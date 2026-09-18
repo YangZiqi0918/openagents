@@ -1,0 +1,26 @@
+FROM node:20-alpine
+
+WORKDIR /app
+
+ARG NEXT_PUBLIC_API_URL=https://workspace-endpoint.openagents.org
+ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+
+# Install dependencies
+COPY package.json package-lock.json ./
+RUN npm ci
+
+ARG NEXT_PUBLIC_LOCAL_MODE=false
+ENV NEXT_PUBLIC_LOCAL_MODE=${NEXT_PUBLIC_LOCAL_MODE}
+ARG API_INTERNAL_URL=
+ENV API_INTERNAL_URL=${API_INTERNAL_URL}
+ENV NEXT_TELEMETRY_DISABLED=1
+
+# Copy application code
+COPY . .
+
+# Build
+RUN npm run build
+
+# Run
+EXPOSE 3000
+CMD ["npm", "start"]

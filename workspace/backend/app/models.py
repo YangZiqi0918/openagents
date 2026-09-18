@@ -1,0 +1,1056 @@
+# -*- coding: utf-8 -*-
+"""
+Workspace ORM models.
+
+Aligned with the ONM: events table as the core log, plus materialized state
+tables for efficient queries.
+
+Uses both Python-side `default=` and PostgreSQL `server_default=` so models
+work in SQLite (tests) and PostgreSQL (production).
+"""
+
+import uuid
+from datetime import datetime, timezone
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    PrimaryKeyConstraint,
+    Text,
+    UniqueConstraint,
+    text,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import relationship
+
+from app.database import Base
+
+
+def _uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Core event store
+# ---------------------------------------------------------------------------
+
+class EventRecord(Base):
+    """
+    Persisted ONM event. Every interaction is stored as an event row.
+    Populated by mod/persistence.
+    """
+    __tablename__ = "events"
+
+    id = Column(Text, primary_key=True)                     # ULID or UUID
+    network_id = Column(UUID(as_uuid=False), nullable=False)  # workspace ID
+    type = Column(Text, nullable=False)                      # e.g. "workspace.message.posted"
+    source = Column(Text, nullable=False)                    # e.g. "openagents:claude-agent"
+    target = Column(Text, nullable=False)                    # e.g. "channel/session-abc"
+    payload = Column(JSONB)
+    metadata_ = Column("metadata", JSONB, default={})        # underscore to avoid Python keyword
+    timestamp = Column(BigInteger, nullable=False)           # unix ms
+    visibility = Column(Text, default="channel")
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        Index("idx_events_network_type", "network_id", "type"),
+        Index("idx_events_network_target", "network_id", "target"),
+        Index("idx_events_network_timestamp", "network_id", "timestamp"),
+        Index("idx_events_network_type_target_ts", "network_id", "type", "target", "timestamp"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Materialized state tables (projections maintained by mods)
+# ---------------------------------------------------------------------------
+
+class Workspace(Base):
+    """A workspace = an ONM network."""
+    __tablename__ = "workspaces"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
+    slug = Column(Text, unique=True)
+    name = Column(Text, nullable=False)
+    creator_email = Column(Text, nullable=True)
+    password_hash = Column(Text, nullable=True)
+    # When True, human web/mobile access requires a logged-in identity that is
+    # a WorkspaceMembership of this workspace (enforced-login, v1.0). When False
+    # (the default, and every pre-v1.0 workspace), access falls back to the
+    # legacy rules: a valid workspace token, or — if no token is set — open.
+    # Agents/daemons always authenticate with the workspace token regardless.
+    require_login = Column(Boolean, nullable=False, default=True, server_default=text("TRUE"))
+    settings = Column(JSONB, default={})
+    status = Column(Text, default="active")
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    last_activity_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    members = relationship("WorkspaceMember", back_populates="workspace", cascade="all, delete-orphan")
+    channels = relationship("Channel", back_populates="workspace", cascade="all, delete-orphan")
+    invitations = relationship("Invitation", back_populates="workspace", cascade="all, delete-orphan")
+    collaborators = relationship("WorkspaceCollaborator", back_populates="workspace", cascade="all, delete-orphan", lazy="selectin")
+    memberships = relationship("WorkspaceMembership", back_populates="workspace", cascade="all, delete-orphan")
+    nodes = relationship("Node", back_populates="workspace", cascade="all, delete-orphan")
+
+
+class WorkspaceMember(Base):
+    """Agent membership in a workspace (network membership)."""
+    __tablename__ = "workspace_members"
+
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    agent_name = Column(Text, nullable=False)
+    # Free-form label shown in UIs (any script, incl. CJK); agent_name stays
+    # the ASCII identity used for mentions, routing and storage keys.
+    display_name = Column(Text, nullable=True)
+    role = Column(Text, default="member")           # master | member | observer
+    agent_type = Column(Text, nullable=True)          # "claude", "openclaw", etc.
+    server_host = Column(Text, nullable=True)          # hostname/IP where agent runs
+    # The device the agent runs on, stamped at join time when the join was
+    # authenticated with that node's token. Nullable: cloud agents and
+    # manual-token joins have no node.
+    node_id = Column(UUID(as_uuid=False), ForeignKey("nodes.id", ondelete="SET NULL"), nullable=True)
+    working_dir = Column(Text, nullable=True)          # working directory on the server
+    description = Column(Text, nullable=True)           # user-provided description of agent's role/capabilities
+    enabled_skills = Column(JSONB, nullable=True)      # {"files": true, "browser": false, ...} — null = all defaults
+    model = Column(Text, nullable=True)                  # user-picked model id; null = agent's own default
+    status = Column(Text, default="offline")         # online | offline
+    last_heartbeat = Column(DateTime(timezone=True), nullable=True)
+    joined_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    # Opaque token assigned on each /v1/join. Subsequent heartbeats and
+    # message posts must carry this id; a newer join rotates it so any
+    # stale client (e.g. ghost adapter, second daemon on same config)
+    # posting with the old id gets rejected and stops.
+    session_id = Column(Text, nullable=True)
+    session_started_at = Column(DateTime(timezone=True), nullable=True)
+
+    workspace = relationship("Workspace", back_populates="members")
+
+    __table_args__ = (
+        PrimaryKeyConstraint("workspace_id", "agent_name"),
+    )
+
+
+class Channel(Base):
+    """A channel = session / thread (named event stream)."""
+    __tablename__ = "channels"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    name = Column(Text, nullable=False)              # e.g. "session-{uuid}"
+    title = Column(Text, nullable=True)
+    title_manually_set = Column(Boolean, default=False, server_default=text("FALSE"))
+    created_by = Column(Text, nullable=True)
+    master_agent = Column(Text, nullable=True)       # per-channel master
+    resume_from = Column(Text, nullable=True)         # channel name to resume context from
+    # Multi-agent collaboration mode for this thread:
+    #   "dynamic"  → LLM router picks next speaker (generic prompt) [default]
+    #   "master"   → deterministic star: humans + sub-agents route to the
+    #                master; the master delegates via @mention
+    #   "workflow" → a structured Workflow template drives the thread step by
+    #                step (see workflow_id + the workflow_runs table)
+    orchestration_mode = Column(Text, nullable=False, server_default=text("'dynamic'"))
+    # Legacy free-text collaboration plan — superseded by structured workflows
+    # (kept for backward compat; no longer authored in the UI).
+    orchestration_instruction = Column(Text, nullable=True)
+    # Structured workflow selected for this thread ("workflow" mode). The live
+    # run lives in workflow_runs, keyed by this channel's name.
+    workflow_id = Column(Text, nullable=True)
+    status = Column(Text, default="active")           # active | archived | deleted
+    starred = Column(Boolean, default=False, server_default=text("FALSE"))
+    last_event_at = Column(BigInteger, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    workspace = relationship("Workspace", back_populates="channels")
+    participants = relationship("ChannelMember", back_populates="channel", cascade="all, delete-orphan", lazy="selectin")
+
+    __table_args__ = (
+        Index("uq_channels_ws_name", "workspace_id", "name", unique=True),
+        # Serves /v1/discover's `WHERE workspace_id = ? AND status != 'deleted'`.
+        Index("idx_channels_workspace_status", "workspace_id", "status"),
+        # Serves the timer-loop auto-archive scan
+        # (`status = 'active' AND last_event_at < cutoff`).
+        Index("idx_channels_status_last_event", "status", "last_event_at"),
+    )
+
+
+class ChannelMember(Base):
+    """Per-channel participant (per-thread membership)."""
+    __tablename__ = "channel_members"
+
+    channel_id = Column(UUID(as_uuid=False), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
+    agent_name = Column(Text, nullable=False)
+
+    channel = relationship("Channel", back_populates="participants")
+
+    __table_args__ = (
+        PrimaryKeyConstraint("channel_id", "agent_name"),
+    )
+
+
+class ChannelHumanMember(Base):
+    """Per-channel human participant — Slack-style thread membership.
+
+    Lives alongside `ChannelMember` (agents only) rather than mixing
+    `agent_name` + `user_email` into one row, which would muddy the
+    existing agent routing queries. Auto-populated by the workspace mod
+    on first human post in a channel; consulted by `services/push.py` to
+    decide whose devices get a banner for non-mention chat messages.
+    Mentions still wake the mentioned human regardless of membership.
+    """
+    __tablename__ = "channel_human_members"
+
+    channel_id = Column(UUID(as_uuid=False), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
+    user_email = Column(Text, nullable=False)               # normalized lowercase
+    joined_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        PrimaryKeyConstraint("channel_id", "user_email"),
+        Index("idx_channel_human_members_email", "user_email"),
+    )
+
+
+class Invitation(Base):
+    """Workspace invitation."""
+    __tablename__ = "invitations"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    target_agent = Column(Text, nullable=False)
+    invite_token = Column(Text, nullable=False, unique=True)
+    status = Column(Text, default="pending")         # pending | accepted | rejected | expired
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+
+    workspace = relationship("Workspace", back_populates="invitations")
+
+
+class WorkspaceCollaborator(Base):
+    """Email-based workspace access (human collaborators)."""
+    __tablename__ = "workspace_collaborators"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    email = Column(Text, nullable=False)                # normalized lowercase
+    role = Column(Text, default="editor")               # editor | viewer
+    added_by = Column(Text, nullable=True)              # email of who added
+    added_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    # Google `displayName` captured the first time the human posted in
+    # this workspace. Mention picker shows it; push.py uses it (along
+    # with the email local-part) to resolve "@bary" → device tokens.
+    display_name = Column(Text, nullable=True)
+
+    workspace = relationship("Workspace", back_populates="collaborators")
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "email", name="uq_collaborator_workspace_email"),
+        Index("idx_collaborators_workspace", "workspace_id"),
+        Index("idx_collaborators_email", "email"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Human identity & workspace membership (enforced-login, v1.0)
+# ---------------------------------------------------------------------------
+
+class User(Base):
+    """A human end-user identity, resolved from a verified login-provider ID
+    token (Google via Firebase, or Sign in with Apple).
+
+    Distinct from `WorkspaceMember` (agents, keyed by agent_name) and the legacy
+    email-only `WorkspaceCollaborator` ACL. A user's access to a workspace is
+    expressed by `WorkspaceMembership` rows. Rows are created/refreshed lazily
+    on login; pre-v1.0 email-keyed access (`Workspace.creator_email` and
+    collaborator rows) is reconciled into memberships the first time the
+    matching user signs in, so existing users keep their workspaces with no
+    data migration.
+    """
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
+    email = Column(Text, nullable=False)                 # normalized lowercase
+    firebase_uid = Column(Text, nullable=True)           # Google/Firebase `uid` claim
+    apple_sub = Column(Text, nullable=True)              # Sign in with Apple `sub` claim
+    display_name = Column(Text, nullable=True)
+    # User-set profile picture: an https:// URL or a small data:image/... URL
+    # (the frontend downscales uploads client-side before saving).
+    avatar_url = Column(Text, nullable=True)
+    # Has this account dismissed the first-run welcome? Per-account (not
+    # per-device) so mobile onboarding shows exactly once across devices.
+    welcome_seen = Column(Boolean, nullable=False, default=False, server_default=text("FALSE"))
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    last_login_at = Column(DateTime(timezone=True), nullable=True)
+
+    memberships = relationship("WorkspaceMembership", back_populates="user", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("email", name="uq_users_email"),
+    )
+
+
+class WorkspaceMembership(Base):
+    """A human user's membership of a workspace, with role.
+
+    The v1.0 replacement for the "owner = `Workspace.creator_email` string" +
+    editor/viewer `WorkspaceCollaborator` split. Roles, highest to lowest:
+    `owner` | `admin` | `member` | `viewer`. `viewer` is read-only and cannot
+    interact with agents — the role is modeled now; its enforcement is deferred.
+    """
+    __tablename__ = "workspace_memberships"
+
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    role = Column(Text, nullable=False, default="member", server_default=text("'member'"))  # owner | admin | member | viewer
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    workspace = relationship("Workspace", back_populates="memberships")
+    user = relationship("User", back_populates="memberships")
+
+    __table_args__ = (
+        PrimaryKeyConstraint("workspace_id", "user_id"),
+        # The composite PK indexes (workspace_id, ...) for "members of a
+        # workspace"; this serves the reverse "workspaces for a user" lookup.
+        Index("idx_memberships_user", "user_id"),
+    )
+
+
+class WorkspaceInvite(Base):
+    """A tokenized invitation link for a human to join a workspace.
+
+    Unlike the workspace token (a machine credential), an invite link carries
+    only this random token — accepting requires the invitee to sign in, and
+    grants at most `role`. Two shapes share the table:
+      - email-bound (`email` set): accept only with a matching signed-in email;
+        consumed on first accept (`accepted_at`). Created by invite-by-email,
+        which also sends the link by email.
+      - open link (`email` NULL): anyone with the link who signs in may join
+        until the link expires or is revoked; `accepted_at` records the last
+        accept but does not consume it.
+    """
+    __tablename__ = "workspace_invites"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    token = Column(Text, nullable=False, unique=True)   # secrets.token_urlsafe(32)
+    email = Column(Text, nullable=True)                 # normalized lowercase; NULL = open link
+    role = Column(Text, nullable=False, default="member", server_default=text("'member'"))  # admin | member | viewer
+    created_by = Column(Text, nullable=True)            # inviter's email (NULL for token/machine callers)
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    accepted_at = Column(DateTime(timezone=True), nullable=True)
+    accepted_by = Column(Text, nullable=True)           # email that (last) accepted
+    revoked_at = Column(DateTime(timezone=True), nullable=True)
+
+    workspace = relationship("Workspace")
+
+    __table_args__ = (
+        Index("idx_workspace_invites_workspace", "workspace_id"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Nodes — a connected device/daemon (launcher host), independent of agents
+# ---------------------------------------------------------------------------
+
+class Node(Base):
+    """A device running the OpenAgents launcher daemon, connected to a workspace.
+
+    A node is registered before (and independently of) any agent, so the
+    workspace can show "this laptop/server is connected" as an early onboarding
+    win. Agents (`WorkspaceMember`) run ON a node; a node can host many agents or
+    none. Liveness is by `last_heartbeat` freshness (like agents), not the
+    persisted `status` column.
+    """
+    __tablename__ = "nodes"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    node_key = Column(Text, nullable=False)             # stable device id generated by the launcher
+    # Per-node machine credential, minted at pairing redeem and REUSED on
+    # re-pair (so running agents never blip). Deleting the row is real
+    # revocation. Stored raw for parity with workspaces.password_hash; hashing
+    # both is a later hardening pass.
+    token = Column(Text, nullable=True, unique=True, index=True)
+    name = Column(Text, nullable=True)                  # display name (defaults to hostname)
+    hostname = Column(Text, nullable=True)
+    device_type = Column(Text, default="unknown")       # server | laptop | desktop | unknown
+    os = Column(Text, nullable=True)                    # e.g. "darwin", "linux", "win32"
+    launcher_version = Column(Text, nullable=True)
+    status = Column(Text, default="offline")            # online | offline
+    last_heartbeat = Column(DateTime(timezone=True), nullable=True)
+    # Roster of agents the daemon reports it is hosting, e.g.
+    # [{"name": "...", "type": "claude", "status": "running"}]. Refreshed each
+    # heartbeat so the workspace can list/manage a node's agents remotely.
+    agents = Column(JSONB, default=list)
+    # Per-agent-type runtime detection reported by the daemon, e.g.
+    # [{"type": "claude", "installed": true, "ready": true, "version": "1.2.3",
+    #   "reason": "ready", "message": "Logged in"}]. Powers the "Add agent"
+    # gallery (what's installed / logged-in on this device).
+    runtimes = Column(JSONB, default=list)
+    # Filesystem hint for the working-directory picker: the device's home dir,
+    # its immediate subfolders, and roots/drives, refreshed each heartbeat, e.g.
+    # {"home": "C:\\Users\\me", "dirs": ["projects"], "roots": ["C:\\", "D:\\"]}.
+    fs = Column(JSONB, default=dict)
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    workspace = relationship("Workspace", back_populates="nodes")
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "node_key", name="uq_node_workspace_key"),
+        Index("idx_nodes_workspace", "workspace_id"),
+    )
+
+
+class NodePairingCode(Base):
+    """A short-lived, single-use code that pairs a device to a workspace.
+
+    Generated by an owner/admin in the workspace UI; the launcher redeems it to
+    obtain the workspace token and register a Node — so the user types one short
+    code instead of copy-pasting the workspace id + token.
+    """
+    __tablename__ = "node_pairing_codes"
+
+    code = Column(Text, primary_key=True)               # normalized (uppercase, no dashes)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    created_by = Column(Text, nullable=True)            # email of the creator
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    redeemed_at = Column(DateTime(timezone=True), nullable=True)
+    node_id = Column(UUID(as_uuid=False), nullable=True)  # set on successful redeem
+
+    __table_args__ = (
+        Index("idx_pairing_workspace", "workspace_id"),
+    )
+
+
+class NodeCommand(Base):
+    """A remote agent-management command queued for a node's daemon.
+
+    The node isn't directly reachable (it's behind NAT), so the workspace can't
+    call it — instead an owner/admin enqueues a command here; the daemon picks it
+    up on its next heartbeat, runs it locally (create/start/stop/remove an
+    agent), and posts the result back. `command`/`result` are free-form JSON.
+    """
+    __tablename__ = "node_commands"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
+    node_id = Column(UUID(as_uuid=False), ForeignKey("nodes.id", ondelete="CASCADE"), nullable=False)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    action = Column(Text, nullable=False)               # create_agent | start_agent | stop_agent | remove_agent
+    command = Column(JSONB, default=dict)               # action args (may hold secrets briefly)
+    status = Column(Text, default="pending")            # pending | running | done | error
+    result = Column(JSONB, nullable=True)               # {ok, message, ...} — never contains secrets
+    created_by = Column(Text, nullable=True)            # email of the requester
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    delivered_at = Column(DateTime(timezone=True), nullable=True)
+    finished_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("idx_node_commands_node_status", "node_id", "status"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared knowledge base
+# ---------------------------------------------------------------------------
+
+class KnowledgeEntry(Base):
+    """A knowledge base entry — workspace-global markdown document."""
+    __tablename__ = "knowledge_entries"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    slug = Column(Text, nullable=False)
+    title = Column(Text, nullable=False)
+    description = Column(Text, nullable=True)
+    storage_key = Column(Text, nullable=True)
+    content_size = Column(Integer, nullable=True)
+    created_by = Column(Text, nullable=False)
+    updated_by = Column(Text, nullable=True)
+    status = Column(Text, nullable=False, default="active")
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    updated_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "slug", name="uq_knowledge_workspace_slug"),
+        Index("idx_knowledge_workspace_status", "workspace_id", "status"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared file storage
+# ---------------------------------------------------------------------------
+
+class FileRecord(Base):
+    """Metadata for a file stored in the workspace."""
+    __tablename__ = "files"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    filename = Column(Text, nullable=False)
+    content_type = Column(Text, nullable=False, default="application/octet-stream")
+    size = Column(Integer, nullable=False)
+    storage_key = Column(Text, nullable=False)
+    uploaded_by = Column(Text, nullable=False)        # "human:user" or "openagents:agent-name"
+    channel_name = Column(Text, nullable=True)         # optional channel context
+    status = Column(Text, nullable=False, default="active")  # active | deleted
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    # Trash. A deleted record keeps its bytes until it's purged; these three
+    # columns are what turn "status = deleted" into something restorable.
+    #   deleted_at  when it went to the trash (and what an expiry sweep reads)
+    #   trash_id    one delete action — deleting a folder trashes N records
+    #               that must come back, or be purged, together
+    #   trash_path  what the user deleted: a file's path, or a folder's
+    # All nullable: records deleted before trash existed simply have none.
+    deleted_at = Column(DateTime(timezone=True), nullable=True)
+    trash_id = Column(Text, nullable=True)
+    trash_path = Column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("idx_files_workspace_status", "workspace_id", "status"),
+        Index("idx_files_trash", "workspace_id", "trash_id"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared browser
+# ---------------------------------------------------------------------------
+
+class BrowserTab(Base):
+    """A shared browser tab in the workspace."""
+    __tablename__ = "browser_tabs"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    url = Column(Text, nullable=False, default="about:blank")
+    title = Column(Text, nullable=True)
+    status = Column(Text, nullable=False, default="active")       # active | closed
+    created_by = Column(Text, nullable=False)                      # "human:user" or "openagents:agent-name"
+    shared_with = Column(JSONB, default=[])                        # list of agent names with access
+    context_id = Column(Text, ForeignKey("browser_contexts.id", ondelete="SET NULL"), nullable=True)  # persistent context
+    session_id = Column(Text, nullable=True)                       # Browserbase session ID
+    live_url = Column(Text, nullable=True)                         # Browserbase live view URL
+    # --- BF credential reference (never the key itself; see app/browser_creds.py) ---
+    bf_key_source = Column(Text, nullable=True)                    # 'workspace' | 'global' | NULL (local/legacy)
+    bf_key_fingerprint = Column(Text, nullable=True)               # SHA-256 hex of the creating key
+    # --- Remote session release tracking ---
+    session_closed = Column(Boolean, nullable=False, default=False, server_default=text("FALSE"))  # BF session confirmed released
+    close_status = Column(Text, nullable=False, default="none", server_default=text("'none'"))  # none|open|closing|closed|close_failed|retry_exhausted
+    close_attempts = Column(Integer, nullable=False, default=0, server_default=text("0"))
+    last_close_attempt_at = Column(DateTime(timezone=True), nullable=True)
+    last_close_error = Column(Text, nullable=True)                 # redacted — never contains key material
+    last_error = Column(Text, nullable=True)                       # last init/navigation error (redacted)
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    last_active_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        Index("idx_browser_tabs_workspace_status", "workspace_id", "status"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Persistent browser contexts (BrowserBase contexts for session persistence)
+# ---------------------------------------------------------------------------
+
+class BrowserContext(Base):
+    """A persistent browser context that preserves cookies/storage across sessions.
+
+    Users mark a tab as persistent by giving it a name (e.g. "LinkedIn Account").
+    A BrowserBase context is created and reused across tab open/close cycles,
+    so the logged-in state survives indefinitely.
+    """
+    __tablename__ = "browser_contexts"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    name = Column(Text, nullable=False)                          # user-provided label, e.g. "LinkedIn Account"
+    bb_context_id = Column(Text, nullable=True)                  # BrowserBase context ID (null in local mode)
+    domain = Column(Text, nullable=True)                         # auto-captured from tab URL, e.g. "linkedin.com"
+    status = Column(Text, nullable=False, default="active")      # active | expired
+    created_by = Column(Text, nullable=False)                    # "human:user" or "openagents:agent-name"
+    shared_with = Column(JSONB, default=[])                      # list of agent names that can use this context
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    last_used_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "name", name="uq_browser_context_workspace_name"),
+        Index("idx_browser_contexts_workspace_status", "workspace_id", "status"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Browser usage tracking
+# ---------------------------------------------------------------------------
+
+class BrowserUsage(Base):
+    """Tracks browser session duration for billing/monitoring."""
+    __tablename__ = "browser_usage"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    tab_id = Column(Text, nullable=False)
+    session_id = Column(Text, nullable=True)             # Browserbase session ID
+    opened_by = Column(Text, nullable=False)               # source: "human:user" or "openagents:agent-name"
+    started_at = Column(DateTime(timezone=True), nullable=False, default=_now, server_default=text("NOW()"))
+    ended_at = Column(DateTime(timezone=True), nullable=True)
+    duration_seconds = Column(Integer, nullable=True)     # computed on close
+
+    __table_args__ = (
+        Index("idx_browser_usage_workspace", "workspace_id"),
+        Index("idx_browser_usage_opened_by", "opened_by"),
+        Index("idx_browser_usage_started", "started_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Push-notification device registration
+# ---------------------------------------------------------------------------
+
+class DeviceToken(Base):
+    """A mobile device's FCM registration token, scoped to a workspace.
+
+    Created by `POST /v1/devices/register` from the OpenAgents mobile apps.
+    Used by `services/push.py` to fan out notifications through Firebase
+    Cloud Messaging when relevant workspace events fire — iOS and Android
+    alike; `device_type` is descriptive, not a transport selector.
+
+    Tied to a workspace via `workspace_id` — the same auth model as every
+    other table here. We do not link to a specific human user because the
+    workspace token is the only identity the iOS client carries today.
+    """
+
+    __tablename__ = "device_tokens"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    fcm_token = Column(Text, nullable=False)
+    device_type = Column(Text, nullable=False)            # "ios" | future: "android" | "macos"
+    bundle_id = Column(Text, nullable=True)               # e.g. "com.openagents.go"
+    # Google email of the signed-in user on the device that registered.
+    # NULL for older clients without a user identity; populated by builds
+    # that started sending `userEmail` with /v1/devices/register. The push
+    # fan-out filters by this column when a @-mention resolves to a human
+    # collaborator so only that specific human's devices get woken up.
+    user_email = Column(Text, nullable=True)
+    # Notification switches as set on the device's Notifications screen —
+    # {approvals, mentions, agentErrors, taskCompletions, allMessages,
+    # quietHours}, all booleans. Mirrored server-side because a banner the
+    # OS draws while the app is dead can only be stopped by not sending it.
+    # NULL means "registered before this existed" and is treated as all-on.
+    prefs = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    last_seen_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "fcm_token", name="uq_device_token_workspace_fcm"),
+        Index("idx_device_tokens_workspace", "workspace_id"),
+        Index("idx_device_tokens_workspace_user", "workspace_id", "user_email"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Planning: To-dos & Timers
+# ---------------------------------------------------------------------------
+
+class TodoRecord(Base):
+    """A single to-do item belonging to an agent in a channel."""
+    __tablename__ = "todos"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    channel_name = Column(Text, nullable=False)
+    thread_id = Column(Text, nullable=True)
+    created_by = Column(Text, nullable=False)              # "openagents:agent-name"
+    assignee = Column(Text, nullable=False)                # defaults to created_by agent
+    content = Column(Text, nullable=False)
+    status = Column(Text, nullable=False, default="pending")  # pending | in_progress | completed
+    position = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    updated_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        Index("idx_todos_workspace_channel", "workspace_id", "channel_name"),
+        Index("idx_todos_workspace_created_by", "workspace_id", "created_by"),
+    )
+
+
+class KanbanTask(Base):
+    """A Kanban board task — workspace-wide, assignable to a single agent.
+
+    Distinct from ``TodoRecord`` (agent-private, in-thread planning
+    checklists). A Kanban task is a GitHub-issue-like work item on a shared
+    board. Assigning it to an agent spins up a dedicated *hidden* thread
+    (a ``task:<id>`` channel) where the agent does the long-running work; a
+    fast-model classifier watches the agent's replies there and moves the
+    card between columns (``in_progress`` → ``need_input`` / ``done``).
+    """
+    __tablename__ = "kanban_tasks"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    title = Column(Text, nullable=False)
+    description = Column(Text, nullable=False, default="", server_default="")
+    # backlog | todo | in_progress | need_input | done
+    status = Column(Text, nullable=False, default="backlog", server_default="backlog")
+    assignee = Column(Text, nullable=True)                 # bare agent name; null = unassigned
+    # A task runs on either a single agent (assignee) OR a workflow template.
+    workflow_id = Column(Text, nullable=True)             # run this task via a Workflow
+    created_by = Column(Text, nullable=False)              # "human:..." or "openagents:..."
+    channel_name = Column(Text, nullable=True)            # the hidden `task:<id>` thread, once assigned
+    priority = Column(Text, nullable=False, default="normal", server_default="normal")  # low | normal | high
+    position = Column(Integer, nullable=False, default=0, server_default="0")  # ordering within a column
+    # Knowledge-base entries attached as context (list of KnowledgeEntry ids).
+    # Referenced in the kickoff as @knowledge:<slug> so agents fetch them.
+    knowledge_ids = Column(JSONB, nullable=True)
+    # Files attached to the task (list of FileRecord ids). Delivered as
+    # attachments on the kickoff message so the agent can open them.
+    file_ids = Column(JSONB, nullable=True)
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        Index("idx_kanban_workspace_status", "workspace_id", "status"),
+        Index("idx_kanban_workspace_channel", "workspace_id", "channel_name"),
+    )
+
+
+class Workflow(Base):
+    """A reusable multi-agent collaboration template.
+
+    A workflow is an ordered list of steps (stored as JSON). Each step has an
+    instruction and an assignee (an agent or a named human), and an optional
+    natural-language **gate** — "go to step X if <condition>" — that the fast
+    model judges, enabling forward skips and backward loops.
+
+    step := {
+      "id": str, "name": str, "instruction": str,
+      "assignee": {"kind": "agent"|"human", "agent"?: str, "human"?: str},
+      "gate"?: {"condition": str, "target": <step id>}   # else falls through
+    }
+
+    Running a task/thread copies this template into a ``WorkflowRun`` snapshot,
+    so later edits never disturb work already in flight.
+    """
+    __tablename__ = "workflows"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    name = Column(Text, nullable=False)
+    description = Column(Text, nullable=False, default="", server_default="")
+    steps = Column(JSONB, nullable=False)                  # ordered list of step dicts
+    # Loop budget: how many times the run may cycle before it stalls. The engine
+    # also enforces a hard backstop of max_iterations * len(steps) activations.
+    max_iterations = Column(Integer, nullable=False, default=5, server_default="5")
+    created_by = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        Index("idx_workflows_workspace", "workspace_id"),
+    )
+
+
+class WorkflowRun(Base):
+    """Live execution state for a workflow driving one thread (channel).
+
+    Serves both a Kanban task and a group-chat thread — whichever owns the
+    ``channel_name``. Holds the frozen template ``snapshot`` and the cursor
+    (``current_step`` + ``iterations``).
+    """
+    __tablename__ = "workflow_runs"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    workflow_id = Column(Text, nullable=True)              # origin template (reference only)
+    channel_name = Column(Text, nullable=False)            # the thread this run drives
+    snapshot = Column(JSONB, nullable=False)               # {name, steps, max_iterations}
+    current_step = Column(Text, nullable=True)             # step id, or null before start / after end
+    iterations = Column(Integer, nullable=False, default=0, server_default="0")
+    status = Column(Text, nullable=False, default="running", server_default="running")  # running | done | stalled | cancelled
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        Index("idx_workflow_runs_ws_channel", "workspace_id", "channel_name"),
+    )
+
+
+class TimerRecord(Base):
+    """A scheduled timer that posts a message when it fires."""
+    __tablename__ = "timers"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    channel_name = Column(Text, nullable=False)
+    thread_id = Column(Text, nullable=True)
+    created_by = Column(Text, nullable=False)              # "openagents:agent-name"
+    message = Column(Text, nullable=False)
+    delay_seconds = Column(Integer, nullable=False)
+    fires_at = Column(DateTime(timezone=True), nullable=False)
+    status = Column(Text, nullable=False, default="active")  # active | fired | cancelled
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        Index("idx_timers_fires_at_status", "fires_at", "status"),
+        Index("idx_timers_workspace_channel", "workspace_id", "channel_name"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routines (recurring scheduled tasks)
+# ---------------------------------------------------------------------------
+
+class RoutineRecord(Base):
+    """A recurring scheduled task that fires on a repeating schedule."""
+    __tablename__ = "routines"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    channel_name = Column(Text, nullable=False)
+    thread_id = Column(Text, nullable=True)
+    created_by = Column(Text, nullable=False)              # "openagents:agent-name"
+    name = Column(Text, nullable=False)                     # human-readable label
+    message = Column(Text, nullable=False)                  # message posted when routine fires
+    context = Column(Text, nullable=True)                    # comprehensive background for the routine
+    # Daily schedule mode: hour + minute (+ optional days). One of the two
+    # modes must be set when the row is created (enforced in the router).
+    schedule_hour = Column(Integer, nullable=True)          # 0-23 UTC
+    schedule_minute = Column(Integer, nullable=True)        # 0-59
+    schedule_days = Column(JSONB, nullable=True)            # null=every day, or [0..6] (0=Mon)
+    # Interval mode: fire every N minutes. Mutually exclusive with hour/minute.
+    schedule_interval_minutes = Column(Integer, nullable=True)
+    timezone = Column(Text, default="UTC")
+    next_fires_at = Column(DateTime(timezone=True), nullable=False)
+    last_fired_at = Column(DateTime(timezone=True), nullable=True)
+    status = Column(Text, nullable=False, default="active")  # active | paused | cancelled
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        Index("idx_routines_workspace_channel", "workspace_id", "channel_name"),
+        Index("idx_routines_next_fires_status", "next_fires_at", "status"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Inbox / Notifications
+# ---------------------------------------------------------------------------
+
+class NotificationRecord(Base):
+    """A notification sent by an agent to the workspace inbox."""
+    __tablename__ = "notifications"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    created_by = Column(Text, nullable=False)              # "openagents:agent-name" or "system:routine"
+    title = Column(Text, nullable=False)
+    message = Column(Text, nullable=False)
+    priority = Column(Text, nullable=False, default="normal")  # low | normal | high
+    is_read = Column(Boolean, default=False, server_default=text("FALSE"))
+    channel_name = Column(Text, nullable=True)              # optional link to related thread
+    thread_id = Column(Text, nullable=True)
+    link_url = Column(Text, nullable=True)                  # optional external link
+    status = Column(Text, nullable=False, default="active") # active | dismissed | expired
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    read_at = Column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("idx_notifications_workspace_status", "workspace_id", "status"),
+        Index("idx_notifications_workspace_read", "workspace_id", "is_read"),
+        Index("idx_notifications_created_at", "created_at"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cloud agent configurations
+# ---------------------------------------------------------------------------
+
+class CloudAgentConfig(Base):
+    """Configuration for a cloud-based agent (API-proxied by the server)."""
+    __tablename__ = "cloud_agent_configs"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    agent_name = Column(Text, nullable=False)
+    provider = Column(Text, nullable=False)              # "openai", "google", "xai", "deepseek"
+    model = Column(Text, nullable=False)                  # "gpt-4o", "gemini-2.5-pro", etc.
+    category = Column(Text, nullable=False, default="chat")  # "chat" or "image"
+    api_key = Column(Text, nullable=False)
+    base_url = Column(Text, nullable=True)                # custom OpenAI-compatible endpoint
+    system_prompt = Column(Text, nullable=True)
+    max_tokens = Column(Integer, nullable=True)
+    status = Column(Text, nullable=False, default="active")  # active | disabled
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        UniqueConstraint("workspace_id", "agent_name", name="uq_cloud_agent_workspace_name"),
+        Index("idx_cloud_agent_workspace", "workspace_id"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Chat-platform integrations (Slack / Telegram bridges)
+# ---------------------------------------------------------------------------
+
+class IntegrationBinding(Base):
+    """A connection between this workspace and an external chat platform bot.
+
+    One binding = one bot (a Telegram bot from BotFather, or a Slack app's bot
+    user). Each external conversation the bot participates in is bridged to a
+    dedicated workspace channel named ``ext-<platform>-<binding8>-<chat id>``
+    (deterministic — no per-conversation mapping table). Inbound platform
+    messages flow through the normal event pipeline as ``human:`` sources, so
+    routing/leader/mention logic applies unchanged; outbound agent ``chat``
+    replies are relayed back by ``services/integrations.relay_for_event``.
+    """
+    __tablename__ = "integration_bindings"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    platform = Column(Text, nullable=False)               # "telegram" | "slack"
+    name = Column(Text, nullable=True)                    # display label, e.g. bot username
+    bot_token = Column(Text, nullable=False)              # Telegram bot token / Slack xoxb- token
+    signing_secret = Column(Text, nullable=True)          # Slack request-signing secret (custom apps only)
+    webhook_secret = Column(Text, nullable=True)          # Telegram X-Telegram-Bot-Api-Secret-Token
+    # Slack team id. The official OpenAgents Slack app delivers every team's
+    # events to ONE shared endpoint — this column is how an event finds its
+    # binding (indexed; also set for custom Slack apps, unused by Telegram).
+    external_team_id = Column(Text, nullable=True)
+    # Route every bridged message to this agent (becomes master_agent of the
+    # auto-created channels). Null = let the router/leader logic decide.
+    default_agent = Column(Text, nullable=True)
+    config = Column(JSONB, default=dict)                  # {botUsername, teamName, botUserId, ...}
+    status = Column(Text, nullable=False, default="active")  # active | disabled
+    last_error = Column(Text, nullable=True)              # last relay/webhook failure (redacted)
+    last_event_at = Column(DateTime(timezone=True), nullable=True)
+    created_by = Column(Text, nullable=True)              # email of the admin who connected it
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        Index("idx_integration_bindings_workspace", "workspace_id"),
+        Index("idx_integration_bindings_team", "external_team_id"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Shared conversation snapshots
+# ---------------------------------------------------------------------------
+
+class ShareSnapshot(Base):
+    """A public snapshot of a conversation thread."""
+    __tablename__ = "share_snapshots"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    channel_name = Column(Text, nullable=False)
+    title = Column(Text, nullable=True)
+    created_by = Column(Text, nullable=False)
+    snapshot_data = Column(JSONB, nullable=False)
+    share_token = Column(Text, unique=True, nullable=False)
+    message_count = Column(Integer, nullable=False, default=0)
+    status = Column(Text, nullable=False, default="active")
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        Index("idx_share_snapshots_workspace", "workspace_id"),
+        Index("idx_share_snapshots_token", "share_token"),
+    )
+
+
+# Standalone agent table (used when IDENTITY_MODE=standalone)
+class Agent(Base):
+    """Local agent identity (standalone mode only)."""
+    __tablename__ = "agents"
+
+    agent_name = Column(Text, primary_key=True)
+    display_name = Column(Text, nullable=True)
+    agent_type = Column(Text, nullable=True)         # "claude", "codex", "gemini", etc.
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+
+class ModelAccess(Base):
+    """A saved inference credential ("model access") for a workspace.
+
+    One entry = provider + API key (+ optional custom base URL). Managed on the
+    Model access settings page and reused across agent configs: forms reference
+    the entry by id, the backend resolves the real key server-side (node-command
+    enqueue, probes), so the raw key never has to round-trip via the browser
+    after creation.
+    """
+    __tablename__ = "model_access"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    label = Column(Text, nullable=False)               # display name, defaults to provider label
+    provider = Column(Text, nullable=False)            # PROVIDERS name, or "custom"
+    base_url = Column(Text, nullable=True)             # custom/relay endpoint override
+    api_key = Column(Text, nullable=False)             # stored server-side; only masked form is listed
+    created_by = Column(Text, nullable=True)           # email or identity of the creator
+    status = Column(Text, default="active")            # active | disabled
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+
+class CampaignAccount(Base):
+    """Per-user model-gateway API key minted for the credits campaign.
+
+    The full key is stored so the UI can re-display it — acceptable because it
+    is a hard-capped campaign credential on our own gateway, not a user secret.
+    One row per user (gateway also enforces unique external_id).
+    """
+    __tablename__ = "campaign_accounts"
+
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    gateway_key_id = Column(Integer, nullable=False)   # numeric id used by /admin/credits
+    api_key = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+
+class CampaignGrant(Base):
+    """Ledger of campaign credit grants, one row per (user, milestone).
+
+    milestone is "signup" | "first_agent" | "first_conversation" |
+    "second_agent" | "second_agent_response" | "daily:<YYYY-MM-DD>".
+    The unique constraint is the first idempotency wall; the gateway's
+    idempotency_key ({user_id}:{milestone}) is the second.
+    """
+    __tablename__ = "campaign_grants"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    milestone = Column(Text, nullable=False)
+    amount_usd = Column(Float, nullable=False)
+    new_limit_usd = Column(Float, nullable=True)       # gateway-confirmed limit after the grant
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "milestone", name="uq_campaign_grants_user_milestone"),
+    )
+
+
+class Feedback(Base):
+    """In-app user feedback — bug reports and feature requests.
+
+    Stored first (queryable, can't get lost), then best-effort forwarded by
+    email (FEEDBACK_EMAIL_TO). workspace_id is advisory context, not an access
+    grant, so it carries no FK; user_email is denormalized so feedback stays
+    readable if the account is later deleted.
+    """
+    __tablename__ = "feedback"
+
+    id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
+    user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    user_email = Column(Text, nullable=True)
+    workspace_id = Column(Text, nullable=True)
+    kind = Column(Text, nullable=False)                 # bug | feature | other
+    message = Column(Text, nullable=False)
+    context = Column(JSONB, nullable=True)              # {url, userAgent, locale, ...}
+    status = Column(Text, nullable=False, default="new", server_default=text("'new'"))  # new | triaged | closed
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))

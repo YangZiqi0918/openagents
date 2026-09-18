@@ -1,0 +1,6 @@
+node_modules
+.next
+dist-desktop
+.env.local
+.env.*.local
+*.log

@@ -1,0 +1,185 @@
+{
+  "title": "Connected Workspaces",
+  "subtitle": "The workspaces this machine has joined, with their agents and activity",
+  "join": "$t(common.actions.addWorkspace)",
+  "stats": {
+    "healthy": "Healthy",
+    "warning": "Warning",
+    "error": "Error",
+    "total": "Paired"
+  },
+  "searchPlaceholder": "Search workspaces or agents...",
+  "refresh": "Refresh",
+  "activeWorkspaces": "Active Workspaces",
+  "loading": "Loading workspaces…",
+  "emptyNone": "A workspace is where you and your agents work together. Join one with its pairing code — workspaces themselves are created on the web, after signing in.",
+  "emptyNoMatch": "No workspace is named “{{query}}”.",
+  "copied": "Copied",
+  "toast": {
+    "urlCopied": "URL copied",
+    "copyFailed": "Failed to copy",
+    "removed": "Unpaired and removed \"{{name}}\"",
+    "removedWarning": "Removed \"{{name}}\" on this device, but the workspace could not be reached: {{message}}",
+    "deleted": "Deleted workspace \"{{name}}\"",
+    "renamed": "Workspace renamed",
+    "renamedWorkspace": "Renamed to \"{{name}}\" for everyone in the workspace",
+    "error": "Error: {{message}}",
+    "cleared": "Cleared the local record for \"{{name}}\""
+  },
+  "remove": {
+    "title": "Remove \"{{name}}\"?",
+    "description": "This device is unpaired from the workspace and its record here is deleted. The workspace itself, its channels, and its other members and devices are untouched — you can join again any time with a fresh code.",
+    "descriptionRemote": "Deleted for every member — channels, history and connected devices go with it. No undo in the app.",
+    "effects": {
+      "pairing": "This device's pairing is deleted on the server, and its credential stops working immediately.",
+      "agents": "Agents in this workspace leave it and are unbound on this device.",
+      "local": "The workspace disappears from this computer until you join it again."
+    },
+    "alsoDelete": "Delete the workspace on the server too — all members",
+    "alsoDeleteWarning": "Everyone loses access immediately. Only an admin restoring the record by hand can undo it.",
+    "confirm": "Unpair",
+    "confirmRemote": "Delete workspace",
+    "revoked": {
+      "title": "Clear the local record for \"{{name}}\"?",
+      "description": "The workspace removed this device, so the pairing and its credential stopped working some time ago. This only clears what is left behind on this machine — the workspace itself, its members and its other devices are untouched.",
+      "effects": {
+        "credential": "The pairing credential stored here is deleted — it no longer works anyway.",
+        "agents": "Agents bound to this workspace are unbound locally; the instances and their data stay.",
+        "local": "The card disappears from this list, and you can re-join at any time with a new pairing code."
+      },
+      "confirm": "Clear record"
+    }
+  },
+  "card": {
+    "unfavorite": "Unfavorite",
+    "favorite": "Favorite",
+    "copyUrl": "Copy URL",
+    "openInBrowser": "Open in browser",
+    "rename": "Rename",
+    "remove": "Remove",
+    "agents": "Agents",
+    "lastActive": "Last active",
+    "platforms": "Platforms",
+    "platformsLinked": "{{count}} linked",
+    "platformsNone": "None",
+    "viewLogs": "View logs",
+    "logs": "Logs",
+    "pending": "...",
+    "stop": "Stop",
+    "start": "Start",
+    "state": {
+      "online": "Running",
+      "starting": "Starting",
+      "offline": "Stopped"
+    },
+    "noAgents": "No agent is connected to this workspace",
+    "deviceLinkedTitle": "This device is connected",
+    "deviceLinked": "No agent is bound here yet — install one on this device from the workspace.",
+    "openWorkspace": "Open workspace",
+    "browserOnly": {
+      "notMember": "The signed-in account isn’t a member of this workspace, so it opens in the browser.",
+      "signedOut": "Sign in to open the workspaces you belong to inside the app.",
+      "otherDeployment": "This workspace is on a different server, so it opens in the browser."
+    },
+    "more": "More actions",
+    "trend": "Activity ({{days}} days)",
+    "trendMessages": "{{count}} messages",
+    "trendTruncated": "Counted from the most recent messages only; earlier days may read low",
+    "noAgentsTitle": "No agents yet",
+    "trendEmpty": "No message activity yet",
+    "qrcode": "Show QR code",
+    "deviceBadge": "This device",
+    "deviceBadgeHint": "This machine is paired to this workspace as a node — agents can be installed and run on it from there.",
+    "repair": "Join again",
+    "revokedTitle": "This device was removed from the workspace",
+    "revokedBody": "The workspace revoked this pairing, so the agents here can no longer connect."
+  },
+  "health": {
+    "healthy": "Healthy",
+    "warning": "Warning",
+    "device": "Device linked",
+    "disconnected": "Disconnected",
+    "error": "Error",
+    "revoked": "Device removed"
+  },
+  "recentActivity": {
+    "noActivity": "No recent activity",
+    "noActivityWithSessions": "No recent activity ({{count}} sessions)",
+    "lastMessage": "Last message · {{time}}",
+    "noPreview": "(no preview)"
+  },
+  "relativeTime": {
+    "never": "never",
+    "justNow": "just now",
+    "minutesAgo": "{{count}}m ago",
+    "hoursAgo": "{{count}}h ago",
+    "daysAgo": "{{count}}d ago",
+    "unknown": "—"
+  },
+  "quickConnect": {
+    "title": "$t(common.actions.addWorkspace)",
+    "subtitle": "Joins a workspace that already exists. This device can belong to several at once — each one takes its own code.",
+    "pairLabel": "Pairing code from the workspace",
+    "pairPlaceholder": "XXXX-XXXX",
+    "pairHint": "In the workspace, open $t(common.workspaceMenu.connectAgent) → $t(common.workspaceMenu.nodes). This device joins as a node, and you install and run agents on it from there. Codes work once and expire after 30 minutes.",
+    "pairBtn": "Join",
+    "pairError": "A pairing code is 8 characters, like XXXX-XXXX.",
+    "cancel": "Cancel",
+    "connecting": "Connecting...",
+    "toast": {
+      "paired": "This device joined {{label}}"
+    },
+    "fallbackLabel": "workspace",
+    "error": {
+      "tls": "Workspace service is temporarily unreachable (TLS certificate mismatch). Please try again later or contact support.",
+      "dns": "Cannot reach the workspace service. Check your internet connection and try again.",
+      "timeout": "Workspace service didn't respond in time. Please try again in a moment."
+    },
+    "createOnWeb": "Need a new workspace? Sign in and create one at"
+  },
+  "rename": {
+    "title": "Rename workspace",
+    "label": "Display name",
+    "labelRemote": "Workspace name",
+    "placeholder": "My Team",
+    "hint": "Shown on this machine only. The slug ({{slug}}) and the workspace’s own name are unchanged.",
+    "hintRemote": "The workspace’s own name. The slug ({{slug}}) and existing links are unchanged.",
+    "applyRemote": "Rename it on the server too — all members",
+    "remoteWarningTitle": "All members see this name",
+    "remoteWarningBody": "Only the displayed name changes; members, links, agents and history are unaffected.",
+    "cancel": "Cancel",
+    "saving": "Saving...",
+    "save": "Save",
+    "saveRemote": "Rename workspace"
+  },
+  "filters": {
+    "all": "All",
+    "healthy": "Healthy",
+    "problem": "Problems",
+    "disconnected": "Disconnected"
+  },
+  "sorts": {
+    "recent": "Recently active",
+    "name": "Name",
+    "agents": "Agent count"
+  },
+  "emptyNoFilterMatch": "Every workspace you have is in another state right now.",
+  "qrcode": {
+    "dialogTitle": "Workspace QR code",
+    "dialogDescription": "Scan to open {{name}} on another device.",
+    "clickToCopy": "Click the code to copy the link",
+    "copied": "Workspace link copied",
+    "copyFailed": "Failed to copy link",
+    "unavailable": "This workspace has no shareable link. Open it in the browser on the other device and sign in there."
+  },
+  "emptyNoneTitle": "No workspaces yet",
+  "emptyNoMatchTitle": "Nothing matches that search",
+  "emptyNoFilterMatchTitle": "Nothing matches this filter",
+  "revokedNotice": {
+    "title": "\"{{name}}\" removed this device",
+    "body": "The workspace has been removed from this machine. Joining again needs a new pairing code.",
+    "bodyAgents": "The workspace has been removed from this machine, and the {{count}} agents filed under it were unbound — the instances and their data stay. Joining the same workspace again files them back under it.",
+    "rejoin": "Join again",
+    "dismiss": "Dismiss"
+  }
+}

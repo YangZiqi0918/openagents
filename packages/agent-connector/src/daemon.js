@@ -1,0 +1,1747 @@
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const { execSync, execFileSync } = require('child_process');
+// spawn() here is the WSL bridge from ./wsl: same signature as
+// child_process.spawn, and a straight pass-through unless the resolved CLI
+// lives on the other side of the Windows/WSL boundary.
+const { spawn } = require('./wsl');
+const os = require('os');
+const { WorkspaceClient } = require('./workspace-client');
+const { getEnhancedEnv, whichBinary, IS_WINDOWS, defaultAgentWorkdir } = require('./paths');
+
+/**
+ * Mask an API key for display (same shape the workspace backend uses for
+ * cloud agents): enough to recognize which key it is, never enough to use it.
+ * The partial reveal needs a real remainder to hide: first4+last4 of a
+ * 9-to-12-char key would expose most of it, so anything that short is
+ * fully masked.
+ */
+function maskApiKey(key) {
+  if (!key || key.length <= 12) return '****';
+  return key.slice(0, 4) + '...' + key.slice(-4);
+}
+
+/**
+ * Top-level filesystem locations the workspace folder picker can jump to.
+ * Windows has one root per mounted drive; POSIX systems have a single root.
+ * Keeping this as a small pure helper makes the Windows behaviour testable on
+ * every CI platform.
+ */
+function filesystemRoots(platform = os.platform(), exists = fs.existsSync) {
+  if (platform !== 'win32') return ['/'];
+
+  const roots = [];
+  for (let code = 'A'.charCodeAt(0); code <= 'Z'.charCodeAt(0); code++) {
+    const root = `${String.fromCharCode(code)}:\\`;
+    try {
+      if (exists(root)) roots.push(root);
+    } catch {
+      // A disconnected or unreadable mapped drive should not break heartbeat.
+    }
+  }
+  return roots;
+}
+
+/**
+ * Agent process lifecycle manager.
+ *
+ * Spawns agent subprocesses, monitors them with auto-restart + backoff,
+ * writes status to disk, processes commands from daemon.cmd, and handles
+ * graceful shutdown.
+ *
+ * Compatible with the Python SDK's daemon — reads the same config files,
+ * writes the same status format, and supports the same command protocol.
+ */
+class Daemon {
+  constructor(config, envManager, registry) {
+    this.config = config;
+    this.envManager = envManager;
+    this.registry = registry;
+
+    // State
+    this._processes = {};     // agentName → { proc, state, restarts, startedAt, lastError }
+    this._adapters = {};      // agentName → adapter instance
+    this._stoppedAgents = new Set();
+    this._shuttingDown = false;
+    this._statusInterval = null;
+    this._cmdInterval = null;
+    this._nodeHeartbeatInterval = null;  // device-level heartbeat (connect-a-node)
+    this._displayNameInterval = null;    // pulls workspace-side renames back
+    this._nodeClients = new Map();       // workspace_id -> WorkspaceClient, one per pairing
+    this._runningCommands = new Set();   // node-command ids currently executing
+    this._runtimes = [];                 // detected agent runtimes for the node view
+    this._runtimesInterval = null;
+    this._probes = this._loadProbes();   // type → last smoke-test result (persisted)
+    this._probeInterval = null;
+    this._probeStartupTimer = null;
+    this._probeInFlight = new Set();     // types being probed right now
+    this._reloadInFlight = null;  // serialize concurrent _reload() calls
+  }
+
+  // ── Agent smoke tests (probes) ─────────────────────────────────────────
+  // A probe runs one tiny end-to-end prompt through an AGENT (see probe.js)
+  // — the check that catches "connected but never answers". Results are
+  // keyed by agent name (a probe belongs to a configured agent, never to a
+  // bare agent type), persisted so a daemon restart doesn't re-spend LLM
+  // calls, and reported per agent on the node heartbeat's roster.
+
+  _probesFile() {
+    return path.join(os.homedir(), '.openagents', 'probes.json');
+  }
+
+  _loadProbes() {
+    try {
+      const data = JSON.parse(fs.readFileSync(this._probesFile(), 'utf-8'));
+      // v2 shape: { agents: { <name>: result } }. The v1 file was keyed by
+      // type — discard it rather than misattribute results to agents.
+      if (data && typeof data.agents === 'object') return data.agents;
+      return {};
+    } catch { return {}; }
+  }
+
+  _saveProbes() {
+    try {
+      fs.mkdirSync(path.dirname(this._probesFile()), { recursive: true });
+      fs.writeFileSync(this._probesFile(), JSON.stringify({ agents: this._probes }, null, 2), 'utf-8');
+    } catch {}
+  }
+
+  /**
+   * Probe one configured agent via a child `agn probe <type> --json` (same
+   * off-event-loop pattern as _refreshRuntimes; a probe can block for its
+   * full timeout). The check exercises the agent's type runtime with the
+   * same env the agent runs with; the result is stored under the agent name.
+   */
+  async _probeAgent(name) {
+    if (this._probeInFlight.has(name)) return this._probes[name] || null;
+    const agent = this.config.getAgent(name);
+    if (!agent) return null;
+    const type = agent.type || 'openclaw';
+    this._probeInFlight.add(name);
+    try {
+      const r = await this._runAgn(['probe', type, '--json']);
+      let parsed = null;
+      try { parsed = JSON.parse(r.stdout.trim()); } catch {}
+      if (!parsed || typeof parsed !== 'object') {
+        parsed = {
+          type, ok: false, method: 'none', code: 'probe_error',
+          message: (r.stderr || 'probe failed').slice(0, 400),
+          guidance: [], at: new Date().toISOString(),
+        };
+      }
+      parsed.agent = name;
+      this._probes[name] = parsed;
+      this._saveProbes();
+      return parsed;
+    } finally {
+      this._probeInFlight.delete(name);
+    }
+  }
+
+  /**
+   * Periodic sweep: probe each configured agent whose last result is missing
+   * or stale. Sequential on purpose — probes cost a (tiny) model call each;
+   * there is no hurry.
+   */
+  async _probeConfiguredAgents(maxAgeMs) {
+    for (const a of this.config.getAgents()) {
+      const last = this._probes[a.name];
+      const age = last && last.at ? Date.now() - Date.parse(last.at) : Infinity;
+      if (age < maxAgeMs) continue;
+      try { await this._probeAgent(a.name); } catch {}
+    }
+    this._nodeHeartbeat();
+  }
+
+  /**
+   * Heartbeat this device (node) to EVERY workspace it is paired to,
+   * independent of any agent, so each workspace's "connected devices" view
+   * stays live even with zero agents there.
+   *
+   * One device legitimately belongs to several workspaces at once — the node
+   * row is per (workspace, device) — so this iterates the pairing list rather
+   * than the single top-level record. Each pairing gets its own roster, scoped
+   * to that workspace's agents. Best-effort: node liveness is non-critical to
+   * agent operation, and one workspace being unreachable must not stop the
+   * others from reporting, so the pairings are heartbeated concurrently and
+   * failures are contained per pairing.
+   */
+  async _nodeHeartbeat() {
+    const nodeCfg = require('./node-config');
+    const pairings = nodeCfg.listPairings().filter((p) => p && p.node_id && p.token);
+    if (!pairings.length) return;  // no node connected
+    const info = { ...nodeCfg.gatherDeviceInfo(), runtimes: this._runtimes || [], fs: this._buildFs() };
+    await Promise.all(pairings.map((p) => this._nodeHeartbeatOne(nodeCfg, p, info)));
+  }
+
+  /**
+   * Restart any adapter whose workspace credential has rotated on disk.
+   *
+   * Re-pairing a device (launcher, CLI, or the workspace's own reconnect flow)
+   * writes a fresh token to node.json / daemon.yaml and the server revokes the
+   * old one. An adapter launched before that keeps its stale token in memory
+   * and every join/poll/heartbeat 401s until someone manually restarts it —
+   * the dashboard meanwhile shows the agent stuck on "Spinning up…". This
+   * watch closes that gap: credentials are re-resolved from disk (pairing
+   * first, saved network as fallback — same order as launch) and a changed
+   * token triggers an in-process restart, which picks the new credential up.
+   */
+  _reconcileAdapterCredentials() {
+    if (this._shuttingDown) return;
+    for (const [name, info] of Object.entries(this._processes || {})) {
+      if (!info || !info.networkRef || info._credRestartPending) continue;
+      if (!this._adapters || !this._adapters[name]) continue;
+      let fresh = null;
+      try { fresh = this._resolveAgentNetwork(info.networkRef); } catch { /* keep running on the current token */ }
+      if (!fresh || !fresh.token || fresh.token === info.credentialToken) continue;
+      // Flag on the CURRENT info object: restartAgent replaces it with a fresh
+      // one on relaunch, so the flag cannot wedge the watch permanently.
+      info._credRestartPending = true;
+      this._log(`${name}: workspace credential for '${info.networkRef}' rotated (device re-paired) — restarting to pick up the new token`);
+      this.restartAgent(name).catch((e) => {
+        info._credRestartPending = false;
+        this._log(`${name}: credential-rotation restart failed: ${e.message}`);
+      });
+    }
+  }
+
+  /** The WorkspaceClient for one pairing, created on first use and reused. */
+  _nodeClientFor(n) {
+    let client = this._nodeClients.get(n.workspace_id);
+    if (!client) {
+      client = new WorkspaceClient(n.endpoint);
+      this._nodeClients.set(n.workspace_id, client);
+    }
+    return client;
+  }
+
+  /** One pairing's heartbeat. Never throws — see _nodeHeartbeat. */
+  async _nodeHeartbeatOne(nodeCfg, n, info) {
+    let resp;
+    try {
+      resp = await this._nodeClientFor(n).nodeHeartbeat(n.node_id, n.token, { ...info, agents: this._buildRoster(n) });
+    } catch (err) {
+      // A 404 is the workspace's definitive word that this node (or that whole
+      // workspace) no longer exists — an owner unpaired the device. Nothing
+      // local can revive it, so forget THAT pairing: keep the device key for a
+      // future re-pair, and leave every other workspace's pairing alone.
+      // Without this the launcher kept showing "connected" long after a remote
+      // removal, since node.json was only ever reconciled by the UI on demand.
+      // Transient failures (timeouts, 5xx, auth blips) say nothing about the
+      // row's existence, so those are swallowed and retried next tick.
+      if (err && err.status === 404) {
+        try { nodeCfg.clearPairing(n.workspace_id); } catch {}
+        this._nodeClients.delete(n.workspace_id);
+        this._log(`node ${n.node_id} no longer recognized by workspace ${n.workspace_slug || n.workspace_id} — pairing cleared`);
+      }
+      return;  // nothing more to do for this pairing this tick
+    }
+    // The heartbeat response is our push channel: run any queued remote
+    // agent-management commands the workspace enqueued for this node. Fire
+    // them off without blocking the heartbeat loop (an install can take
+    // minutes — awaiting here would stall liveness and stack up commands).
+    const commands = (resp && resp.commands) || [];
+    for (const cmd of commands) {
+      const id = cmd.commandId;
+      if (!id || this._runningCommands.has(id)) continue;
+      this._runningCommands.add(id);
+      this._runNodeCommand(n, cmd).finally(() => this._runningCommands.delete(id));
+    }
+  }
+
+  /**
+   * Reflect workspace-side renames back onto this device.
+   *
+   * The workspace is treated as authoritative for the label, which needs no
+   * timestamps to be correct: a rename started on the device writes to the
+   * workspace FIRST and only then to local config (see
+   * AgentConnector.setAgentDisplayName), so by the time this reads, the
+   * workspace already holds whatever the device just set. Anything different
+   * from local therefore came from the workspace and should win.
+   *
+   * Never throws — a workspace that is unreachable simply leaves the labels
+   * as they are until the next pass.
+   */
+  async _syncDisplayNames() {
+    let pairings = [];
+    try {
+      pairings = require('./node-config').listPairings();
+    } catch { return; }
+
+    for (const n of pairings) {
+      if (!n.workspace_id || !n.token) continue;
+      let members = [];
+      try {
+        members = await this._nodeClientFor(n).getAgents(n.workspace_id, n.token);
+      } catch { continue; }
+
+      const byName = new Map(members.map((m) => [m.agentName, m]));
+      for (const a of this.config.getAgents()) {
+        // Scoped to this pairing's workspace, like _buildRoster: an agent in
+        // another workspace must never be relabelled from this one.
+        if (!this._agentOnNodeWorkspace(a, n)) continue;
+        const remote = byName.get(a.name);
+        if (!remote) continue;
+        const local = a.display_name || null;
+        const wanted = remote.displayName || null;
+        if (local === wanted) continue;
+        try {
+          this.config.updateAgent(a.name, { display_name: wanted || undefined });
+          this._log(`display name for ${a.name} updated from workspace`);
+        } catch {}
+      }
+    }
+  }
+
+  /**
+   * True if agent `a` is bound to the node's currently-connected workspace.
+   * A missing network never matches (guards against undefined === undefined
+   * leaking local-only agents when a node field is also unset).
+   */
+  _agentOnNodeWorkspace(a, node) {
+    if (!a || !a.network || !node) return false;
+    return a.network === node.workspace_slug || a.network === node.workspace_id;
+  }
+
+  /**
+   * Roster of agents this node hosts, for the workspace's node view. Sourced
+   * from config (the source of truth for what's configured) and augmented with
+   * live process state, so a removed agent drops off immediately rather than
+   * lingering as a stale 'stopped' process entry.
+   *
+   * SECURITY: scoped to the node's currently-connected workspace. An agent
+   * connected to a DIFFERENT workspace (or a local-only agent with no network)
+   * must never leak into — or be controllable from — a workspace it was never
+   * added to. Each agent belongs to exactly one workspace; this node reports
+   * only the agents that belong to the one it's paired with right now.
+   */
+  _buildRoster(node) {
+    const roster = [];
+    try {
+      for (const a of this.config.getAgents()) {
+        if (!this._agentOnNodeWorkspace(a, node)) continue;
+        const proc = this._processes[a.name];
+        // Model/key: per-agent env override, else the type-level saved env.
+        // Both power the workspace agent cards; the key goes out MASKED only,
+        // so the edit form can show a key is configured without the secret
+        // ever leaving the device.
+        let typeEnv = {};
+        try { typeEnv = this.envManager.load(a.type) || {}; } catch {}
+        const model = (a.env && a.env.LLM_MODEL) || typeEnv.LLM_MODEL || null;
+        const apiKey = (a.env && a.env.LLM_API_KEY) || typeEnv.LLM_API_KEY || null;
+        roster.push({
+          name: a.name,
+          type: a.type || 'unknown',
+          status: (proc && proc.state) || 'stopped',
+          model: model || null,
+          workingDir: a.path || null,
+          apiKeyMasked: apiKey ? maskApiKey(apiKey) : null,
+          probe: this._probes[a.name] || null,
+        });
+      }
+    } catch {
+      // best-effort
+    }
+    return roster;
+  }
+
+  /**
+   * Filesystem hint for the working-directory picker: home, its immediate
+   * (non-hidden) subfolders, and the device's filesystem roots. Roots let a
+   * Windows user switch drives instead of being trapped on the home drive.
+   */
+  _buildFs() {
+    try {
+      const home = os.homedir();
+      const dirs = fs.readdirSync(home, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && !d.name.startsWith('.'))
+        .map((d) => d.name)
+        .sort((a, b) => a.localeCompare(b))
+        .slice(0, 100);
+      return { home, dirs, roots: filesystemRoots() };
+    } catch {
+      return {};
+    }
+  }
+
+  /** List the (non-hidden) subfolders of a directory, for on-demand browsing. */
+  _listDir(dir) {
+    const target = dir && String(dir).trim() ? String(dir) : os.homedir();
+    const dirs = fs.readdirSync(target, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith('.'))
+      .map((d) => d.name)
+      .sort((a, b) => a.localeCompare(b))
+      .slice(0, 500);
+    const parent = path.dirname(target);
+    return { path: target, parent: parent === target ? null : parent, dirs };
+  }
+
+  /**
+   * Detect, for every supported agent type, whether its runtime is installed and
+   * logged-in/ready on this device. Runs `agn runtimes --json` in a CHILD process
+   * so the (synchronous, execSync-heavy) version/login probes never block the
+   * daemon's event loop. Result is reported to the workspace on the heartbeat.
+   */
+  /**
+   * Persist an agent's model. Sets the generic LLM_MODEL (used by LLM-direct
+   * adapters) plus the env var the agent's own CLI reads, so a model picked in
+   * the workspace actually takes effect (e.g. Claude reads ANTHROPIC_MODEL).
+   */
+  async _setModelEnv(type, model) {
+    const val = String(model || '');
+    await this._runAgn(['env', type, '--set', `LLM_MODEL=${val}`]);
+    const nativeVar = { claude: 'ANTHROPIC_MODEL', gemini: 'GEMINI_MODEL' }[type] || this._nativeModelVar(type);
+    if (nativeVar) await this._runAgn(['env', type, '--set', `${nativeVar}=${val}`]);
+  }
+
+  /**
+   * The agent's own model setting, for a type whose registry declares one and
+   * does not map LLM_MODEL onto anything itself (CodeArts reads CODEARTS_MODEL
+   * and nothing else). A type with a resolve_env rule for LLM_MODEL already
+   * gets there through env resolution, so it is left alone.
+   */
+  _nativeModelVar(type) {
+    try {
+      const entry = this.registry.getEntry(type);
+      if (!entry) return null;
+      const rules = (entry.resolve_env && entry.resolve_env.rules) || [];
+      if (rules.some((r) => r && r.from === 'LLM_MODEL')) return null;
+      const field = (entry.env_config || []).find(
+        (f) => f && /_MODEL$/.test(f.name || '') && f.name !== 'LLM_MODEL',
+      );
+      return field ? field.name : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async _refreshRuntimes() {
+    try {
+      const r = await this._runAgn(['runtimes', '--json']);
+      if (r.code === 0 && r.stdout) {
+        const parsed = JSON.parse(r.stdout.trim());
+        if (Array.isArray(parsed)) this._runtimes = parsed;
+      }
+    } catch {
+      // keep the previous snapshot on failure
+    }
+  }
+
+  /**
+   * Execute one remote command by shelling out to this same launcher's CLI, so
+   * all of create/install/connect/start/stop/remove reuses the exact code path a
+   * local `agn` invocation would — then report the outcome back to the workspace.
+   */
+    /**
+   * Apply a workspace-sent config map, ALLOWLISTED to the agent type's own
+   * registry env_config keys. Arbitrary env is refused — a workspace admin
+   * must not be able to push NODE_OPTIONS-class variables onto a device.
+   * (Credential contract: config flows down transiently, secrets persist
+   * only here, in the device's env store.)
+   */
+  async _applyConfigMap(type, config) {
+    if (!config || typeof config !== 'object') return;
+    let allowed = null;
+    try {
+      const entry = this.registry.getEntry(type);
+      allowed = new Set(
+        ((entry && entry.env_config) || []).map((f) => f.name).filter(Boolean)
+      );
+    } catch {
+      return; // no registry entry — refuse everything rather than guess
+    }
+    for (const [key, value] of Object.entries(config)) {
+      if (!allowed.has(key)) {
+        this._log(`config for '${type}': refused non-env_config key '${key}'`);
+        continue;
+      }
+      if (value === null || value === undefined) continue;
+      await this._runAgn(['env', type, '--set', `${key}=${String(value)}`]);
+    }
+  }
+
+async _runNodeCommand(n, cmd) {
+    const action = cmd.action;
+    const args = cmd.args || {};
+    const name = (args.name || '').trim();
+    let ok = false;
+    let message = '';
+    let data = null;
+    // SECURITY: a workspace may only act on agents bound to it. Reject commands
+    // that target an existing agent connected to a different workspace, so a
+    // newly-paired workspace can't start/stop/remove/reconfigure agents that
+    // belong to another one (they surface in no roster of ours either).
+    const AGENT_SCOPED = new Set(['start_agent', 'stop_agent', 'remove_agent', 'configure_agent']);
+    try {
+      if (AGENT_SCOPED.has(action)) {
+        const existing = this.config.getAgent(name);
+        if (!existing || !this._agentOnNodeWorkspace(existing, n)) {
+          throw new Error(`Agent '${name}' is not managed by this workspace`);
+        }
+      }
+      if (action === 'create_agent') {
+        const type = (args.type || '').trim();
+        // Working directory: use the one the user picked, else a managed folder
+        // under the launcher home so every remote-created agent has a clean,
+        // predictable home without the user typing a path.
+        let workingDir = (args.workingDir || '').trim();
+        if (!workingDir) workingDir = path.join(os.homedir(), '.openagents', 'agents', name);
+        try { fs.mkdirSync(workingDir, { recursive: true }); } catch {}
+        const r1 = await this._runAgn(['create', name, '--type', type, '--install', '--path', workingDir]);
+        if (r1.code !== 0) throw new Error(r1.stderr || r1.stdout || 'create failed');
+        // Optional credentials for API-key agents (generic → provider mapping
+        // happens in env resolution). `useDeviceCredentials` means the device
+        // already holds them — nothing to write.
+        if (args.apiKey && !args.useDeviceCredentials)
+          await this._runAgn(['env', type, '--set', `LLM_API_KEY=${args.apiKey}`]);
+        if (args.model) await this._setModelEnv(type, args.model);
+        if (args.baseUrl) await this._runAgn(['env', type, '--set', `LLM_BASE_URL=${args.baseUrl}`]);
+        await this._applyConfigMap(type, args.config);
+        // Attach to this node's workspace BY SLUG: the daemon already knows
+        // which workspace this command came from, so there is no token to
+        // pass and no /v1/token/resolve round-trip to fail (the outage class
+        // that used to break remote installs).
+        const r2 = await this._runAgn([
+          'connect', name, '--workspace', n.workspace_slug || n.workspace_id,
+        ]);
+        if (r2.code !== 0) throw new Error(r2.stderr || r2.stdout || 'connect failed');
+        ok = true;
+        message = `Agent '${name}' created`;
+        // First-connect smoke test, in the background (a probe can take its
+        // full timeout — never hold the create result hostage). The outcome
+        // reaches the workspace via the heartbeat's agents[].probe.
+        this._probeAgent(name).then(() => this._nodeHeartbeat()).catch(() => {});
+      } else if (action === 'start_agent') {
+        const r = await this._runAgn(['start', name]);
+        ok = r.code === 0;
+        message = ok ? `Agent '${name}' started` : (r.stderr || r.stdout || 'start failed');
+      } else if (action === 'stop_agent') {
+        const r = await this._runAgn(['stop', name]);
+        ok = r.code === 0;
+        message = ok ? `Agent '${name}' stopped` : (r.stderr || r.stdout || 'stop failed');
+      } else if (action === 'remove_agent') {
+        const r = await this._runAgn(['remove', name]);
+        ok = r.code === 0;
+        message = ok ? `Agent '${name}' removed` : (r.stderr || r.stdout || 'remove failed');
+      } else if (action === 'configure_agent') {
+        // Reconfigure an existing agent: update model/key (type-level env), then
+        // restart it so the change takes effect. Working-dir changes require a
+        // recreate (agn has no in-place path change) at the new path.
+        const type = (args.type || '').trim();
+        if (args.apiKey && !args.useDeviceCredentials)
+          await this._runAgn(['env', type, '--set', `LLM_API_KEY=${args.apiKey}`]);
+        if (args.model !== undefined) await this._setModelEnv(type, args.model);
+        if (args.baseUrl !== undefined) await this._runAgn(['env', type, '--set', `LLM_BASE_URL=${args.baseUrl}`]);
+        await this._applyConfigMap(type, args.config);
+        const newDir = (args.workingDir || '').trim();
+        if (newDir && newDir !== (args.currentWorkingDir || '')) {
+          try { fs.mkdirSync(newDir, { recursive: true }); } catch {}
+          await this._runAgn(['remove', name]);
+          const rc = await this._runAgn(['create', name, '--type', type, '--install', '--path', newDir]);
+          if (rc.code !== 0) throw new Error(rc.stderr || rc.stdout || 'recreate failed');
+          const rc2 = await this._runAgn([
+            'connect', name, '--workspace', n.workspace_slug || n.workspace_id,
+          ]);
+          if (rc2.code !== 0) throw new Error(rc2.stderr || rc2.stdout || 'connect failed');
+        } else {
+          // Restart in-process. `agn stop` + `agn start` both round-trip
+          // through daemon.cmd, and writeCommand() OVERWRITES that file — the
+          // start could clobber the unread stop (agent keeps the stale env) or
+          // interleave with the poll so the agent stops and never restarts.
+          await this.restartAgent(name);
+        }
+        ok = true;
+        message = `Agent '${name}' reconfigured`;
+        // A reconfigure changes credentials/model — re-verify in the
+        // background so the workspace sees the new state without a manual test.
+        this._probeAgent(name).then(() => this._nodeHeartbeat()).catch(() => {});
+      } else if (action === 'probe_agent') {
+        // Smoke-test on demand ("Re-test" in the workspace). Probes belong to
+        // configured agents (by name); the result rides agents[].probe.
+        if (!name) throw new Error('Missing agent name');
+        const agent = this.config.getAgent(name);
+        if (!agent || !this._agentOnNodeWorkspace(agent, n)) {
+          throw new Error(`Agent '${name}' is not managed by this workspace`);
+        }
+        const probe = await this._probeAgent(name);
+        ok = !!(probe && probe.ok);
+        message = (probe && probe.message) || (ok ? 'Smoke test passed' : 'Smoke test failed');
+        data = { probe };
+        // Push the fresh result right away (same pattern as detect_runtimes).
+        this._nodeHeartbeat();
+      } else if (action === 'detect_runtimes') {
+        await this._refreshRuntimes();
+        // Push the fresh detection right away rather than waiting for the next
+        // heartbeat, so the workspace's Add-agent gallery updates promptly.
+        this._nodeHeartbeat();
+        ok = true;
+        message = `Detected ${this._runtimes.length} runtime(s)`;
+      } else if (action === 'list_dir') {
+        data = this._listDir(args.path);
+        ok = true;
+        message = `Listed ${data.dirs.length} folder(s)`;
+      } else {
+        message = `Unknown action '${action}'`;
+      }
+    } catch (e) {
+      ok = false;
+      message = e.message || String(e);
+    }
+    try {
+      // Report back to the workspace that issued the command — with several
+      // pairings live, the result must not go out over another one's client.
+      await this._nodeClientFor(n).nodeCommandResult(cmd.commandId, n.token, { ok, message, data });
+    } catch {
+      // best-effort; the command stays 'running' if we can't report back
+    }
+  }
+
+  /** Run this launcher's own CLI as a child process, capturing output. */
+  _runAgn(cliArgs) {
+    return new Promise((resolve) => {
+      let bin;
+      try {
+        bin = require.resolve('../bin/agent-connector.js');
+      } catch {
+        bin = process.argv[1];
+      }
+      const child = spawn(process.execPath, [bin, ...cliArgs], {
+        env: { ...getEnhancedEnv(), OPENAGENTS_SKIP_UPDATE_CHECK: '1' },
+        // Run from home so a created agent's default working dir is sensible
+        // (not the ~/.openagents config dir).
+        cwd: os.homedir(),
+        // The daemon has no console of its own (it is spawned DETACHED), so a
+        // child without this gets a fresh console window — the blank black box
+        // that used to appear every time _refreshRuntimes() ran.
+        windowsHide: true,
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (d) => { stdout += d.toString(); });
+      child.stderr.on('data', (d) => { stderr += d.toString(); });
+      child.on('error', (e) => resolve({ code: 1, stdout, stderr: stderr || e.message }));
+      child.on('close', (code) => resolve({ code, stdout, stderr }));
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Public API
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Start all configured agents and block until shutdown.
+   * Call this from the foreground daemon process.
+   */
+  async start() {
+    const agents = this.config.getAgents();
+    for (const agent of agents) {
+      this._launchAgent(agent);
+    }
+
+    // Install signal handlers
+    const shutdown = () => this.stop();
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
+    if (!IS_WINDOWS && process.on) {
+      try { process.on('SIGHUP', () => this._reload()); } catch {}
+    }
+
+    // Crash guards. A bug in one adapter — a rejected fire-and-forget promise,
+    // an EBADF from a double fs.closeSync in a child-process callback, a throw
+    // inside a stream/'exit' handler — must NEVER take down the whole daemon
+    // and every other agent with it. Node ≥15 terminates the process on an
+    // unhandled rejection by default, so without these the daemon silently
+    // dies and the launcher shows "Daemon stopped". Log loudly, keep
+    // supervising; per-agent failures are already isolated in _adapterLoop.
+    if (!this._crashGuardsInstalled) {
+      this._crashGuardsInstalled = true;
+      process.on('unhandledRejection', (reason) => {
+        const msg = reason && reason.stack ? reason.stack : String(reason);
+        this._log(`UNHANDLED REJECTION (daemon kept alive): ${msg}`);
+      });
+      process.on('uncaughtException', (err) => {
+        const msg = err && err.stack ? err.stack : String(err);
+        this._log(`UNCAUGHT EXCEPTION (daemon kept alive): ${msg}`);
+      });
+    }
+
+    // Write PID file
+    this._writePid();
+
+    // Periodic status (heavy: JSON serialize + write) every 5s.
+    this._statusInterval = setInterval(() => {
+      this._writeStatus();
+    }, 5000);
+
+    // Command file poll (cheap: existsSync on a tiny file) every 200ms so
+    // start/stop/restart from the launcher feels responsive. With a 5s
+    // combined interval, users saw up to 5s before the daemon even noticed
+    // a Stop click — this was especially painful on Windows where there's
+    // no SIGHUP shortcut and Stop landed near the end of a tick.
+    this._cmdInterval = setInterval(() => {
+      this._processCommands();
+    }, 200);
+
+    // Device-level heartbeat (connect-a-node), independent of agents. Also the
+    // delivery channel for remote agent-management commands, so keep it brisk
+    // (10s) — the request is tiny and it bounds remote-command pickup latency.
+    this._nodeHeartbeat();
+    this._nodeHeartbeatInterval = setInterval(() => this._nodeHeartbeat(), 10000);
+
+    // Credential-rotation watch. Re-pairing a device rotates the workspace
+    // token (and revokes the old one) while adapters holding the old token
+    // keep 401-ing forever — the "agent stuck spinning up after re-pair"
+    // failure. Pairings are re-read from disk on every pass, so a re-pair done
+    // by the launcher, the CLI or a remote command is picked up within a tick.
+    this._credReconcileInterval = setInterval(
+      () => this._reconcileAdapterCredentials(),
+      15000,
+    );
+
+    // Pull display-name renames made in the workspace back onto the device, so
+    // the two sides agree whichever one the user typed into. Separate from the
+    // 10s heartbeat on purpose: a label changes rarely and this is an extra
+    // request per paired workspace, so it runs a sixth as often.
+    this._displayNameInterval = setInterval(
+      () => this._syncDisplayNames(),
+      60000,
+    );
+
+    // Detect installed/logged-in agent runtimes for the Add-agent gallery. Runs
+    // in a child process (off the event loop), refreshed periodically.
+    this._refreshRuntimes();
+    this._runtimesInterval = setInterval(() => this._refreshRuntimes(), 120000);
+
+    // Smoke-test configured agent types periodically (each probe spends one
+    // tiny model call, so: only types with agents, only when the last result
+    // is a day old, and a few minutes after startup so install/login churn
+    // settles first). Persisted results keep restarts from re-spending calls.
+    // Hourly per-agent sweep — a stale/broken key should surface within the
+    // hour, not the day. Create/reconfigure probe immediately, so the sweep
+    // only tops up agents whose last result has aged out.
+    const PROBE_MAX_AGE_MS = 3600 * 1000;
+    this._probeStartupTimer = setTimeout(
+      () => this._probeConfiguredAgents(PROBE_MAX_AGE_MS).catch(() => {}),
+      3 * 60 * 1000,
+    );
+    this._probeInterval = setInterval(
+      () => this._probeConfiguredAgents(PROBE_MAX_AGE_MS).catch(() => {}),
+      3600 * 1000,
+    );
+
+    // Watch config file for hot-reload
+    this._watchConfig();
+
+    this._writeStatus();
+    this._cachedAgentNames = new Set(agents.map(a => a.name));
+    this._cachedAgentConfigs = {};
+    for (const a of agents) this._cachedAgentConfigs[a.name] = this._agentConfigFingerprint(a);
+    this._log(`Daemon started with ${agents.length} agent(s)`);
+
+    // Block until shutdown
+    await new Promise((resolve) => {
+      this._shutdownResolve = resolve;
+    });
+  }
+
+  /**
+   * Gracefully stop all agents and exit.
+   */
+  async stop() {
+    if (this._shuttingDown) return;
+    this._shuttingDown = true;
+    this._log('Shutting down...');
+
+    if (this._statusInterval) clearInterval(this._statusInterval);
+    if (this._cmdInterval) clearInterval(this._cmdInterval);
+    if (this._nodeHeartbeatInterval) clearInterval(this._nodeHeartbeatInterval);
+    if (this._credReconcileInterval) clearInterval(this._credReconcileInterval);
+    if (this._runtimesInterval) clearInterval(this._runtimesInterval);
+    if (this._displayNameInterval) clearInterval(this._displayNameInterval);
+    if (this._probeStartupTimer) clearTimeout(this._probeStartupTimer);
+    if (this._probeInterval) clearInterval(this._probeInterval);
+    if (this._configWatcher) { try { this._configWatcher.close(); } catch {} }
+
+    // Kill all child processes
+    const kills = Object.keys(this._processes).map((name) =>
+      this._killAgent(name, 5000)
+    );
+    await Promise.all(kills);
+
+    this._writeStatus();
+    this._cleanupPid();
+    this._log('Daemon stopped');
+
+    if (this._shutdownResolve) this._shutdownResolve();
+  }
+
+  /**
+   * Stop a single agent by name.
+   */
+  async stopAgent(agentName) {
+    this._stoppedAgents.add(agentName);
+    // Mark state as stopped immediately
+    if (this._processes[agentName]) {
+      this._processes[agentName].state = 'stopped';
+    }
+    this._writeStatus();
+    // Stop the adapter directly if running
+    if (this._adapters && this._adapters[agentName]) {
+      this._adapters[agentName].stop();
+    }
+    await this._killAgent(agentName, 5000);
+    // Wait for adapter loop to actually exit
+    for (let i = 0; i < 10; i++) {
+      if (!this._adapters || !this._adapters[agentName]) break;
+      await new Promise(r => setTimeout(r, 500));
+    }
+    // Force-clear the adapter slot if it's still hanging. Without this,
+    // a hung adapter.run() promise prevents the slot from ever being
+    // released, and subsequent start/restart commands see "already running".
+    if (this._adapters && this._adapters[agentName]) {
+      this._log(`WARNING: ${agentName} adapter did not exit after stop — force-releasing slot`);
+      try { this._adapters[agentName].stop(); } catch {}
+      delete this._adapters[agentName];
+    }
+    this._writeStatus();
+  }
+
+  /**
+   * Restart a single agent by name.
+   */
+  async restartAgent(agentName) {
+    // Set state to 'starting' immediately so UI never sees 'stopped' during restart
+    if (this._processes[agentName]) {
+      this._processes[agentName].state = 'starting';
+      this._writeStatus();
+    }
+
+    await this.stopAgent(agentName);
+
+    // stopAgent only waits 5s for `_adapters[name]` to disappear, but
+    // graceful adapter shutdown can take longer (control-poller cleanup,
+    // disconnect, in-flight CLI subprocess kill). If the adapter is still
+    // there when we reach _launchAgent, the duplicate-launch guard bails
+    // and the agent stays stuck in 'stopped'. Wait up to 20s so the
+    // launch sees a clean slate.
+    for (let i = 0; i < 40; i++) {
+      if (!this._adapters || !this._adapters[agentName]) break;
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    this._stoppedAgents.delete(agentName);
+
+    // Reload config in case it changed
+    this.config.load();
+
+    const agent = this.config.getAgent(agentName);
+    if (agent) {
+      this._launchAgent(agent);
+      this._writeStatus();
+    }
+  }
+
+  /**
+   * Get current status of all agents.
+   */
+  getStatus() {
+    const result = {};
+    for (const [name, info] of Object.entries(this._processes)) {
+      result[name] = {
+        state: info.state,
+        type: info.type || 'unknown',
+        network: info.network || '(local)',
+        restarts: info.restarts,
+        started_at: info.startedAt || null,
+        last_error: info.lastError || null,
+        error_reason: info.errorReason || null,
+      };
+    }
+    return result;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Daemonize — launch as background process
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Launch the daemon as a background process.
+   * The parent process prints info and exits; the child runs `start()`.
+   * @param {string[]} foregroundArgs - CLI args for the foreground child process
+   */
+  static daemonize(configDir, foregroundArgs, execPath) {
+    const logFile = path.join(configDir, 'daemon.log');
+    const pidFile = path.join(configDir, 'daemon.pid');
+    const bin = execPath || process.execPath;
+
+    fs.mkdirSync(configDir, { recursive: true });
+
+    // Refuse to start if an existing daemon is already running.
+    // Without this check, repeated `agn up` invocations would spawn
+    // multiple daemons that each process the same message → duplicate
+    // bot replies. Check BOTH the pid file and the status file (a live daemon
+    // rewrites the latter every 5s with its own pid): a clobbered/stale pid
+    // file must not let a duplicate slip past this guard.
+    const existingPid = Daemon.runningDaemonPid(configDir);
+    if (existingPid) {
+      console.error(`Daemon already running (PID ${existingPid}).`);
+      console.error(`Run 'agn down' first, or 'agn status' to check.`);
+      process.exit(1);
+    }
+    // Stale pid file — clean up before spawning fresh
+    if (Daemon._readPid(pidFile)) {
+      try { fs.unlinkSync(pidFile); } catch {}
+    }
+
+    const logFd = fs.openSync(logFile, 'a');
+
+    // Build env with enhanced PATH (ensures node/npm are findable)
+    const env = getEnhancedEnv();
+    // Ensure the directory containing the node binary is on PATH
+    const nodeBinDir = path.dirname(bin);
+    if (env.PATH && !env.PATH.includes(nodeBinDir)) {
+      env.PATH = nodeBinDir + path.delimiter + env.PATH;
+    }
+
+    const opts = {
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+      env,
+      cwd: configDir,
+    };
+    if (IS_WINDOWS) opts.windowsHide = true;
+
+    const proc = spawn(bin, foregroundArgs, opts);
+    proc.unref();
+    fs.writeFileSync(pidFile, String(proc.pid), 'utf-8');
+
+    // Give child a moment to start before closing the log fd
+    setTimeout(() => {
+      try { fs.closeSync(logFd); } catch {}
+    }, 1000);
+
+    console.log(`Daemon started (PID ${proc.pid})`);
+    console.log(`Logs: ${logFile}`);
+    console.log('Stop: agn down');
+  }
+
+  /**
+   * Stop a running daemon by reading PID file and sending signal.
+   * @returns {boolean} true if stopped
+   */
+  static stopDaemon(configDir) {
+    const pidFile = path.join(configDir, 'daemon.pid');
+    const statusFile = path.join(configDir, 'daemon.status.json');
+
+    // Resolve the REAL running daemon(s) from BOTH the pid file and the status
+    // file. A live daemon rewrites the status file every 5s with its own pid,
+    // so when the pid file is stale/clobbered the status file is the only
+    // record of the actual process. The old code trusted only the pid file:
+    // `agn down` would signal a dead pid, delete the files, report "Daemon
+    // stopped", and leave the real daemon orphaned — which then blocked every
+    // subsequent `agn up` ("already running") and kept its agents wedged.
+    const pids = Daemon._liveDaemonPids(configDir);
+
+    // SIGTERM every distinct live pid.
+    for (const pid of pids) {
+      try {
+        if (IS_WINDOWS) {
+          execSync(`taskkill /F /PID ${pid}`, { stdio: 'ignore', timeout: 5000 });
+        } else {
+          process.kill(pid, 'SIGTERM');
+        }
+      } catch {}
+    }
+
+    // Wait briefly, then SIGKILL any survivor that ignored SIGTERM (this is
+    // what today's zombie required — a foreground daemon that didn't exit on
+    // SIGTERM).
+    for (const pid of pids) {
+      let alive = Daemon._isAlive(pid);
+      for (let i = 0; alive && i < 5; i++) {
+        execSync(IS_WINDOWS ? 'ping -n 2 127.0.0.1 >nul' : 'sleep 0.5', {
+          stdio: 'ignore', timeout: 5000,
+        });
+        alive = Daemon._isAlive(pid);
+      }
+      if (alive) {
+        try {
+          if (IS_WINDOWS) {
+            execSync(`taskkill /F /PID ${pid}`, { stdio: 'ignore', timeout: 5000 });
+          } else {
+            process.kill(pid, 'SIGKILL');
+          }
+        } catch {}
+      }
+    }
+
+    // Always clear BOTH sources of truth so a fresh `agn up` starts clean.
+    try { fs.unlinkSync(pidFile); } catch {}
+    try { fs.unlinkSync(statusFile); } catch {}
+
+    return pids.length > 0;
+  }
+
+  /**
+   * Read daemon PID, returning null if not running.
+   */
+  static readDaemonPid(configDir) {
+    const pidFile = path.join(configDir, 'daemon.pid');
+    const statusFile = path.join(configDir, 'daemon.status.json');
+    const pid = Daemon._readPid(pidFile);
+    if (pid && Daemon._isAlive(pid)) return pid;
+
+    // pid file missing or stale — fall back to the status file so `agn status`
+    // reports the SAME live daemon the `agn up` singleton guard detects.
+    // Otherwise status says "not running" (dead pid file) while up refuses
+    // ("already running", from the status file) — the exact contradiction that
+    // hid today's orphaned daemon.
+    const live = Daemon.runningDaemonPid(configDir);
+    if (live) return live;
+
+    Daemon._cleanupStaleDaemonFiles(pidFile, statusFile);
+    return null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal — agent launch
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The workspace record an agent joins with. The device pairing (node.json)
+   * is the authoritative credential — it is refreshed by every re-pair —
+   * with the saved network entry (daemon.yaml) as the manual-connection
+   * fallback. Fields from the network entry win for display (name), the
+   * pairing wins for credentials (token/endpoint).
+   */
+  _resolveAgentNetwork(ref) {
+    const network =
+      this.config.getNetworks().find((n) => n.slug === ref || n.id === ref) ||
+      null;
+    let pairing = null;
+    try {
+      pairing = require('./node-config')
+        .listPairings()
+        .find((p) => p.workspace_slug === ref || p.workspace_id === ref) || null;
+    } catch {}
+    if (!network && !pairing) return null;
+    return {
+      id: (network && network.id) || (pairing && pairing.workspace_id) || null,
+      slug: (network && network.slug) || (pairing && pairing.workspace_slug) || ref,
+      name:
+        (network && network.name) || (pairing && pairing.workspace_name) || ref,
+      endpoint:
+        (pairing && pairing.endpoint) || (network && network.endpoint) || null,
+      token: (pairing && pairing.token) || (network && network.token) || null,
+    };
+  }
+
+  _launchAgent(agentCfg) {
+    const name = agentCfg.name;
+    const type = agentCfg.type || 'openclaw';
+
+    // Prevent duplicate launches — if an adapter is already running, skip
+    if (this._adapters && this._adapters[name]) {
+      this._log(`${name} already running, skipping duplicate launch`);
+      return;
+    }
+
+    this._stoppedAgents.delete(name);
+
+    const info = {
+      type,
+      network: agentCfg.network || '(local)',
+      state: 'starting',
+      restarts: 0,
+      startedAt: null,
+      lastError: null,
+      // Structured failure reason (health-status REASON) paired with lastError,
+      // so the UI/TUI can classify "why" without parsing the message.
+      errorReason: null,
+      proc: null,
+      _backoff: 2,
+    };
+    this._processes[name] = info;
+
+    // Workspace-connected agents use the adapter loop (poll + CLI per message).
+    // Local-only agents use the spawn loop (long-running child process).
+    const network = agentCfg.network
+      ? this._resolveAgentNetwork(agentCfg.network)
+      : null;
+
+    if (network && !network.token) {
+      // A known workspace with no credential anywhere: the device was
+      // unpaired (or a future token-free entry has no pairing behind it).
+      // Say so instead of letting the join fail with a bare 401.
+      info.state = 'error';
+      info.network = agentCfg.network;
+      info.lastError =
+        'workspace credentials missing — re-pair this device with the workspace';
+      this._writeStatus();
+      this._log(
+        `${name} cannot join '${agentCfg.network}': no pairing and no saved token — re-pair the device`
+      );
+    } else if (network) {
+      // Remember which credential this adapter runs with, so the rotation
+      // watch can restart it when a re-pair hands the workspace a new token.
+      info.networkRef = agentCfg.network;
+      info.credentialToken = network.token;
+      this._adapterLoop(name, agentCfg, info, network);
+    } else {
+      // No workspace connected — agent is running locally
+      info.state = 'running';
+      info.network = '(local)';
+      this._writeStatus();
+      this._log(`${name} running (local only, no workspace connected)`);
+    }
+  }
+
+  async _spawnLoop(name, agentCfg, info) {
+    const cmd = this._getLaunchCommand(agentCfg);
+    if (!cmd) {
+      info.state = 'running';
+      info.startedAt = new Date().toISOString();
+      this._log(`${name} registered (no launch command for ${agentCfg.type})`);
+      return;
+    }
+
+    const env = this._buildAgentEnv(agentCfg);
+    const cwd = agentCfg.path || undefined;
+
+    while (!this._shuttingDown && !this._stoppedAgents.has(name)) {
+      try {
+        info.state = 'starting';
+        this._writeStatus();
+
+        this._log(`${name} launching: ${cmd.join(' ')}`);
+        const proc = this._spawnAgent(cmd, { env, cwd });
+        info.proc = proc;
+        info.state = 'running';
+        info.startedAt = new Date().toISOString();
+        this._writeStatus();
+        this._log(`${name} running (PID ${proc.pid})`);
+
+        // Stream output to log
+        if (proc.stdout) {
+          proc.stdout.on('data', (chunk) => {
+            const lines = chunk.toString().split('\n').filter(Boolean);
+            for (const line of lines) {
+              this._log(`[${name}] ${line}`);
+            }
+          });
+        }
+
+        const exitCode = await new Promise((resolve) => {
+          proc.on('exit', (code) => resolve(code));
+          proc.on('error', (err) => {
+            this._log(`${name} spawn error: ${err.message}`);
+            resolve(1);
+          });
+        });
+
+        info.proc = null;
+
+        if (this._stoppedAgents.has(name)) {
+          this._log(`${name} was stopped, not restarting`);
+          break;
+        }
+
+        if (exitCode === 0) {
+          this._log(`${name} exited cleanly`);
+          break;
+        }
+
+        throw new Error(`Process exited with code ${exitCode}`);
+      } catch (err) {
+        if (this._stoppedAgents.has(name) || this._shuttingDown) break;
+
+        info.restarts++;
+        info.state = 'error';
+        info.lastError = (err.message || String(err)).slice(0, 200);
+        this._writeStatus();
+
+        if (info.restarts >= 10) {
+          this._log(`${name} crashed ${info.restarts} times, giving up. Fix the issue and restart manually.`);
+          info.state = 'stopped';
+          this._writeStatus();
+          break;
+        }
+
+        this._log(`${name} crashed: ${info.lastError}, restarting in ${info._backoff}s (attempt ${info.restarts})`);
+        await this._sleep(info._backoff * 1000);
+        info._backoff = Math.min(info._backoff * 2, 60);
+      }
+    }
+
+    info.state = 'stopped';
+    this._writeStatus();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal — adapter loop (workspace-connected agents)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Apply a live status update reported by a running adapter (join/heartbeat
+   * health). A genuine failure reason → state 'error' + redacted last_error so
+   * the Agents list / TUI show the real cause; a null reason → recovered, clear
+   * the error. Ignored once the agent is stopping (a user stop must win).
+   */
+  _applyAdapterStatus(name, info, update) {
+    if (!update || this._shuttingDown || this._stoppedAgents.has(name)) return;
+    const { isErrorReason, redactDiagnostic } = require('./adapters/health-status');
+    const reason = update.reason || null;
+    if (reason && isErrorReason(reason)) {
+      info.state = 'error';
+      info.errorReason = reason;
+      info.lastError = redactDiagnostic(update.message || reason);
+    } else {
+      // Recovered / healthy again — clear any prior connectivity error.
+      if (info.state === 'error') info.state = 'running';
+      info.errorReason = null;
+      info.lastError = null;
+    }
+    this._writeStatus();
+  }
+
+  async _adapterLoop(name, agentCfg, info, network) {
+    const { createAdapter } = require('./adapters');
+    const { skillsToDisabledModules } = require('./skill-catalog');
+    const { redactDiagnostic } = require('./adapters/health-status');
+    const agentType = agentCfg.type || 'openclaw';
+    const endpoint = network.endpoint || 'https://workspace-endpoint.openagents.org';
+
+    let adapter;
+    try {
+      adapter = createAdapter(agentType, {
+        // Networks created via the launcher can be persisted with id: null
+        // (the workspace service returns only a slug). The server identifies
+        // a workspace by its slug — the same value the web UI uses in its URL —
+        // so fall back to it. Joining with a null id makes every poll/heartbeat
+        // fail "Network not found", which spins the adapter in an error loop.
+        workspaceId: network.id || network.slug,
+        channelName: 'general',
+        token: network.token,
+        agentName: name,
+        endpoint,
+        agentType,
+        openclawAgentId: agentCfg.openclaw_agent_id || 'main',
+        disabledModules: skillsToDisabledModules(agentCfg.skills),
+        agentEnv: this._buildAgentEnv(agentCfg),
+        // Always give the agent a real, writable working directory. Without an
+        // explicit `path`, adapters used to fall back to process.cwd(), which on
+        // a packaged Windows launcher is C:\WINDOWS\system32 — so writing
+        // .claude/skills there failed with EPERM. Root it under ~/.openagents.
+        workingDir: agentCfg.path || defaultAgentWorkdir(name),
+        toolMode: agentCfg.tool_mode || 'skills',
+        // Live runtime/connectivity status → daemon.status.json (Agents list/TUI).
+        onStatus: (update) => this._applyAdapterStatus(name, info, update),
+      });
+    } catch (e) {
+      // A construction failure (e.g. unknown agent type in this core) is a hard
+      // error with a real cause — surface it (redacted), do not pretend stopped.
+      info.state = 'error';
+      info.errorReason = 'adapter_crashed';
+      info.lastError = redactDiagnostic(e.message || String(e));
+      this._log(`${name} failed to create ${agentType} adapter: ${info.lastError}`);
+      this._writeStatus();
+      return;
+    }
+
+    // Preflight: when the agent's runtime binary is genuinely missing, surface a
+    // precise reason ('runtime_missing') and DO NOT join the workspace — there is
+    // no point spinning a join/poll loop that can never run the CLI. Adapters
+    // that don't override preflight() always pass.
+    try {
+      const pf =
+        typeof adapter.preflight === 'function' ? adapter.preflight() : null;
+      if (pf && pf.ok === false) {
+        info.state = 'error';
+        info.errorReason = pf.reason || 'runtime_missing';
+        info.lastError = redactDiagnostic(pf.message || 'runtime not available');
+        this._writeStatus();
+        this._log(`${name} preflight failed (${info.errorReason}): ${info.lastError}`);
+        return;
+      }
+    } catch (e) {
+      this._log(`${name} preflight error (ignored, continuing): ${e.message}`);
+    }
+
+    // Store adapter reference for stop and duplicate detection
+    this._adapters[name] = adapter;
+
+    info.state = 'running';
+    info.startedAt = new Date().toISOString();
+    info.lastError = null;
+    info.errorReason = null;
+    this._writeStatus();
+    this._log(`${name} adapter online → ${network.slug} (type: ${agentType})`);
+
+    try {
+      // Run adapter poll loop — stops when adapter.stop() is called
+      // or when the daemon shuts down
+      const checkStop = setInterval(() => {
+        if (this._shuttingDown || this._stoppedAgents.has(name)) {
+          adapter.stop();
+          clearInterval(checkStop);
+        }
+      }, 1000);
+
+      await adapter.run();
+      clearInterval(checkStop);
+    } catch (e) {
+      info.errorReason = info.errorReason || 'adapter_crashed';
+      info.lastError = redactDiagnostic((e.message || String(e)).slice(0, 200));
+      this._log(`${name} adapter error: ${info.lastError}`);
+    }
+
+    delete this._adapters[name];
+
+    // Final state: a clean stop (user stop / daemon shutdown) is NEVER an error.
+    // A terminal failure recorded by the adapter (join/heartbeat/session-revoked)
+    // or a crash surfaces as 'error' with its classified, redacted reason.
+    const userStopped =
+      this._shuttingDown ||
+      this._stoppedAgents.has(name) ||
+      (typeof adapter.wasStopRequested === 'function' && adapter.wasStopRequested());
+    if (userStopped) {
+      info.state = 'stopped';
+      info.lastError = null;
+      info.errorReason = null;
+    } else {
+      const exit =
+        (typeof adapter.getExitInfo === 'function' && adapter.getExitInfo()) ||
+        null;
+      if (exit && exit.reason) {
+        info.state = 'error';
+        info.errorReason = exit.reason;
+        info.lastError = redactDiagnostic(exit.message || exit.reason);
+      } else if (info.errorReason) {
+        // A crash, or a live error report that never recovered — keep it visible.
+        info.state = 'error';
+      } else {
+        info.state = 'stopped';
+      }
+    }
+    this._writeStatus();
+    this._log(`${name} adapter stopped (state: ${info.state})`);
+  }
+
+  // NOTE: Adapter-specific message handling (openclaw, claude, codex)
+  // has been moved to src/adapters/. The daemon delegates via createAdapter().
+
+  _resolveAgentBinary(agentCfg) {
+    const entry = this.registry.getEntry(agentCfg.type);
+    let binary = (entry && entry.install && entry.install.binary);
+    if (!binary) {
+      const knownBinaries = {
+        openclaw: 'openclaw', claude: 'claude', codex: 'codex',
+        aider: 'aider', goose: 'goose', gemini: 'gemini',
+      };
+      binary = knownBinaries[agentCfg.type];
+    }
+    return binary || null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal — spawn loop (local-only agents)
+  // ---------------------------------------------------------------------------
+
+  _spawnAgent(cmd, opts) {
+    const [binary, ...args] = cmd;
+    const spawnOpts = {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: getEnhancedEnv(opts.env),
+      cwd: opts.cwd,
+      // Windows: cmd.exe would otherwise open a console window per agent (the
+      // daemon has none to inherit) and leave it up for the agent's lifetime.
+      windowsHide: true,
+    };
+
+    if (IS_WINDOWS) {
+      // On Windows, always use shell so .cmd/.ps1 shims on PATH are found
+      // Use cmd /c with chcp 65001 to force UTF-8 output (fixes GBK garbled text)
+      spawnOpts.shell = true;
+    }
+
+    const proc = spawn(binary, args, spawnOpts);
+
+    // Force UTF-8 decoding on stdout/stderr
+    if (proc.stdout) proc.stdout.setEncoding('utf-8');
+    if (proc.stderr) proc.stderr.setEncoding('utf-8');
+
+    // Merge stderr into stdout handler
+    if (proc.stderr) {
+      proc.stderr.on('data', (chunk) => {
+        if (proc.stdout) proc.stdout.emit('data', chunk);
+      });
+    }
+
+    return proc;
+  }
+
+  _getLaunchCommand(agentCfg) {
+    const binary = this._resolveAgentBinary(agentCfg);
+    if (!binary) return null;
+
+    const entry = this.registry.getEntry(agentCfg.type);
+    const args = [];
+
+    // Add launch args from registry
+    if (entry && entry.launch && entry.launch.args) {
+      for (const arg of entry.launch.args) {
+        args.push(arg.replace(/\{agent_name\}/g, agentCfg.name));
+      }
+    }
+
+    // Built-in launch profiles for local-only agents
+    if (!args.length) {
+      const type = agentCfg.type || '';
+      if (type === 'claude') {
+        args.push('--print');
+      } else if (type === 'codex') {
+        args.push('--quiet');
+      }
+    }
+
+    return [binary, ...args];
+  }
+
+  _buildAgentEnv(agentCfg) {
+    const type = agentCfg.type || 'openclaw';
+    const saved = this.envManager.load(type);
+    const mergedSaved = { ...saved, ...(agentCfg.env || {}) };
+    const resolved = this.envManager.resolve(type, mergedSaved, this.registry);
+    const merged = { ...mergedSaved, ...resolved };
+    return { ...process.env, ...merged };
+  }
+
+  _agentConfigFingerprint(agentCfg) {
+    return JSON.stringify({
+      network: agentCfg.network || '',
+      env: agentCfg.env || {},
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal — agent kill
+  // ---------------------------------------------------------------------------
+
+  async _killAgent(name, timeoutMs) {
+    const info = this._processes[name];
+    if (!info || !info.proc) {
+      if (info) info.state = 'stopped';
+      return;
+    }
+
+    const proc = info.proc;
+    info.proc = null;
+
+    // Try graceful termination
+    try {
+      if (IS_WINDOWS) {
+        execSync(`taskkill /PID ${proc.pid}`, { stdio: 'ignore', timeout: 5000 });
+      } else {
+        proc.kill('SIGTERM');
+      }
+    } catch {}
+
+    // Wait for exit
+    const died = await Promise.race([
+      new Promise((resolve) => proc.on('exit', () => resolve(true))),
+      this._sleep(timeoutMs).then(() => false),
+    ]);
+
+    if (!died) {
+      try {
+        if (IS_WINDOWS) {
+          execSync(`taskkill /F /PID ${proc.pid}`, { stdio: 'ignore', timeout: 5000 });
+        } else {
+          proc.kill('SIGKILL');
+        }
+      } catch {}
+    }
+
+    info.state = 'stopped';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Internal — status, commands, PID
+  // ---------------------------------------------------------------------------
+
+  _writeStatus() {
+    try {
+      const status = { agents: this.getStatus(), pid: process.pid };
+      fs.writeFileSync(this.config.statusFile, JSON.stringify(status, null, 2), 'utf-8');
+    } catch {}
+  }
+
+  _processCommands() {
+    const cmdFile = this.config.cmdFile;
+    try {
+      if (!fs.existsSync(cmdFile)) return;
+      const raw = fs.readFileSync(cmdFile, 'utf-8').trim();
+      fs.unlinkSync(cmdFile);
+      if (!raw) return;
+
+      for (const line of raw.split('\n')) {
+        const cmd = line.trim();
+        if (cmd.startsWith('stop:')) {
+          const agentName = cmd.slice(5).trim();
+          this._log(`Command: stop ${agentName}`);
+          this.stopAgent(agentName);
+        } else if (cmd.startsWith('start:')) {
+          const agentName = cmd.slice(6).trim();
+          // 'start' must be idempotent. The launcher sends start:<name> right
+          // after (re)spawning the daemon, but the daemon's own start() already
+          // launched every configured agent. A blind restart here tears down
+          // the just-joined workspace session and re-joins as the same agent;
+          // the server revokes the first session and the agent then stops the
+          // moment it next touches the workspace (e.g. the first user message →
+          // "thinking..." status). Only (re)launch when it isn't running.
+          const running =
+            (this._adapters && this._adapters[agentName]) ||
+            ['running', 'starting'].includes(
+              this._processes[agentName] && this._processes[agentName].state
+            );
+          if (running) {
+            this._log(`Command: start ${agentName} — already running, skipping`);
+          } else {
+            this._log(`Command: start ${agentName}`);
+            this.restartAgent(agentName);
+          }
+        } else if (cmd.startsWith('restart:')) {
+          const agentName = cmd.slice(8).trim();
+          this._log(`Command: restart ${agentName}`);
+          this.restartAgent(agentName);
+        } else if (cmd === 'reload') {
+          this._log('Command: reload');
+          this._reload();
+        }
+      }
+    } catch {}
+  }
+
+  _watchConfig() {
+    try {
+      let debounce = null;
+      this._configWatcher = fs.watch(this.config.configFile, () => {
+        if (debounce) clearTimeout(debounce);
+        debounce = setTimeout(() => this._reload(), 1000);
+      });
+      this._configWatcher.on('error', () => {});
+    } catch {}
+  }
+
+  async _reload() {
+    // Serialize reloads. fs.watch, the 'reload' command, and SIGHUP can
+    // all fire concurrently. Without a mutex, two _reload() calls in flight
+    // may both observe the same stale `this._adapters[name]` entry between
+    // stopAgent() and _launchAgent(), leaving a ghost adapter running
+    // alongside the new one → duplicate bot replies per message.
+    if (this._reloadInFlight) {
+      // Wait for the in-flight reload to finish, then run once more
+      // (the config may have changed again since it started).
+      this._reloadInFlight = this._reloadInFlight.then(
+        () => this._reloadUnsafe(),
+        () => this._reloadUnsafe(),
+      );
+      return this._reloadInFlight;
+    }
+    this._reloadInFlight = this._reloadUnsafe().finally(() => {
+      this._reloadInFlight = null;
+    });
+    return this._reloadInFlight;
+  }
+
+  async _reloadUnsafe() {
+    this._log('Reloading config...');
+    const oldNames = this._cachedAgentNames || new Set();
+    const oldConfigs = this._cachedAgentConfigs || {};
+    // Re-read config from disk
+    this.config.load();
+    const newAgents = this.config.getAgents();
+    const newNames = new Set(newAgents.map(a => a.name));
+    const newConfigs = {};
+    for (const a of newAgents) newConfigs[a.name] = this._agentConfigFingerprint(a);
+
+    // Stop removed agents
+    for (const name of oldNames) {
+      if (!newNames.has(name)) {
+        await this.stopAgent(name);
+        this._log(`Reload: stopped removed agent '${name}'`);
+      }
+    }
+
+    // Start new agents or restart agents whose network changed
+    for (const agent of newAgents) {
+      if (!oldNames.has(agent.name)) {
+        await this._ensureAdapterCleared(agent.name);
+        this._launchAgent(agent);
+        this._log(`Reload: started new agent '${agent.name}'`);
+      } else if ((oldConfigs[agent.name] || '') !== newConfigs[agent.name]) {
+        // Network or env config changed — restart agent
+        await this.stopAgent(agent.name);
+        this._stoppedAgents.delete(agent.name);
+        await this._ensureAdapterCleared(agent.name);
+        this._launchAgent(agent);
+        this._log(`Reload: restarted '${agent.name}' (config changed)`);
+      }
+    }
+
+    this._cachedAgentNames = newNames;
+    this._cachedAgentConfigs = newConfigs;
+    this._writeStatus();
+  }
+
+  /**
+   * Wait until the old adapter (if any) has fully released its slot in
+   * this._adapters before relaunching. stopAgent already waits up to 5s,
+   * but on slow shutdowns that can be too short — and _launchAgent's
+   * duplicate-check would then silently skip the relaunch, leaving the
+   * OLD adapter running instead of starting the new one.
+   */
+  async _ensureAdapterCleared(name) {
+    for (let i = 0; i < 20; i++) {
+      if (!this._adapters || !this._adapters[name]) return;
+      await this._sleep(500);
+    }
+    // Last resort: force-clear the slot so the new adapter can start.
+    // The old adapter will exit on its next poll iteration since its
+    // entry in _stoppedAgents triggers adapter.stop() via checkStop.
+    if (this._adapters && this._adapters[name]) {
+      this._log(`WARNING: adapter '${name}' did not clear after 10s — force-releasing slot to avoid duplicate`);
+      try { this._adapters[name].stop(); } catch {}
+      delete this._adapters[name];
+    }
+  }
+
+  _writePid() {
+    try {
+      fs.writeFileSync(this.config.pidFile, String(process.pid), 'utf-8');
+    } catch {}
+  }
+
+  _cleanupPid() {
+    try { fs.unlinkSync(this.config.pidFile); } catch {}
+    try { fs.unlinkSync(this.config.statusFile); } catch {}
+  }
+
+  _log(msg) {
+    const ts = new Date().toISOString();
+    const line = `${ts} INFO daemon: ${msg}`;
+    try {
+      fs.appendFileSync(this.config.logFile, line + '\n', 'utf-8');
+      this._maybeRotateLog();
+    } catch {}
+    // Only log to console if stdout is a TTY (not redirected to log file)
+    // to avoid duplicate lines when daemonized
+    if (!this._shuttingDown && process.stdout.isTTY) {
+      console.log(line);
+    }
+  }
+
+  _maybeRotateLog() {
+    // Rotate at 10MB, keep 1 backup
+    const MAX_SIZE = 10 * 1024 * 1024;
+    try {
+      const stat = fs.statSync(this.config.logFile);
+      if (stat.size > MAX_SIZE) {
+        const backup = this.config.logFile + '.1';
+        try { fs.unlinkSync(backup); } catch {}
+        fs.renameSync(this.config.logFile, backup);
+      }
+    } catch {}
+  }
+
+  _sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Static helpers
+  // ---------------------------------------------------------------------------
+
+  static _readPid(pidFile) {
+    try {
+      if (!fs.existsSync(pidFile)) return null;
+      const pid = parseInt(fs.readFileSync(pidFile, 'utf-8').trim(), 10);
+      return isNaN(pid) ? null : pid;
+    } catch {
+      return null;
+    }
+  }
+
+  static _cleanupStaleDaemonFiles(pidFile, statusFile) {
+    Daemon._unlinkIfExists(pidFile);
+    Daemon._unlinkIfExists(statusFile);
+  }
+
+  static _unlinkIfExists(filePath) {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  }
+
+  static _isAlive(pid) {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (e) {
+      // EPERM = process exists but cross-session on Windows
+      if (e.code === 'EPERM') return true;
+      return false;
+    }
+  }
+
+  /**
+   * Return the PID of another live daemon for this configDir, or null.
+   *
+   * Used to enforce the singleton even on the `up --foreground` path, which the
+   * launcher spawns directly (bypassing daemonize's guard). Trusts BOTH the pid
+   * file and the status file (a live daemon rewrites the latter every 5s with
+   * its own pid), because the pid file gets emptied/clobbered under races. Uses
+   * real process-liveness — not just file age — so a daemon that was just
+   * stopped for a legitimate restart doesn't block the replacement.
+   */
+  static runningDaemonPid(configDir) {
+    return Daemon._liveDaemonPids(configDir)[0] || null;
+  }
+
+  /**
+   * Return all distinct live daemon PIDs for this configDir (never including
+   * the calling process), gathered from BOTH the pid file and the status file.
+   * The pid file is considered first so its PID sorts ahead of the status
+   * file's. Used by the singleton guard, `agn status`, and `agn down` so every
+   * command agrees on which process(es) are the daemon — the divergence that
+   * let a stale pid file orphan a running daemon.
+   */
+  static _liveDaemonPids(configDir) {
+    const self = process.pid;
+    const pids = [];
+    const consider = (pid) => {
+      if (pid && pid !== self && Daemon._isAlive(pid) && !pids.includes(pid)) {
+        pids.push(pid);
+      }
+    };
+
+    consider(Daemon._readPid(path.join(configDir, 'daemon.pid')));
+
+    try {
+      const statusFile = path.join(configDir, 'daemon.status.json');
+      const age = Date.now() - fs.statSync(statusFile).mtimeMs;
+      // Bound the age so a long-dead daemon whose pid got reused by an
+      // unrelated process can't masquerade as a live daemon.
+      if (age < 30000) {
+        const raw = JSON.parse(fs.readFileSync(statusFile, 'utf-8'));
+        consider(raw && raw.pid);
+      }
+    } catch {}
+
+    return pids;
+  }
+}
+
+module.exports = { Daemon, filesystemRoots };
