@@ -27,7 +27,7 @@ export function BrowserTabList() {
   const {
     browserTabs, selectedBrowserTabId, setSelectedBrowserTabId,
     openBrowserTab, closeBrowserTab,
-    browserContexts, openBrowserTabWithContext, deleteBrowserContext,
+    browserContexts, openBrowserTabWithContext, deleteBrowserContext, canWrite = true,
   } = useWorkspace();
   const { isMobile, openMobileDetail } = useLayout();
   const confirm = useConfirm();
@@ -129,7 +129,7 @@ export function BrowserTabList() {
                 size="sm"
                 aria-label={t('browser.openNewTab')}
                 onClick={handleOpen}
-                disabled={opening}
+                disabled={!canWrite || opening}
                 className="text-muted-foreground"
               >
                 <Plus className="size-3.5" />
@@ -182,6 +182,7 @@ export function BrowserTabList() {
                     </div>
                     <button
                       onClick={(e) => handleClose(e, tab.id)}
+                      disabled={!canWrite}
                       className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-zinc-200 dark:hover:bg-zinc-700 text-muted-foreground hover:text-red-500 transition-all"
                       title={t('browser.closeTab')}
                     >
@@ -208,7 +209,7 @@ export function BrowserTabList() {
                   <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-all">
                     <button
                       onClick={(e) => handleOpenWithContext(e, ctx.id)}
-                      disabled={opening}
+                      disabled={!canWrite || opening}
                       className="p-1 rounded hover:bg-zinc-200 dark:hover:bg-zinc-700 text-muted-foreground hover:text-green-500 transition-colors disabled:opacity-50"
                       title={t('browser.openWithSession')}
                     >
@@ -216,6 +217,7 @@ export function BrowserTabList() {
                     </button>
                     <button
                       onClick={(e) => handleDeleteContext(e, ctx.id, ctx.name)}
+                      disabled={!canWrite}
                       className="p-1 rounded hover:bg-zinc-200 dark:hover:bg-zinc-700 text-muted-foreground hover:text-red-500 transition-colors"
                       title={t('browser.deleteSavedSession')}
                     >
@@ -261,6 +263,7 @@ export function BrowserTabList() {
                   </div>
                   <button
                     onClick={(e) => handleClose(e, tab.id)}
+                    disabled={!canWrite}
                     className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-zinc-200 dark:hover:bg-zinc-700 text-muted-foreground hover:text-red-500 transition-all"
                     title={t('browser.closeTab')}
                   >

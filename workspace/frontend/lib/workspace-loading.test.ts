@@ -5,13 +5,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WorkspaceProvider, useWorkspace } from './workspace-context';
 
 const api = vi.hoisted(() => Object.fromEntries([
-  'configure', 'getWorkspace', 'discover', 'listFiles', 'listTrash',
+  'configure', 'setCredentials', 'isAccessRevoked', 'getWorkspace', 'discover', 'listFiles', 'listTrash',
   'listBrowserTabs', 'listBrowserContexts', 'listTodos', 'listTasks',
   'listWorkflows', 'listRoutines', 'listKnowledge', 'listNotifications',
   'listConversations', 'latestPerChannel', 'createChannel', 'sendMessage', 'updateChannel',
 ].map((name) => [name, vi.fn()])));
 
-vi.mock('./api', () => ({ workspaceApi: api }));
+vi.mock('./api', () => ({
+  workspaceApi: api,
+  WorkspaceApi: vi.fn(function (workspaceId: string, token: string, bearerToken: string) {
+    api.configure(workspaceId, token, bearerToken);
+    return api;
+  }),
+}));
 vi.mock('./analytics', () => ({ capture: vi.fn(), group: vi.fn() }));
 vi.mock('./openagents-auth-context', () => ({ useOpenAgentsAuth: () => ({ user: null }) }));
 vi.mock('./identity', () => ({
@@ -67,6 +73,7 @@ beforeEach(() => {
   for (const method of Object.values(api)) {
     method.mockReset().mockImplementation(() => new Promise(() => {}));
   }
+  api.isAccessRevoked.mockReturnValue(false);
   container = document.createElement('div');
   document.body.appendChild(container);
   root = createRoot(container);

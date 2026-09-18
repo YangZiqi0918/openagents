@@ -9,6 +9,8 @@ never again be told "invalid token" by one endpoint while another endpoint
 happily heartbeats with the same token.
 """
 
+from tests.conftest import create_test_workspace
+
 import pytest
 
 from app.access import resolve_machine_token, verify_workspace_access
@@ -80,7 +82,7 @@ class TestVerifyResolveInvariant:
 
     def test_node_token_is_scoped_to_its_workspace(self, client, workspace, db):
         data = _redeem(client, workspace)
-        other = client.post("/v1/workspaces", json={
+        other = create_test_workspace(client, json={
             "name": "Other WS",
             "agent_name": "agent-beta",
             "creator_email": "other@example.com",

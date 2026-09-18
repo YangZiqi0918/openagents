@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { toast } from 'sonner';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 
 /**
  * A file on its way up, as the grid draws it.
@@ -55,6 +55,7 @@ export interface UploadQueue {
  * tile is never briefly absent between "uploaded" and "listed".
  */
 export function useUploadQueue(onUploaded: () => Promise<void>): UploadQueue {
+  const workspaceApi = useWorkspaceApi();
   const [uploads, setUploads] = useState<PendingUpload[]>([]);
 
   // The queue itself is refs: it's a worker's bookkeeping, and re-rendering on
@@ -134,7 +135,7 @@ export function useUploadQueue(onUploaded: () => Promise<void>): UploadQueue {
     } finally {
       runningRef.current = false;
     }
-  }, [patch, forget]);
+  }, [patch, forget, workspaceApi]);
 
   const enqueueUploads = useCallback((files: File[], folder: string) => {
     if (files.length === 0) return;
@@ -182,11 +183,17 @@ export function useUploadQueue(onUploaded: () => Promise<void>): UploadQueue {
   // Object URLs outlive the component unless they're handed back.
   useEffect(() => {
     const previews = previewsRef.current;
+    const aborts = abortsRef.current;
+    const files = filesRef.current;
     return () => {
+      queueRef.current = [];
+      aborts.forEach((controller) => controller.abort());
+      aborts.clear();
+      files.clear();
       previews.forEach((url) => URL.revokeObjectURL(url));
       previews.clear();
     };
-  }, []);
+  }, [workspaceApi]);
 
   return { uploads, enqueueUploads, retryUpload, cancelUpload };
 }

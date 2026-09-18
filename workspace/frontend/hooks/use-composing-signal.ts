@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef } from 'react';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 
 const SIGNAL_INTERVAL_MS = 10_000;
 const AFK_TIMEOUT_MS = 5 * 60 * 1000;
 
 export function useComposingSignal(channelName: string | null) {
+  const workspaceApi = useWorkspaceApi();
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastActivityRef = useRef(0);
   const activeRef = useRef(false);
@@ -24,7 +25,7 @@ export function useComposingSignal(channelName: string | null) {
       return;
     }
     workspaceApi.sendComposing(channelName);
-  }, [channelName, stop]);
+  }, [channelName, stop, workspaceApi]);
 
   const start = useCallback(() => {
     if (activeRef.current) return;

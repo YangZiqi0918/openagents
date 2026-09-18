@@ -5,6 +5,7 @@ import { useParams } from 'next/navigation';
 import { desktopHost } from '@/lib/desktop-host';
 import { useOpenAgentsAuth } from '@/lib/openagents-auth-context';
 import { useWorkspace } from '@/lib/workspace-context';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
 import { useLayout, type ViewMode } from './layout-context';
 
 const VIEWS: ViewMode[] = ['threads', 'projects', 'files', 'knowledge', 'browser', 'tasks', 'workflows', 'routines', 'inbox', 'connect', 'skills'];
@@ -16,7 +17,7 @@ export function useDesktopWorkspaceState(): void {
   const { loading, sessions, currentSessionId, setCurrentSessionId } = useWorkspace();
   const { viewMode, openView } = useLayout();
   const [restored, setRestored] = useState('');
-  const key = user && desktopHost() ? `oa:desktop:view:${user.email}:${workspaceId}` : '';
+  const key = !IS_LOCAL_AUTH && user && desktopHost() ? `oa:desktop:view:${user.email}:${workspaceId}` : '';
 
   useEffect(() => {
     if (!key || loading || restored === key) return;

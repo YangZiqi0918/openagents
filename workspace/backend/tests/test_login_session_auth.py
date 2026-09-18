@@ -13,6 +13,8 @@ Covers:
   - Event auth via both token and bearer paths
 """
 
+from tests.conftest import create_test_workspace
+
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -26,7 +28,7 @@ def _create_workspace(client, name="Test WS", agent_name="agent-alpha", creator_
     body = {"name": name, "agent_name": agent_name}
     if creator_email:
         body["creator_email"] = creator_email
-    resp = client.post("/v1/workspaces", json=body)
+    resp = create_test_workspace(client, json=body)
     assert resp.status_code == 200
     return resp.json()["data"]
 
@@ -207,8 +209,8 @@ class TestBearerAuth:
 class TestWorkspaceClaim:
     """POST /v1/workspaces/{id}/claim — claim workspace ownership."""
 
-    def test_claim_unclaimed_workspace(self, client):
-        """User can claim a workspace that has no creator_email set."""
+    def test_new_workspace_cannot_be_claimed_by_other_user(self, client):
+        """Authenticated creation attaches an owner; a second user cannot claim it."""
         ws = _create_workspace(client, name="Unclaimed WS", agent_name="bot")
         ws_id = ws["workspaceId"]
 
@@ -217,9 +219,7 @@ class TestWorkspaceClaim:
                 f"/v1/workspaces/{ws_id}/claim",
                 headers={"Authorization": "Bearer claim-token"},
             )
-        assert resp.status_code == 200
-        data = resp.json()["data"]
-        assert data["creatorEmail"] == "claimer@example.com"
+        assert resp.status_code == 403
 
     def test_claim_already_owned_by_same_user(self, client, workspace):
         """Re-claiming by the same owner succeeds (idempotent)."""
@@ -264,20 +264,13 @@ class TestWorkspaceClaim:
             )
         assert resp.status_code == 404
 
-    def test_claimed_workspace_accessible_via_bearer(self, client):
-        """After claiming, the owner can use bearer auth to access protected endpoints."""
+    def test_created_workspace_accessible_via_owner_bearer(self, client):
+        """Creating the project already grants its owner bearer access."""
         ws = _create_workspace(client, name="Claimable", agent_name="bot")
         ws_id = ws["workspaceId"]
 
-        # Claim
-        with _mock_firebase_verify("owner@example.com"):
-            client.post(
-                f"/v1/workspaces/{ws_id}/claim",
-                headers={"Authorization": "Bearer claim-token"},
-            )
-
-        # Now use bearer auth to rotate token (a protected action)
-        with _mock_firebase_verify("owner@example.com"):
+        # The verified creation identity is test@example.com in the fixture.
+        with _mock_firebase_verify("test@example.com"):
             resp = client.post(
                 f"/v1/workspaces/{ws_id}/rotate-token",
                 headers={"Authorization": "Bearer owner-token"},
@@ -540,25 +533,32 @@ class TestSessionLifecycle:
         sources = [e["source"] for e in events]
         assert "openagents:agent-leaver" in sources
 
-    def test_heartbeat_generates_event(self, client, workspace):
-        """Heartbeat creates a network.ping event."""
-        client.post("/v1/join", json={
+    def test_heartbeat_updates_member_without_persisting_ping(self, client, workspace, db):
+        """Heartbeat updates the member; pings are intentionally not stored."""
+        joined = client.post("/v1/join", json={
             "agent_name": "agent-pinger",
             "token": workspace["token"],
             "network": workspace["id"],
         })
-        client.post("/v1/heartbeat", json={
+        heartbeat = client.post("/v1/heartbeat", json={
             "agent_name": "agent-pinger",
             "network": workspace["id"],
-        })
+            "session_id": joined.json()["data"].get("session_id"),
+        }, headers={"X-Workspace-Token": workspace["token"]})
+        assert heartbeat.status_code == 200
+        from app.models import WorkspaceMember
+        from sqlalchemy import select
+        member = db.execute(select(WorkspaceMember).where(
+            WorkspaceMember.workspace_id == workspace["id"],
+            WorkspaceMember.agent_name == "agent-pinger",
+        )).scalar_one()
+        assert member.last_heartbeat is not None
 
         resp = client.get("/v1/events", params={
             "network": workspace["id"],
             "type": "network.ping",
         }, headers={"X-Workspace-Token": workspace["token"]})
-        events = resp.json()["data"]["events"]
-        sources = [e["source"] for e in events]
-        assert "openagents:agent-pinger" in sources
+        assert resp.json()["data"]["events"] == []
 
 
 # ===========================================================================
@@ -687,7 +687,7 @@ class TestTokenResolveEdgeCases:
         # Delete the workspace (auth required)
         client.delete(
             f"/v1/workspaces/{workspace['id']}",
-            headers={"X-Workspace-Token": workspace["token"]},
+            headers=workspace["owner_headers"],
         )
 
         # Token should no longer resolve

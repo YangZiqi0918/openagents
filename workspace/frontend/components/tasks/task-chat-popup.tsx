@@ -11,7 +11,8 @@ import { ChatMessages } from '@/components/chat/chat-messages';
 import { ChatInput, type PendingFile } from '@/components/chat/chat-input';
 import { useMessagePolling } from '@/hooks/use-polling';
 import { useWorkspace } from '@/lib/workspace-context';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
+import { toast } from 'sonner';
 import { AgentAvatar } from '@/components/agents/agent-avatar';
 
 interface TaskChatPopupProps {
@@ -34,8 +35,9 @@ interface TaskChatPopupProps {
  * children it uses — `ChatMessages` + `ChatInput` — against a `sessionId` prop.
  */
 export function TaskChatPopup({ open, onOpenChange, sessionId, taskTitle, assignee, subtitle }: TaskChatPopupProps) {
-  const { agents, currentUser } = useWorkspace();
-  const { messages, forceRefresh, generation, loadOlder, hasOlder, loadingOlder } = useMessagePolling({
+  const workspaceApi = useWorkspaceApi();
+  const { agents, currentUser, canWrite = true } = useWorkspace();
+  const { messages, forceRefresh, generation, loadOlder, hasOlder, loadingOlder, error: pollingError } = useMessagePolling({
     sessionId,
     enabled: open,
   });
@@ -67,8 +69,8 @@ export function TaskChatPopup({ open, onOpenChange, sessionId, taskTitle, assign
           currentUser.id,
         );
         forceRefresh();
-      } catch {
-        // Surface via missing message; polling will reconcile.
+      } catch (failure: unknown) {
+        toast.error(failure instanceof Error ? failure.message : 'Unable to send message');
       }
     },
     [sessionId, currentUser.name, currentUser.id, forceRefresh],
@@ -91,6 +93,7 @@ export function TaskChatPopup({ open, onOpenChange, sessionId, taskTitle, assign
             of this flex column to get a bounded height and scroll — wrapping it
             in a plain div collapses that and the list overflows the dialog. */}
         <div className="flex flex-col h-[60vh] min-h-0">
+          {pollingError && <p role="alert" className="px-4 py-2 text-xs text-destructive">{pollingError}</p>}
           <ChatMessages
             messages={messages}
             agents={agents}
@@ -102,7 +105,7 @@ export function TaskChatPopup({ open, onOpenChange, sessionId, taskTitle, assign
             className="h-full overflow-y-auto px-4 py-3"
           />
           <div className="border-t border-border p-3">
-            <ChatInput onSend={handleSend} agents={agents} />
+            <ChatInput onSend={handleSend} agents={agents} disabled={!canWrite} />
           </div>
         </div>
       </DialogContent>

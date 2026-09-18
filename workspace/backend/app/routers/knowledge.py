@@ -21,6 +21,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.access import resolve_current_user
+from app.config import config
 from app.models import KnowledgeEntry, Workspace
 from app.response import ResponseCode, json_response, success_response
 from app.routers.network import (
@@ -141,7 +143,9 @@ async def create_knowledge(
         description=body.description,
         storage_key=storage_key,
         content_size=len(content_bytes),
-        created_by=body.source or "human:user",
+        created_by=(f"human:{resolve_current_user(db, authorization).email}"
+                    if authorization is not None and (config.AUTH_MODE == "local_password" or workspace.kind == "personal")
+                    else body.source or "human:user"),
     )
     db.add(entry)
     db.commit()
@@ -307,6 +311,8 @@ async def update_knowledge(
         return json_response(ResponseCode.NOT_FOUND, "Network not found")
     if not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+    if str(entry.workspace_id) != str(workspace.id):
+        return json_response(ResponseCode.NOT_FOUND, "Knowledge entry not found in this project")
 
     ws_id = str(workspace.id)
     now = datetime.now(timezone.utc)
@@ -335,7 +341,9 @@ async def update_knowledge(
         entry.storage_key = store.save(ws_id, entry.id, storage_filename, content_bytes)
         entry.content_size = len(content_bytes)
 
-    entry.updated_by = body.source or "human:user"
+    entry.updated_by = (f"human:{resolve_current_user(db, authorization).email}"
+                        if authorization is not None and (config.AUTH_MODE == "local_password" or workspace.kind == "personal")
+                        else body.source or "human:user")
     entry.updated_at = now
     db.commit()
 
@@ -379,6 +387,8 @@ async def delete_knowledge(
         return json_response(ResponseCode.NOT_FOUND, "Network not found")
     if not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+    if str(entry.workspace_id) != str(workspace.id):
+        return json_response(ResponseCode.NOT_FOUND, "Knowledge entry not found in this project")
 
     entry.status = "deleted"
     entry.updated_at = datetime.now(timezone.utc)

@@ -300,7 +300,7 @@ def _emit(db, workspace, channel_name: str, content: str, metadata: Optional[dic
         payload=payload,
         metadata=metadata or {},
     )
-    _emit_event_blocking(event, workspace, db, token=workspace.password_hash)
+    _emit_event_blocking(event, workspace, db, token=workspace.password_hash, trusted_service=True)
 
 
 def _ensure_member(db, channel: Channel, agent: str) -> None:

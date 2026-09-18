@@ -1,8 +1,4 @@
-// Membership Home API — the signed-in user's workspaces, keyed to their
-// verified identity (Firebase/Apple bearer), served by the workspace backend's
-// GET /v1/account/workspaces. That endpoint also reconciles legacy email-based
-// access into memberships and auto-provisions an empty workspace for brand-new
-// users, so a freshly signed-in user always has at least one entry.
+// Account APIs share a verified Bearer identity, independent of resource scope.
 
 import { API_URL } from './api-config';
 
@@ -10,9 +6,28 @@ export interface AccountWorkspace {
   workspaceId: string;
   slug: string;
   name: string;
-  token: string | null;
+  token?: string | null;
+  kind?: 'personal' | 'project';
+  createdAt?: string;
+  description?: string | null;
   role: 'owner' | 'admin' | 'member' | 'viewer';
-  lastActivityAt: string | null;
+  lastActivityAt?: string | null;
+}
+
+export type PersonalSpace = Omit<AccountWorkspace, 'lastActivityAt' | 'token'>;
+
+export function getPersonalSpace(idToken: string): Promise<PersonalSpace> {
+  return bearerFetch('/v1/account/personal-space', idToken);
+}
+
+export function renameAccountProject(idToken: string, projectId: string, name: string): Promise<AccountWorkspace> {
+  return bearerFetch(`/v1/workspaces/${encodeURIComponent(projectId)}`, idToken, {
+    method: 'PATCH', body: JSON.stringify({ name }),
+  });
+}
+
+export function deleteAccountProject(idToken: string, projectId: string): Promise<void> {
+  return bearerFetch(`/v1/workspaces/${encodeURIComponent(projectId)}`, idToken, { method: 'DELETE' });
 }
 
 async function bearerFetch<T>(path: string, idToken: string, options: RequestInit = {}): Promise<T> {
@@ -48,6 +63,8 @@ export function sendSetupEmail(idToken: string, workspaceIdOrSlug: string): Prom
 
 /** The signed-in user's cross-workspace profile (name + avatar). */
 export interface AccountProfile {
+  userId?: string;
+  username?: string | null;
   email: string;
   displayName: string | null;
   /** https:// URL or a small data:image/... URL; null = no custom avatar. */
@@ -82,10 +99,12 @@ export function updateAccountProfile(
 export function createAccountWorkspace(
   idToken: string,
   name: string,
-): Promise<{ workspaceId: string; slug: string; name: string; token: string }> {
+  description = '',
+  templateId?: string,
+): Promise<AccountWorkspace> {
   return bearerFetch('/v1/workspaces', idToken, {
     method: 'POST',
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, description, ...(templateId ? { template_id: templateId } : {}) }),
   });
 }
 

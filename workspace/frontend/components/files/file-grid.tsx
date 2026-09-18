@@ -66,7 +66,7 @@ export function FileGrid() {
   const {
     files, selectedFileId, setSelectedFileId, deleteFile,
     currentFilePath, setCurrentFilePath,
-    pendingUploads, enqueueUploads, retryUpload, cancelUpload,
+    pendingUploads, enqueueUploads, retryUpload, cancelUpload, canWrite = true,
   } = useWorkspace();
   const {
     isMobile, openMobileDetail, openMobileList, filesBrowse, setFilesBrowse,
@@ -314,9 +314,9 @@ export function FileGrid() {
    * and nothing to announce at the end that the grid hasn't already shown.
    */
   const uploadInto = useCallback((list: FileList) => {
-    if (!currentPath || list.length === 0) return;
+    if (!canWrite || !currentPath || list.length === 0) return;
     enqueueUploads(Array.from(list), currentPath);
-  }, [currentPath, enqueueUploads]);
+  }, [currentPath, enqueueUploads, canWrite]);
 
   const handleUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) uploadInto(e.target.files);
@@ -586,6 +586,7 @@ export function FileGrid() {
                 mode="icon"
                 size="sm"
                 onClick={() => fileInputRef.current?.click()}
+                disabled={!canWrite}
                 aria-label={t('files.uploadFile')}
                 className="shrink-0 text-muted-foreground"
               >
@@ -672,7 +673,7 @@ export function FileGrid() {
                 {t('files.clearSearch')}
               </Button>
             ) : (
-              <Button variant="outline" size="sm" className="mt-1" onClick={() => fileInputRef.current?.click()}>
+              <Button variant="outline" size="sm" disabled={!canWrite} className="mt-1" onClick={() => fileInputRef.current?.click()}>
                 <Upload className="size-3.5" />
                 {t('files.uploadFiles')}
               </Button>
@@ -752,6 +753,7 @@ export function FileGrid() {
                   variant="ghost"
                   mode="icon"
                   size="sm"
+                  disabled={!canWrite}
                   onClick={(e) => handleDelete(e, file.id, file.filename)}
                   aria-label={t('files.deleteItem', { name: displayName })}
                   className="size-6 shrink-0 text-muted-foreground opacity-0 transition-opacity hover:text-red-500 group-hover:opacity-100"
@@ -846,6 +848,7 @@ export function FileGrid() {
                     variant="ghost"
                     mode="icon"
                     size="sm"
+                    disabled={!canWrite}
                     onClick={(e) => handleDelete(e, file.id, file.filename)}
                     aria-label={t('files.deleteItem', { name: displayName })}
                     className="absolute top-1.5 right-1.5 size-6 bg-background/80 text-muted-foreground opacity-0 shadow-sm transition-opacity hover:text-red-500 group-hover:opacity-100"

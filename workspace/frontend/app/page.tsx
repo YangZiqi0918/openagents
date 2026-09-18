@@ -13,7 +13,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { useOpenAgentsAuth } from '@/lib/openagents-auth-context';
-import { IS_LOCAL_MODE } from '@/lib/api-config';
+import { IS_LOCAL_AUTH, IS_LOCAL_MODE } from '@/lib/api-config';
 import { LocalWorkspace } from '@/components/local-workspace';
 import { listAccountWorkspaces, createAccountWorkspace, getCampaignStatus, type AccountWorkspace, type CampaignStatus } from '@/lib/account-api';
 import { capture, group } from '@/lib/analytics';
@@ -955,6 +955,8 @@ function SignInGate({ signIn }: { signIn: () => Promise<void> }) {
 
 export default function HomePage() {
   const oa = useOpenAgentsAuth();
+
+  if (IS_LOCAL_AUTH) return null;
 
   if (IS_LOCAL_MODE) return <LocalWorkspace />;
 

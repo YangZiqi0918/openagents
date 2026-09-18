@@ -6,6 +6,8 @@ Tests for image search (POST /v1/search/images) and URL file ingestion
 Brave Search and the file download are mocked.
 """
 
+from tests.conftest import create_test_workspace
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from sqlalchemy import select
@@ -17,7 +19,7 @@ PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"0" * 100
 
 
 def _create_workspace(client):
-    resp = client.post("/v1/workspaces", json={
+    resp = create_test_workspace(client, json={
         "name": "Image Test Workspace",
         "agent_name": "agent-image",
         "creator_email": "test@example.com",

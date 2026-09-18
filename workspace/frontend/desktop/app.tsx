@@ -22,6 +22,10 @@ import SettingsProfile from '@/app/[workspaceId]/settings/profile/page';
 import SettingsSecurity from '@/app/[workspaceId]/settings/security/page';
 import InvitePage from '@/app/invite/[token]/page';
 import SharePage from '@/app/share/[token]/page';
+import LoginPage from '@/app/login/page';
+import ProjectsPage from '@/app/projects/page';
+import ProjectRoute from '@/app/projects/[projectId]/page';
+import { LocalAccountShell } from '@/components/layout/local-account-shell';
 
 import { DesktopRouter, type RouteTable } from './router';
 import { reportLocale, reportTheme, useHostAppearance, useHostNotices } from './host';
@@ -122,6 +126,9 @@ function settingsRoute(
  */
 const ROUTES: RouteTable = [
   { pattern: '/', render: () => <Home /> },
+  { pattern: '/login', render: () => <LoginPage /> },
+  { pattern: '/projects', render: () => <ProjectsPage /> },
+  { pattern: '/projects/:projectId', render: (params) => <Page params={params}>{(promise) => <ProjectRoute params={promise as Promise<{ projectId: string }>} />}</Page> },
   {
     pattern: '/invite/:token',
     render: (params) => (
@@ -181,7 +188,7 @@ export default function App(): React.JSX.Element {
         <AppearanceSync />
         <OpenAgentsAuthProvider>
           <DialogsProvider>
-            <DesktopRouter routes={ROUTES} notFound={<NotFound />} />
+            <DesktopRouter routes={ROUTES} notFound={<NotFound />} shell={(children) => <LocalAccountShell>{children}</LocalAccountShell>} />
           </DialogsProvider>
         </OpenAgentsAuthProvider>
         <Toaster />

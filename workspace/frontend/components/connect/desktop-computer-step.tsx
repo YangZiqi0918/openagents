@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ArrowRight, CheckCircle2, Laptop, Loader2, Monitor, Server } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { capture } from '@/lib/analytics';
 import { useT } from '@/lib/i18n';
 import type { DesktopComputer, DesktopHost } from '@/lib/desktop-host';
@@ -16,6 +16,7 @@ export function DesktopComputerStep({ host, workspaceId, workspaceName, onConnec
   onConnected: (nodeId: string) => void;
   onOtherDevice: () => void;
 }) {
+  const workspaceApi = useWorkspaceApi();
   const t = useT();
   const [computer, setComputer] = useState<DesktopComputer | null>(null);
   const [phase, setPhase] = useState<'loading' | 'ready' | 'connecting' | 'waiting' | 'error'>('loading');

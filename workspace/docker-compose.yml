@@ -21,10 +21,12 @@ services:
       dockerfile: backend.Dockerfile
     environment:
       DATABASE_URL: postgresql://postgres:dev@db:5432/openagents_workspace
-      AUTH_MODE: workspace_token
-      LOCAL_MODE: "true"
+      AUTH_MODE: local_password
+      LOCAL_MODE: "false"
+      WORKSPACE_SESSION_SECRET_FILE: /app/secrets/local-session.key
       FIREBASE_PROJECT_ID: ""
-      YUMI_ENABLED: "false"
+      YUMI_ENABLED: "true"
+      YUMI_API_KEY: ${YUMI_API_KEY:-}
       ROUTER_LLM_ENABLED: "false"
       CAMPAIGN_ENABLED: "false"
       FRONTEND_BASE_URL: http://localhost:3000
@@ -38,14 +40,17 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
 
   frontend:
     build:
       context: ./frontend
       args:
         NEXT_PUBLIC_API_URL: http://localhost:8000
-        NEXT_PUBLIC_LOCAL_MODE: "true"
+        NEXT_PUBLIC_LOCAL_MODE: "false"
+        NEXT_PUBLIC_AUTH_MODE: local_password
         API_INTERNAL_URL: http://backend:8000
     ports:
       - "127.0.0.1:3000:3000"

@@ -6,7 +6,7 @@ import { ChatInput, type PendingFile } from '@/components/chat/chat-input';
 import { ChatMessages } from '@/components/chat/chat-messages';
 import { useMessagePolling } from '@/hooks/use-polling';
 import { useComposingSignal } from '@/hooks/use-composing-signal';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { mergeMessages } from '@/lib/message-merge';
 import {
   eventToMessage,
@@ -40,6 +40,7 @@ export function ProjectActivityConversation({
   failedSend,
   onFailedSend,
   labels: l,
+  readOnly = false,
 }: {
   sessionId: string;
   agents: WorkspaceAgent[];
@@ -51,7 +52,9 @@ export function ProjectActivityConversation({
   failedSend?: ActivitySend;
   onFailedSend: (send: ActivitySend | undefined) => void;
   labels: ReturnType<typeof activityLabels>;
+  readOnly?: boolean;
 }) {
+  const workspaceApi = useWorkspaceApi();
   const {
     messages,
     loading,
@@ -60,6 +63,7 @@ export function ProjectActivityConversation({
     loadOlder,
     hasOlder,
     loadingOlder,
+    error: pollingError,
   } = useMessagePolling({ sessionId });
   const { notifyFocus, notifyBlur, notifyTyping } =
     useComposingSignal(sessionId);
@@ -95,7 +99,7 @@ export function ProjectActivityConversation({
   }, [latestMessageId]);
 
   const send = async (submission: ActivitySend) => {
-    if (busy.current || !alive.current) return;
+    if (readOnly || busy.current || !alive.current) return;
     busy.current = true;
     setSending(true);
     callbacks.current.onSending(true);
@@ -192,6 +196,7 @@ export function ProjectActivityConversation({
       data-session-id={sessionId}
       className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"
     >
+      {pollingError && <div role="alert" className="flex items-center gap-2 border-b border-destructive/30 px-4 py-2 text-sm text-destructive"><span className="min-w-0 flex-1 break-words">{l.loadFailed}: {pollingError}</span><button type="button" onClick={forceRefresh} title={l.retry} aria-label={l.retry} className="flex size-8 shrink-0 items-center justify-center rounded-md hover:bg-muted"><RotateCcw className="size-4" /></button></div>}
       {loading && !displayed.length ? (
         <div
           role="status"
@@ -255,7 +260,7 @@ export function ProjectActivityConversation({
           draft={draft}
           onDraftChange={changeDraft}
           onFocusChange={(focused) => (focused ? notifyFocus() : notifyBlur())}
-          disabled={sending || Boolean(failedSend) || !currentUser.name.trim()}
+          disabled={readOnly || sending || Boolean(failedSend) || !currentUser.name.trim()}
           onSend={(content, mentions, files) => {
             callbacks.current.onDraftChange(content);
             void send({ content, mentions, files, uploaded: new Map() });

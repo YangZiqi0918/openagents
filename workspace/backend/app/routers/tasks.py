@@ -22,6 +22,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.access import resolve_current_user
+from app.config import config
 from app.models import Channel, KanbanTask, Workflow, Workspace, WorkspaceMember
 from app.response import ResponseCode, json_response, success_response
 from app.routers.network import (
@@ -164,6 +166,27 @@ def _clean_file_ids(db: Session, workspace_id: str, ids: Optional[List[str]]) ->
     valid = set(rows)
     cleaned = [i for i in wanted if i in valid]  # preserve selection order
     return cleaned or None
+
+
+def _reference_error(db: Session, workspace, *, assignee=None, workflow_id=None,
+                     knowledge_ids=None, file_ids=None) -> Optional[str]:
+    if config.AUTH_MODE != "local_password" and workspace.kind != "personal":
+        return None
+    agent = _bare_agent(assignee)
+    if agent and db.execute(select(WorkspaceMember.agent_name).where(
+        WorkspaceMember.workspace_id == workspace.id, WorkspaceMember.agent_name == agent,
+        WorkspaceMember.status != "removed",
+    )).first() is None:
+        return "Assignee does not belong to this project"
+    if workflow_id and db.execute(select(Workflow.id).where(
+        Workflow.workspace_id == workspace.id, Workflow.id == workflow_id,
+    )).first() is None:
+        return "Workflow does not belong to this project"
+    if knowledge_ids and set(knowledge_ids) != set(_clean_knowledge_ids(db, str(workspace.id), knowledge_ids) or []):
+        return "Knowledge entry does not belong to this project"
+    if file_ids and set(file_ids) != set(_clean_file_ids(db, str(workspace.id), file_ids) or []):
+        return "File does not belong to this project"
+    return None
 
 
 def _task_attachments(db: Session, workspace_id: str, task: KanbanTask) -> list:
@@ -379,6 +402,10 @@ def create_task(
         return json_response(ResponseCode.NOT_FOUND, "Network not found")
     if not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+    error = _reference_error(db, workspace, assignee=body.assignee, workflow_id=body.workflow_id,
+                             knowledge_ids=body.knowledge_ids, file_ids=body.file_ids)
+    if error:
+        return json_response(ResponseCode.BAD_REQUEST, error)
 
     # Description is the primary field; the title is optional and, when
     # omitted, previews the description's first few words.
@@ -401,7 +428,9 @@ def create_task(
         workflow_id=(body.workflow_id or None),
         knowledge_ids=_clean_knowledge_ids(db, str(workspace.id), body.knowledge_ids),
         file_ids=_clean_file_ids(db, str(workspace.id), body.file_ids),
-        created_by=body.source or "human:user",
+        created_by=(f"human:{resolve_current_user(db, authorization).email}"
+                    if authorization is not None and (config.AUTH_MODE == "local_password" or workspace.kind == "personal")
+                    else body.source or "human:user"),
         position=_next_position(db, str(workspace.id), status),
     )
     db.add(task)
@@ -442,6 +471,10 @@ def update_task(
     ).scalar_one_or_none()
     if not task:
         return json_response(ResponseCode.NOT_FOUND, "Task not found")
+    error = _reference_error(db, workspace, assignee=body.assignee, workflow_id=body.workflow_id,
+                             knowledge_ids=body.knowledge_ids, file_ids=body.file_ids)
+    if error:
+        return json_response(ResponseCode.BAD_REQUEST, error)
 
     # Description first — a cleared title derives its preview from the
     # (possibly just-updated) description.
@@ -532,7 +565,8 @@ def _run_workflow_task(db, workspace, task, human_source: str, token: Optional[s
             },
             metadata={},
         )
-        _emit_event_blocking(create_evt, workspace, db, token=token)
+        if _emit_event_blocking(create_evt, workspace, db, token=token) is None:
+            return json_response(ResponseCode.FORBIDDEN, "Unable to create the task execution channel")
 
     task.channel_name = channel_name
     task.status = "in_progress"
@@ -597,6 +631,7 @@ def assign_task(
         select(WorkspaceMember).where(
             WorkspaceMember.workspace_id == workspace.id,
             WorkspaceMember.agent_name == agent,
+            WorkspaceMember.status != "removed",
         )
     ).scalar_one_or_none()
     if not is_member:
@@ -628,7 +663,8 @@ def assign_task(
             },
             metadata={},
         )
-        _emit_event_blocking(create_evt, workspace, db, token=x_workspace_token)
+        if _emit_event_blocking(create_evt, workspace, db, token=x_workspace_token) is None:
+            return json_response(ResponseCode.FORBIDDEN, "Unable to create the task execution channel")
     else:
         # Reassignment — point the existing channel at the new agent.
         existing_channel.master_agent = agent
@@ -645,7 +681,8 @@ def assign_task(
         },
         metadata={"target_agents": [agent]},
     )
-    _emit_event_blocking(kickoff, workspace, db, token=x_workspace_token)
+    if _emit_event_blocking(kickoff, workspace, db, token=x_workspace_token) is None:
+        return json_response(ResponseCode.FORBIDDEN, "Unable to start the task")
 
     # 3. Move the card to In Progress.
     task.assignee = agent

@@ -3,13 +3,17 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { capture, identify } from './analytics';
 import { desktopHost } from './desktop-host';
-import { clearWorkspaceSession, loadWorkspaceSession } from './workspace-session';
-import { IS_LOCAL_MODE } from './api-config';
+import { authenticateLocalAccount, clearWorkspaceSession, loadWorkspaceSession } from './workspace-session';
+import { IS_LOCAL_AUTH, IS_LOCAL_MODE } from './api-config';
+import { getAccountProfile } from './account-api';
 
-interface OpenAgentsUser {
+export interface OpenAgentsUser {
   email: string;
   displayName: string;
   photoURL: string | null;
+  id?: string;
+  username?: string;
+  source?: 'local_password' | 'handoff';
 }
 
 interface OpenAgentsAuthContextValue {
@@ -19,6 +23,7 @@ interface OpenAgentsAuthContextValue {
   isOpenAgentsDomain: boolean;
   signIn: () => Promise<void>;
   signOut: () => Promise<void>;
+  authenticateLocal: (mode: 'register' | 'login', username: string, password: string) => Promise<void>;
 }
 
 // `workspace` is the desktop build: the launcher serves the bundle from
@@ -42,6 +47,22 @@ export function OpenAgentsAuthProvider({ children }: { children: React.ReactNode
   const [isOpenAgentsDomain, setIsOpenAgentsDomain] = useState(false);
 
   useEffect(() => {
+    if (IS_LOCAL_AUTH) {
+      setIsOpenAgentsDomain(true);
+      const stored = loadWorkspaceSession();
+      if (!stored || stored.source !== 'local_password') {
+        clearWorkspaceSession();
+        setLoading(false);
+        return;
+      }
+      let active = true;
+      getAccountProfile(stored.token).then((profile) => {
+        if (!active) return;
+        setUser({ email: stored.email, displayName: profile.displayName || stored.username || '', photoURL: profile.avatarUrl, id: profile.userId || stored.userId, username: profile.username || stored.username, source: 'local_password' });
+        setIdToken(stored.token);
+      }).catch(() => { if (active) clearWorkspaceSession(); }).finally(() => { if (active) setLoading(false); });
+      return () => { active = false; };
+    }
     if (IS_LOCAL_MODE) {
       setLoading(false);
       return;
@@ -131,13 +152,20 @@ export function OpenAgentsAuthProvider({ children }: { children: React.ReactNode
 
   // In the desktop app the launcher owns the session and pushes renewals here;
   // the page never decides on its own that the account has ended.
-  useEffect(() => !IS_LOCAL_MODE ? desktopHost()?.onSession?.((session) => {
+  useEffect(() => !IS_LOCAL_MODE && !IS_LOCAL_AUTH ? desktopHost()?.onSession?.((session) => {
     setUser({ email: session.email, displayName: session.displayName || session.email, photoURL: null });
     setIdToken(session.token);
   }) : undefined, []);
 
   const signIn = useCallback(async () => {
-    if (IS_LOCAL_MODE) return;
+    if (IS_LOCAL_AUTH) {
+      const route = window.location.hash.startsWith('#/') ? window.location.hash.slice(1) : window.location.pathname + window.location.search;
+      const login = `/login?returnTo=${encodeURIComponent(route)}`;
+      if (window.location.hash.startsWith('#/')) window.location.hash = login;
+      else window.location.assign(login);
+      return;
+    }
+    if (IS_LOCAL_MODE || IS_LOCAL_AUTH) return;
     const host = desktopHost();
     if (host) { host.signIn(); return; }
     const { signInWithGoogle, getIdToken } = await import('./firebase');
@@ -154,13 +182,19 @@ export function OpenAgentsAuthProvider({ children }: { children: React.ReactNode
     // which this popup sign-in also triggers.
   }, []);
 
+  const authenticateLocal = useCallback(async (mode: 'register' | 'login', username: string, password: string) => {
+    const session = await authenticateLocalAccount(mode, username, password);
+    setUser({ email: session.email, displayName: session.displayName || session.username || '', photoURL: null, id: session.userId, username: session.username, source: 'local_password' });
+    setIdToken(session.token);
+  }, []);
+
   const signOut = useCallback(async () => {
     // Drop the workspace session first so a Firebase failure (Google
     // unreachable) can't leave the user signed in.
     clearWorkspaceSession();
     setUser(null);
     setIdToken(null);
-    if (IS_LOCAL_MODE) return;
+    if (IS_LOCAL_MODE || IS_LOCAL_AUTH) return;
     const host = desktopHost();
     if (host) { host.signOut(); return; }
     const { signOutUser } = await import('./firebase');
@@ -168,7 +202,7 @@ export function OpenAgentsAuthProvider({ children }: { children: React.ReactNode
   }, []);
 
   return (
-    <OpenAgentsAuthContext.Provider value={{ user, idToken, loading, isOpenAgentsDomain, signIn, signOut }}>
+    <OpenAgentsAuthContext.Provider value={{ user, idToken, loading, isOpenAgentsDomain, signIn, signOut, authenticateLocal }}>
       {children}
     </OpenAgentsAuthContext.Provider>
   );

@@ -12,7 +12,7 @@
 
 export const messages = {
   metadata: {
-    title: 'OpenAgents Workspace',
+    title: 'OpenAgents',
     description: 'Interact with your AI agents in real time',
   },
 

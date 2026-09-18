@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useWorkspace } from '@/lib/workspace-context';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { agentLabel } from '@/lib/helpers';
 import { eventToMessage } from '@/lib/types';
 import type { WorkspaceMessage } from '@/lib/types';
@@ -22,6 +22,7 @@ export interface TileData {
 }
 
 export function MonitorGrid() {
+  const workspaceApi = useWorkspaceApi();
   const { sessions, activeSessionIds, completedSessionIds, agents, acknowledgeCompletion, lastMessageBySession } = useWorkspace();
   const t = useT();
   const { timeAgo } = useFormatters();

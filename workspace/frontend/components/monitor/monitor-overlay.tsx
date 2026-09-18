@@ -12,7 +12,7 @@ import { CreateRoutineDialog } from '@/components/routines/create-routine-dialog
 import { useWorkspace } from '@/lib/workspace-context';
 import { useT } from '@/lib/i18n';
 import { useMessagePolling } from '@/hooks/use-polling';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { Square } from 'lucide-react';
 import type { WorkspaceMessage, WorkspaceSession } from '@/lib/types';
 
@@ -26,13 +26,14 @@ interface MonitorOverlayProps {
 }
 
 export function MonitorOverlay({ sessionId, session, initialMessages, open, onOpenChange }: MonitorOverlayProps) {
-  const { agents, currentUser, activeSessionIds, stoppingSessionIds, stopAllAgents, renameSession, createRoutine } = useWorkspace();
+  const workspaceApi = useWorkspaceApi();
+  const { agents, currentUser, activeSessionIds, stoppingSessionIds, stopAllAgents, renameSession, createRoutine, canWrite = true } = useWorkspace();
   const t = useT();
   const [showCreateRoutine, setShowCreateRoutine] = useState(false);
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
   const titleInputRef = useRef<HTMLInputElement>(null);
-  const { messages, loading, forceRefresh, generation } = useMessagePolling({
+  const { messages, loading, forceRefresh, generation, error: pollingError } = useMessagePolling({
     sessionId: open ? sessionId : null,
     initialMessages,
   });
@@ -216,7 +217,7 @@ export function MonitorOverlay({ sessionId, session, initialMessages, open, onOp
             return (
               <button
                 onClick={() => stopAllAgents(sessionId)}
-                disabled={isStopping}
+                disabled={!canWrite || isStopping}
                 className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors shrink-0 disabled:opacity-60 disabled:pointer-events-none"
               >
                 <Square className="size-3 fill-current" />
@@ -228,6 +229,7 @@ export function MonitorOverlay({ sessionId, session, initialMessages, open, onOp
 
         {/* Messages */}
         <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
+          {pollingError && <p role="alert" className="px-4 py-2 text-xs text-destructive">{pollingError}</p>}
           {loading && messages.length === 0 ? (
             <div className="flex items-center justify-center flex-1">
               <div className="w-6 h-6 border-2 border-primary border-t-transparent rounded-full animate-spin" />
@@ -245,7 +247,7 @@ export function MonitorOverlay({ sessionId, session, initialMessages, open, onOp
           {/* Input */}
           <div className="px-4 py-3 border-t">
             <div className="max-w-3xl mx-auto w-full">
-              <ChatInput onSend={handleSend} agents={agents} disabled={!currentUser.name.trim()} focusKey={focusKey} onCreateRoutine={() => setShowCreateRoutine(true)} />
+              <ChatInput onSend={handleSend} agents={agents} disabled={!canWrite || !currentUser.name.trim()} focusKey={focusKey} onCreateRoutine={() => setShowCreateRoutine(true)} />
             </div>
           </div>
         </div>

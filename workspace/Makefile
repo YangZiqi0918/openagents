@@ -1,11 +1,14 @@
-.PHONY: dev stop test migrate build
+.PHONY: dev dev-backend prepare-local-key stop test migrate build
 
 # Start all services (db + backend + frontend)
-dev:
+dev: prepare-local-key
 	docker compose up --build
 
+prepare-local-key:
+	python3 backend/scripts/prepare_local_accounts.py
+
 # Start only the backend (db + backend, no frontend)
-dev-backend:
+dev-backend: prepare-local-key
 	docker compose up --build db backend
 
 # Stop all services

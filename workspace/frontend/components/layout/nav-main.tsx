@@ -17,7 +17,7 @@ import { useWorkspace } from '@/lib/workspace-context';
 import { isRecentAgent } from '@/lib/helpers';
 import { countFiles } from '@/components/files/file-utils';
 import { useT } from '@/lib/i18n';
-import { IS_LOCAL_MODE } from '@/lib/api-config';
+import { IS_LOCAL_AUTH, IS_LOCAL_MODE } from '@/lib/api-config';
 import { useLayout, type ViewMode } from './layout-context';
 
 interface NavItem {
@@ -38,7 +38,7 @@ export function NavMain({ onNavigate }: { onNavigate?: () => void }) {
   const hasAgents = agents.filter((a) => isRecentAgent(a) && !a.builtin).length > 0;
   // Fresh workspace (no real agent, no threads) is in guided onboarding — the
   // "threads" view renders the onboarding flow, so label the nav item to match.
-  const isOnboarding = !hasAgents && sessions.length === 0;
+  const isOnboarding = !IS_LOCAL_AUTH && !hasAgents && sessions.length === 0;
 
   const items: NavItem[] = [
     isOnboarding
@@ -49,8 +49,8 @@ export function NavMain({ onNavigate }: { onNavigate?: () => void }) {
           icon: <MessageSquare />,
           count: sessions.filter((s) => !s.sessionId.startsWith('routine:') && !s.sessionId.startsWith('task:')).length,
         },
-    ...(IS_LOCAL_MODE ? [{ mode: 'projects' as const, label: t('views.projects'), icon: <FolderKanban /> }] : []),
-    ...(hasAgents
+    ...(IS_LOCAL_MODE || IS_LOCAL_AUTH ? [{ mode: 'projects' as const, label: t('views.projects'), icon: <FolderKanban /> }] : []),
+    ...(hasAgents || IS_LOCAL_AUTH
       ? ([
           { mode: 'files', label: t('views.files'), icon: <FileText />, count: countFiles(files) },
           { mode: 'browser', label: t('views.browser'), icon: <Globe />, count: browserTabs.length },
@@ -91,7 +91,7 @@ export function NavMain({ onNavigate }: { onNavigate?: () => void }) {
       <SidebarGroupLabel>{t('nav.collaboration')}</SidebarGroupLabel>
       <SidebarGroupContent>
         <SidebarMenu className="gap-0.25">
-          {items.map((item) => (
+          {items.filter((item) => !IS_LOCAL_AUTH || !['tasks', 'files', 'workflows', 'browser'].includes(item.mode)).map((item) => (
             <SidebarMenuItem key={item.mode}>
               <SidebarMenuButton
                 tooltip={item.label}

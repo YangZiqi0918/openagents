@@ -7,7 +7,7 @@ import { useWorkspace } from '@/lib/workspace-context';
 import { useConfirm } from '@/components/ui/dialogs-provider';
 import { AgentAvatar } from '@/components/agents/agent-avatar';
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { cn } from '@/lib/utils';
 import { agentLabel } from '@/lib/helpers';
 import { toast } from 'sonner';
@@ -25,6 +25,7 @@ import {
 const DEFAULT_MODEL = '__default__';
 
 export function AgentProfilePanel({ docked = false }: { docked?: boolean } = {}) {
+  const workspaceApi = useWorkspaceApi();
   const {
     selectedAgentName, setSelectedAgentName, isMobile, setViewMode, openMobileDetail,
   } = useLayout();

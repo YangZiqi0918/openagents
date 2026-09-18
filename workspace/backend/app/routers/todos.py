@@ -15,6 +15,8 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.access import resolve_current_user
+from app.config import config
 from app.models import TodoRecord, Workspace
 from app.response import ResponseCode, json_response, success_response
 from app.routers.network import (
@@ -90,7 +92,10 @@ def put_todos(
     if not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
 
-    created_by = body.source
+    actor = resolve_current_user(db, authorization) if authorization is not None and (config.AUTH_MODE == "local_password" or workspace.kind == "personal") else None
+    if authorization is not None and (config.AUTH_MODE == "local_password" or workspace.kind == "personal") and actor is None:
+        return json_response(ResponseCode.UNAUTHORIZED, "Valid human identity required")
+    created_by = f"human:{actor.email}" if actor else body.source
     agent_name = _agent_name_from_source(created_by)
     channel_name = body.channel or "default"
 
@@ -141,7 +146,8 @@ def put_todos(
         },
         metadata={},
     )
-    _emit_event_blocking(event, workspace, db, token=x_workspace_token)
+    if _emit_event_blocking(event, workspace, db, token=x_workspace_token) is None:
+        return json_response(ResponseCode.FORBIDDEN, "Unable to update todos")
 
     db.commit()
     return success_response({"todos": [_serialize_todo(r) for r in records]})

@@ -10,8 +10,9 @@ import { goToCentralLogin } from '@/lib/auth-redirects';
 import { LogIn } from 'lucide-react';
 import { useT } from '@/lib/i18n';
 import { CampaignMilestoneToasts } from '@/components/campaign/campaign-feedback';
-import { API_URL, IS_LOCAL_MODE } from '@/lib/api-config';
+import { API_URL, IS_LOCAL_AUTH, IS_LOCAL_MODE } from '@/lib/api-config';
 import { LocalWorkspace } from '@/components/local-workspace';
+import { LegacyProjectRedirect } from '@/components/project/legacy-project-redirect';
 
 function WorkspaceLoadingSplash() {
   const t = useT();
@@ -252,6 +253,8 @@ export default function WorkspacePage({
   params: Promise<{ workspaceId: string }>;
 }) {
   const { workspaceId } = use(params);
+
+  if (IS_LOCAL_AUTH) return <LegacyProjectRedirect workspaceId={workspaceId} />;
 
   if (IS_LOCAL_MODE) return <LocalWorkspace workspaceId={workspaceId} />;
 

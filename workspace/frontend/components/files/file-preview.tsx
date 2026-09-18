@@ -13,7 +13,7 @@ import {
 import { useWorkspace } from '@/lib/workspace-context';
 import { useLayout } from '@/components/layout/layout-context';
 import { DetailHeader } from '@/components/layout/app-header';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { toast } from 'sonner';
 import { MarkdownContent } from '@/components/chat/markdown-content';
 import { Button } from '@/components/ui/button';
@@ -53,13 +53,10 @@ function delimiterFor(contentType: string, filename: string): string | null {
 /**
  * How the preview gets at a file's bytes.
  *
- * `url` hands the download route straight to an <img>/<audio>/<video>/<iframe>
- * (the URL carries the workspace token). `blob` is for PDFs: the route serves
- * them as an attachment, which makes a direct <iframe> download the file
- * instead of rendering it — a blob URL has no disposition, so the browser's
- * built-in viewer takes over.
+ * Binary previews use a scoped authenticated request and a temporary Blob URL.
+ * No browser media element receives a bearer or machine credential in its URL.
  */
-type LoadStrategy = 'text' | 'blob' | 'url' | 'none';
+type LoadStrategy = 'text' | 'blob' | 'none';
 
 function loadStrategyFor(kind: FileKind, contentType: string, filename: string): LoadStrategy {
   switch (kind) {
@@ -74,9 +71,9 @@ function loadStrategyFor(kind: FileKind, contentType: string, filename: string):
     case 'image':
     case 'audio':
     case 'video':
-      return 'url';
+      return 'blob';
     case 'web':
-      return isHtml(contentType, filename) ? 'url' : 'none';
+      return isHtml(contentType, filename) ? 'blob' : 'none';
     default:
       return 'none';
   }
@@ -250,7 +247,8 @@ function UnsupportedStage({
 /* ── Preview ─────────────────────────────────────────────────────────────── */
 
 export function FilePreview() {
-  const { files, selectedFileId, deleteFile, setSelectedFileId, setCurrentFilePath } = useWorkspace();
+  const workspaceApi = useWorkspaceApi();
+  const { files, selectedFileId, deleteFile, setSelectedFileId, setCurrentFilePath, canWrite = true } = useWorkspace();
   const { isMobile, openMobileList } = useLayout();
   const t = useT();
   const { formatFileSize } = useFormatters();
@@ -267,7 +265,7 @@ export function FilePreview() {
   const filename = file?.filename || '';
   const kind = file ? getFileKind(contentType, filename) : 'unknown';
   const strategy = file ? loadStrategyFor(kind, contentType, filename) : 'none';
-  const sourceUrl = file ? workspaceApi.getFileUrl(file.id) : '';
+  const sourceUrl = blobUrl || '';
   // Images don't have one — the picture wants the width, and its footer says
   // everything a column would have.
   const hasInfoPanel = kind === 'audio' || kind === 'video';
@@ -312,28 +310,24 @@ export function FilePreview() {
 
     let cancelled = false;
     let objectUrl: string | null = null;
+    const controller = new AbortController();
     setLoading(true);
 
-    const headers: Record<string, string> = {};
-    const token = (workspaceApi as unknown as { token: string }).token;
-    if (token) headers['X-Workspace-Token'] = token;
-
-    fetch(workspaceApi.getFileUrl(file.id), { headers })
+    workspaceApi.fetchResource(`/v1/files/${encodeURIComponent(file.id)}`, { signal: controller.signal })
       .then(async (res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
         if (strategy === 'text') {
           const text = await res.text();
           if (!cancelled) setContent(text);
         } else {
           const data = await res.blob();
-          // Force the type: the browser only opens its PDF viewer when the
-          // blob says application/pdf, and uploads often arrive octet-stream.
-          objectUrl = URL.createObjectURL(new Blob([data], { type: 'application/pdf' }));
-          if (!cancelled) setBlobUrl(objectUrl);
+          if (cancelled) return;
+          const type = kind === 'pdf' ? 'application/pdf' : isHtml(contentType, filename) ? 'text/html' : contentType;
+          objectUrl = URL.createObjectURL(type ? new Blob([data], { type }) : data);
+          setBlobUrl(objectUrl);
         }
       })
-      .catch(() => {
-        if (!cancelled) setError(t('files.loadFailed'));
+      .catch((failure: unknown) => {
+        if (!cancelled) setError(failure instanceof Error ? failure.message : t('files.loadFailed'));
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -341,9 +335,10 @@ export function FilePreview() {
 
     return () => {
       cancelled = true;
+      controller.abort();
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [file?.id, strategy]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [file?.id, strategy, workspaceApi]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!file) {
     return <FileGrid />;
@@ -358,12 +353,13 @@ export function FilePreview() {
   };
 
   const handleDownload = () => {
-    // We can't attach headers to an <a download>, so the tokenised URL opens
-    // in a new tab and the route's Content-Disposition does the rest.
-    window.open(sourceUrl, '_blank');
+    void workspaceApi.downloadFile(file.id, filename).catch((failure: unknown) => {
+      toast.error(failure instanceof Error ? failure.message : t('files.loadFailed'));
+    });
   };
 
   const handleDelete = async () => {
+    if (!canWrite) return;
     try {
       await deleteFile(file.id);
       toast.success(t('files.movedToTrash', { name: basename(filename) }));
@@ -460,7 +456,7 @@ export function FilePreview() {
               src={sourceUrl}
               title={basename(filename)}
               className="h-full w-full border-0 bg-white"
-              sandbox="allow-scripts allow-same-origin"
+              sandbox="allow-scripts"
             />
           );
         }
@@ -628,6 +624,7 @@ export function FilePreview() {
               mode="icon"
               size="sm"
               onClick={handleDelete}
+              disabled={!canWrite}
               aria-label={t('common.delete')}
               className="text-muted-foreground hover:text-red-500"
             >

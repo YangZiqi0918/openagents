@@ -22,6 +22,8 @@ true multi-connection race is verified in test_browser_postgres_concurrency
 (PostgreSQL only, gated on TEST_DATABASE_URL).
 """
 
+from tests.conftest import create_test_workspace
+
 import asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -43,7 +45,7 @@ WS_KEY = "bf-secret-workspace-key-123456"
 # ---------------------------------------------------------------------------
 
 def _create_workspace(client):
-    resp = client.post("/v1/workspaces", json={
+    resp = create_test_workspace(client, json={
         "name": "Leak Test Workspace",
         "agent_name": "agent-leak",
         "creator_email": "test@example.com",

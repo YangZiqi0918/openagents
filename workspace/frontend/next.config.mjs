@@ -1,15 +1,18 @@
 const localMode = process.env.NEXT_PUBLIC_LOCAL_MODE === 'true';
+const localAuth = process.env.NEXT_PUBLIC_AUTH_MODE === 'local_password';
 const apiUrl = process.env.NEXT_PUBLIC_API_URL || (localMode ? 'http://localhost:8000' : 'https://workspace-endpoint.openagents.org');
 const proxyUrl = process.env.API_INTERNAL_URL || apiUrl;
-if (localMode && !['localhost', '127.0.0.1'].includes(new URL(apiUrl).hostname)) {
-  throw new Error('Local mode requires a loopback NEXT_PUBLIC_API_URL');
+if ((localMode || localAuth) && !['localhost', '127.0.0.1'].includes(new URL(apiUrl).hostname)) {
+  throw new Error('Local deployment requires a loopback NEXT_PUBLIC_API_URL');
 }
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: 'standalone',
+  devIndicators: localAuth ? false : undefined,
+  distDir: process.env.OPENAGENTS_BUILD_DIR || '.next',
   async redirects() {
-    if (localMode) {
+    if (localMode || localAuth) {
       return ['/auth/callback', '/auth/desktop'].map((source) => ({
         source, destination: '/', permanent: false,
       }));
@@ -32,7 +35,7 @@ const nextConfig = {
   },
   async rewrites() {
     return {
-      beforeFiles: [{ source: '/', destination: '/preview-home' }],
+      beforeFiles: localAuth ? [] : [{ source: '/', destination: '/preview-home' }],
       afterFiles: [
         {
           source: '/wsapi/:path*',
@@ -43,7 +46,7 @@ const nextConfig = {
     };
   },
   async headers() {
-    if (!localMode) return [];
+    if (!localMode && !localAuth) return [];
     const localOrigins = "http://localhost:* http://127.0.0.1:* https://localhost:* https://127.0.0.1:*";
     const policy = [
       "default-src 'self'",
@@ -53,7 +56,7 @@ const nextConfig = {
       `img-src 'self' data: blob: ${localOrigins}`,
       `media-src 'self' data: blob: ${localOrigins}`,
       "font-src 'self' data:",
-      `frame-src 'self' ${localOrigins}`,
+      `frame-src 'self' blob: ${localOrigins}`,
       "object-src 'none'",
       "base-uri 'self'",
       "form-action 'self'",

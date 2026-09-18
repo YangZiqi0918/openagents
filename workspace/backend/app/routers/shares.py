@@ -17,8 +17,10 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.access import resolve_current_user, verify_workspace_access
+from app.config import config
 from app.database import get_db
-from app.models import Channel, EventRecord, ShareSnapshot, Workspace
+from app.models import Channel, EventRecord, ShareSnapshot, User, Workspace, WorkspaceMembership
 from app.response import ResponseCode, json_response, success_response
 from app.routers.network import (
     _resolve_workspace,
@@ -56,10 +58,18 @@ def _serialize_snapshot(s: ShareSnapshot) -> dict:
     }
 
 
-def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
-    if authorization and authorization.lower().startswith("bearer "):
-        return authorization[7:].strip()
-    return None
+def _requires_identity(db: Session, workspace: Workspace) -> bool:
+    if config.AUTH_MODE == "local_password" or workspace.kind == "personal":
+        return True
+    # Shared-database legacy deployments must not make local accounts' data public.
+    creator = db.execute(select(User.id).where(
+        User.email == workspace.creator_email, User.local_password_hash.is_not(None),
+    )).first()
+    local_owner = db.execute(select(User.id).join(WorkspaceMembership, WorkspaceMembership.user_id == User.id).where(
+        WorkspaceMembership.workspace_id == workspace.id, WorkspaceMembership.role == "owner",
+        User.local_password_hash.is_not(None),
+    )).first()
+    return creator is not None or local_owner is not None
 
 
 # ---------------------------------------------------------------------------
@@ -77,8 +87,7 @@ async def create_share(
     if not workspace:
         return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
 
-    bearer = _extract_bearer(authorization)
-    if not _verify_workspace_access(workspace, x_workspace_token, bearer):
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Unauthorized")
 
     channel_target = f"channel/{body.channel}"
@@ -120,11 +129,12 @@ async def create_share(
 
     share_token = secrets.token_urlsafe(9)
 
+    actor = resolve_current_user(db, authorization) if authorization is not None else None
     snapshot = ShareSnapshot(
         workspace_id=str(workspace.id),
         channel_name=body.channel,
         title=title,
-        created_by=body.created_by or "human:user",
+        created_by=f"human:{actor.email}" if actor else body.created_by or "human:user",
         snapshot_data=chat_messages,
         share_token=share_token,
         message_count=len(chat_messages),
@@ -145,6 +155,7 @@ async def create_share(
 async def get_public_share(
     share_token: str,
     db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
 ):
     snapshot = db.execute(
         select(ShareSnapshot).where(
@@ -155,6 +166,14 @@ async def get_public_share(
 
     if not snapshot:
         return json_response(ResponseCode.NOT_FOUND, "Share not found")
+
+    workspace = db.execute(select(Workspace).where(Workspace.id == snapshot.workspace_id)).scalar_one_or_none()
+    if workspace is None or workspace.status == "deleted":
+        return json_response(ResponseCode.NOT_FOUND, "Share not found")
+    if _requires_identity(db, workspace) and not verify_workspace_access(
+        workspace, None, authorization, db=db, min_role="viewer", human_only=True,
+    ):
+        return json_response(ResponseCode.FORBIDDEN, "Project membership required to view this snapshot")
 
     return success_response({
         "id": snapshot.id,
@@ -180,8 +199,7 @@ async def list_shares(
     if not workspace:
         return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
 
-    bearer = _extract_bearer(authorization)
-    if not _verify_workspace_access(workspace, x_workspace_token, bearer):
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Unauthorized")
 
     snapshots = db.execute(
@@ -212,8 +230,7 @@ async def delete_share(
     if not workspace:
         return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
 
-    bearer = _extract_bearer(authorization)
-    if not _verify_workspace_access(workspace, x_workspace_token, bearer):
+    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Unauthorized")
 
     snapshot = db.execute(

@@ -4,6 +4,7 @@ import { useRef, useState } from 'react';
 import Image from 'next/image';
 import { useWorkspace } from '@/lib/workspace-context';
 import { useT } from '@/lib/i18n';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
 
 /**
  * Sidebar brand block: logo + workspace name (click to rename) + slug.
@@ -54,13 +55,13 @@ export function Brand() {
         ) : (
           <span
             className="truncate text-sm font-medium cursor-pointer transition-colors hover:text-primary"
-            onClick={startEditing}
-            title={t('header.clickToRename')}
+            onClick={IS_LOCAL_AUTH ? undefined : startEditing}
+            title={IS_LOCAL_AUTH ? undefined : t('header.clickToRename')}
           >
-            {workspace?.name || t('nav.workspaceFallback')}
+            {IS_LOCAL_AUTH ? 'OpenAgents' : workspace?.name || t('nav.workspaceFallback')}
           </span>
         )}
-        <span className="truncate font-mono text-xs text-muted-foreground">{workspace?.slug || ''}</span>
+        {!IS_LOCAL_AUTH && <span className="truncate font-mono text-xs text-muted-foreground">{workspace?.slug || ''}</span>}
       </div>
     </div>
   );

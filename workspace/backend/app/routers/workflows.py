@@ -22,7 +22,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.models import Workflow, Workspace
+from app.config import config
+from app.local_accounts import normalize_username
+from app.models import User, Workflow, Workspace, WorkspaceMember, WorkspaceMembership
 from app.response import ResponseCode, json_response, success_response
 from app.routers.network import _resolve_workspace, _verify_workspace_access
 
@@ -92,6 +94,17 @@ def _normalize_steps(
 
     normalized: List[Dict[str, Any]] = []
     ids: set[str] = set()
+    strict = config.AUTH_MODE == "local_password"
+    project = db.execute(select(Workspace).where(Workspace.id == workspace_id)).scalar_one_or_none()
+    strict = strict or (project is not None and project.kind == "personal")
+    if strict:
+        valid_agents = set(db.execute(select(WorkspaceMember.agent_name).where(
+            WorkspaceMember.workspace_id == workspace_id, WorkspaceMember.status != "removed",
+        )).scalars().all())
+        valid_humans = db.execute(select(User).join(WorkspaceMembership, WorkspaceMembership.user_id == User.id).where(
+            WorkspaceMembership.workspace_id == workspace_id,
+        )).scalars().all()
+        human_keys = {key for user in valid_humans for key in (str(user.id), user.email, user.username) if key}
     for i, raw in enumerate(steps):
         if not isinstance(raw, dict):
             return None, f"step {i + 1} is malformed"
@@ -110,6 +123,14 @@ def _normalize_steps(
             return None, f"step {i + 1} needs an assignee (agent or human)"
         if kind == "agent" and not (assignee.get("agent") or "").strip():
             return None, f"step {i + 1} is missing its agent"
+        if strict:
+            if kind == "agent" and assignee["agent"].strip() not in valid_agents:
+                return None, f"step {i + 1}'s agent does not belong to this project"
+            human = (assignee.get("human") or "").strip()
+            if kind == "human" and human and human not in human_keys and normalize_username(human) not in human_keys:
+                return None, f"step {i + 1}'s human is not a member of this project"
+            if raw.get("knowledge_id") and str(raw["knowledge_id"]).strip() not in valid_kids:
+                return None, f"step {i + 1}'s knowledge entry does not belong to this project"
 
         step: Dict[str, Any] = {
             "id": sid,

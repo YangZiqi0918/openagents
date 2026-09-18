@@ -15,7 +15,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { UserPlus, Copy, Check, Clock, CheckCircle, XCircle } from 'lucide-react';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard';
 import { toast } from 'sonner';
 import { cn } from '@/lib/utils';
@@ -23,6 +23,7 @@ import { useFormatters, useT } from '@/lib/i18n';
 import type { WorkspaceInvitation } from '@/lib/types';
 
 export function InvitationDialog() {
+  const workspaceApi = useWorkspaceApi();
   const t = useT();
   const { timeAgo } = useFormatters();
   const [open, setOpen] = useState(false);

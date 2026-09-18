@@ -1,4 +1,4 @@
-import { belongsToProject } from '@/lib/project-channels';
+import { belongsToProject, isProjectCollaborationChannel } from '@/lib/project-channels';
 
 export interface ActivityPreferences {
   selectedId: string | null;
@@ -17,7 +17,9 @@ export function activityStorageKey(
 export function readActivityPreferences(
   raw: string | null,
   projectId: string,
+  containerScoped = false,
 ): ActivityPreferences {
+  const belongs = (id: string) => containerScoped ? isProjectCollaborationChannel(id) : belongsToProject(id, projectId);
   const empty: ActivityPreferences = {
     selectedId: null,
     drafts: {},
@@ -30,13 +32,13 @@ export function readActivityPreferences(
     const scopedEntries = (entries: unknown) =>
       entries && typeof entries === 'object'
         ? Object.entries(entries).filter(([id]) =>
-            belongsToProject(id, projectId),
+            belongs(id),
           )
         : [];
     return {
       selectedId:
         typeof saved.selectedId === 'string' &&
-        belongsToProject(saved.selectedId, projectId)
+        belongs(saved.selectedId)
           ? saved.selectedId
           : null,
       drafts: Object.fromEntries(

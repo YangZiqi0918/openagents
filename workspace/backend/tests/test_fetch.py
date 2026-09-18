@@ -6,6 +6,8 @@ Static HTTP and browser rendering are mocked; the chain logic
 (static → JS-shell detection → render → wall detection) is real.
 """
 
+from tests.conftest import create_test_workspace
+
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -25,7 +27,7 @@ from app.routers.fetch import (
 
 
 def _create_workspace(client):
-    resp = client.post("/v1/workspaces", json={
+    resp = create_test_workspace(client, json={
         "name": "Fetch Test Workspace",
         "agent_name": "agent-fetch",
         "creator_email": "test@example.com",

@@ -2,6 +2,9 @@ export interface Workspace {
   workspaceId: string;
   slug: string;
   name: string;
+  description?: string | null;
+  kind?: 'personal' | 'project';
+  personalOwnerId?: string | null;
   creatorEmail: string | null;
   requireLogin: boolean;
   settings: Record<string, unknown>;
@@ -16,6 +19,7 @@ export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';
 
 export interface TeamMember {
   email: string;
+  username?: string | null;
   displayName: string | null;
   avatarUrl: string | null;
   role: WorkspaceRole;
@@ -28,6 +32,7 @@ export interface TeamInvite {
   inviteId: string;
   /** Bound address (lowercased), or null for an open shareable link. */
   email: string | null;
+  username?: string | null;
   role: WorkspaceRole;
   url: string;
   status: 'pending' | 'accepted' | 'expired' | 'revoked';
@@ -43,6 +48,9 @@ export interface TeamInvite {
  * access and is what UI gating should use. */
 export interface WorkspaceMe {
   email: string | null;
+  username?: string | null;
+  userId?: string | null;
+  kind?: 'personal' | 'project';
   displayName: string | null;
   authenticated: boolean;
   role: WorkspaceRole | null;

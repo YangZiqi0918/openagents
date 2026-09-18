@@ -1,7 +1,8 @@
 'use client';
 
-import { useEffect, useId, useState } from 'react';
-import { MoreVertical, Pencil, Plus, Search, Trash2, Waypoints, X } from 'lucide-react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { Loader2, MoreVertical, Pencil, Plus, RefreshCw, Search, Trash2, Waypoints, X } from 'lucide-react';
 import { useT } from '@/lib/i18n';
 import { useConfirm, usePrompt } from '@/components/ui/dialogs-provider';
 import { ProjectInternalPage } from './project-internal-page';
@@ -10,6 +11,8 @@ import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem,
   DropdownMenuSeparator, DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { useOpenAgentsAuth } from '@/lib/openagents-auth-context';
+import { createAccountWorkspace, deleteAccountProject, listAccountWorkspaces, renameAccountProject, type AccountWorkspace } from '@/lib/account-api';
 
 interface Project {
   id: string;
@@ -43,7 +46,11 @@ function ProjectIcon() {
 const commandClass = 'inline-flex h-11 items-center justify-center gap-2 rounded-lg bg-neutral-900 px-5 text-base font-medium text-white transition-colors hover:bg-neutral-800 active:bg-neutral-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-neutral-500 disabled:opacity-50 dark:bg-neutral-100 dark:text-neutral-950 dark:hover:bg-white';
 const iconButtonClass = 'flex size-9 shrink-0 items-center justify-center rounded-md text-neutral-400 transition-colors hover:bg-neutral-100 hover:text-neutral-900 focus-visible:outline-2 focus-visible:outline-neutral-500 dark:hover:bg-neutral-800 dark:hover:text-neutral-100';
 
-export function ProjectsView({ storageKey = PREVIEW_STORAGE_KEY }: { storageKey?: string }) {
+export function ProjectsView({ storageKey = PREVIEW_STORAGE_KEY, serverBacked = false }: { storageKey?: string; serverBacked?: boolean }) {
+  return serverBacked ? <ServerProjectsView /> : <PreviewProjectsView storageKey={storageKey} />;
+}
+
+function PreviewProjectsView({ storageKey }: { storageKey: string }) {
   const t = useT();
   const prompt = usePrompt();
   const confirm = useConfirm();
@@ -235,4 +242,95 @@ export function ProjectsView({ storageKey = PREVIEW_STORAGE_KEY }: { storageKey?
 
     </div>
   );
+}
+
+function ServerProjectsView() {
+  const t = useT();
+  const prompt = usePrompt();
+  const confirm = useConfirm();
+  const router = useRouter();
+  const { idToken } = useOpenAgentsAuth();
+  const searchId = useId();
+  const [projects, setProjects] = useState<AccountWorkspace[]>([]);
+  const [query, setQuery] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState('');
+  const busy = useRef(false);
+  const version = useRef(0);
+
+  const load = useCallback(async () => {
+    if (!idToken) return;
+    const current = ++version.current;
+    setLoading(true); setError('');
+    try {
+      const list = await listAccountWorkspaces(idToken);
+      if (current === version.current) setProjects(list.filter((project) => project.kind !== 'personal'));
+    } catch (reason) {
+      if (current === version.current) setError(reason instanceof Error ? reason.message : t('projects.loadFailed'));
+    } finally { if (current === version.current) setLoading(false); }
+  }, [idToken, t]);
+
+  useEffect(() => {
+    void load();
+    const onFocus = () => void load();
+    window.addEventListener('focus', onFocus);
+    return () => { version.current += 1; window.removeEventListener('focus', onFocus); };
+  }, [load]);
+
+  const validateName = (name: string) => !name.trim() ? t('projects.projectName') : name.trim().length > 60 ? t('projects.nameTooLong') : null;
+  const failure = (reason: unknown) => setError(reason instanceof Error ? reason.message : t('projects.saveFailed'));
+  const create = async (template?: Template) => {
+    if (busy.current || !idToken) return;
+    busy.current = true;
+    try {
+      const name = await prompt({ title: t('projects.newProject'), placeholder: t('projects.projectName'), defaultValue: template ? t(`projects.templates.${template}.title`) : '', description: template ? t(`projects.templates.${template}.description`) : undefined, confirmText: t('common.create'), validate: validateName });
+      if (!name?.trim() || validateName(name)) return;
+      setPending(true); setError('');
+      const project = await createAccountWorkspace(idToken, name.trim(), template ? t(`projects.templates.${template}.description`) : '', template);
+      setProjects((previous) => [project, ...previous]);
+      router.push(`/projects/${encodeURIComponent(project.workspaceId)}`);
+    } catch (reason) { failure(reason); }
+    finally { busy.current = false; setPending(false); }
+  };
+  const rename = async (project: AccountWorkspace) => {
+    if (!idToken || pending || !['owner', 'admin'].includes(project.role)) return;
+    const name = await prompt({ title: t('projects.renameProject'), placeholder: t('projects.projectName'), defaultValue: project.name, confirmText: t('common.save'), validate: validateName });
+    if (!name?.trim() || validateName(name)) return;
+    setPending(true);
+    try { await renameAccountProject(idToken, project.workspaceId, name.trim()); setProjects((previous) => previous.map((entry) => entry.workspaceId === project.workspaceId ? { ...entry, name: name.trim() } : entry)); }
+    catch (reason) { failure(reason); }
+    finally { setPending(false); }
+  };
+  const remove = async (project: AccountWorkspace) => {
+    if (!idToken || pending || project.role !== 'owner') return;
+    if (!(await confirm({ title: t('projects.deleteProject'), description: t('projects.deleteConfirmation', { name: project.name }), confirmText: t('common.delete'), destructive: true }))) return;
+    setPending(true);
+    try { await deleteAccountProject(idToken, project.workspaceId); setProjects((previous) => previous.filter((entry) => entry.workspaceId !== project.workspaceId)); }
+    catch (reason) { failure(reason); }
+    finally { setPending(false); }
+  };
+  const normalized = query.trim().toLocaleLowerCase();
+  const filtered = projects.filter((project) => project.name.toLocaleLowerCase().includes(normalized));
+
+  return <div data-testid="projects-view" className="h-full min-h-0 w-full overflow-y-auto bg-background text-foreground" style={{ letterSpacing: 0 }}>
+    <div className="mx-auto w-full max-w-[1400px] px-5 pb-12 pt-8 sm:px-8 lg:px-10">
+      <header className="flex min-h-[120px] items-center justify-between gap-6 border-b pb-8">
+        <div className="min-w-0"><h1 className="text-2xl font-semibold">{t('views.projects')}</h1></div>
+        <button type="button" disabled={loading || pending} onClick={() => void create()} className={commandClass}>{pending ? <Loader2 className="size-5 animate-spin" /> : <Plus className="size-5" />}{t('projects.newProject')}</button>
+      </header>
+      {error && <div role="alert" className="mt-5 flex items-center justify-between gap-3 rounded-md border border-destructive/30 px-4 py-3 text-sm text-destructive"><span>{error}</span><button type="button" onClick={() => void load()} aria-label={t('common.retry')} title={t('common.retry')} className={iconButtonClass}><RefreshCw className="size-4" /></button></div>}
+      <section aria-labelledby={`${searchId}-mine`} className="pt-7">
+        <div className="mb-4 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between"><h2 id={`${searchId}-mine`} className="text-lg font-semibold">{t('projects.myProjects')}</h2><div className="relative w-full sm:w-[260px]"><label htmlFor={searchId} className="sr-only">{t('projects.search')}</label><Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" /><input id={searchId} type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t('projects.search')} className="h-10 w-full rounded-md border bg-background pl-9 pr-3 text-sm focus-visible:outline-2 focus-visible:outline-ring" /></div></div>
+        <div className="grid gap-4 sm:grid-cols-2" aria-busy={loading}>
+          {loading ? [0, 1].map((id) => <div key={id} role="status" aria-label={t('common.loading')} className="flex min-h-[108px] items-center gap-4 rounded-lg border px-5"><span className="size-12 rounded-md bg-muted motion-safe:animate-pulse" /><span className="h-4 w-32 rounded bg-muted motion-safe:animate-pulse" /></div>) : filtered.map((project) => <div key={project.workspaceId} data-testid="project-card" className="group flex min-h-[108px] min-w-0 items-center gap-2 rounded-lg border bg-background px-5 transition-colors hover:border-neutral-400">
+            <button type="button" onClick={() => router.push(`/projects/${encodeURIComponent(project.workspaceId)}`)} className="flex min-w-0 flex-1 items-center gap-4 py-5 text-left focus-visible:outline-2 focus-visible:outline-ring"><ProjectIcon /><span className="min-w-0"><span className="block break-words text-base font-semibold">{project.name}</span>{project.description && <span className="mt-1 block line-clamp-2 text-sm text-muted-foreground">{project.description}</span>}{project.createdAt && <time dateTime={project.createdAt} className="mt-2 block text-xs text-muted-foreground">{new Date(project.createdAt).toLocaleDateString()}</time>}</span></button>
+            {['admin', 'owner'].includes(project.role) && <DropdownMenu><DropdownMenuTrigger asChild><button type="button" disabled={pending} aria-label={t('projects.projectActions', { name: project.name })} title={t('projects.projectActions', { name: project.name })} className={iconButtonClass}><MoreVertical className="size-4" /></button></DropdownMenuTrigger><DropdownMenuContent align="end"><DropdownMenuItem onClick={() => void rename(project)}><Pencil className="size-4" />{t('common.rename')}</DropdownMenuItem>{project.role === 'owner' && <><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onClick={() => void remove(project)}><Trash2 className="size-4" />{t('common.delete')}</DropdownMenuItem></>}</DropdownMenuContent></DropdownMenu>}
+          </div>)}
+          {!loading && filtered.length === 0 && !error && <p role="status" className="col-span-full py-10 text-center text-sm text-muted-foreground">{normalized ? t('projects.noResults') : t('projects.empty')}</p>}
+        </div>
+      </section>
+      <section aria-labelledby={`${searchId}-templates`} className="mt-10"><h2 id={`${searchId}-templates`} className="mb-4 text-lg font-semibold">{t('projects.fromTemplate')}</h2><div className="grid gap-4 sm:grid-cols-2">{TEMPLATES.map((template) => <button key={template} type="button" disabled={loading || pending} onClick={() => void create(template)} className="flex min-h-[108px] min-w-0 items-center gap-4 rounded-lg border px-5 py-5 text-left transition-colors hover:bg-muted/40 focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-50"><ProjectIcon /><span className="min-w-0"><span className="block text-sm font-semibold">{t(`projects.templates.${template}.title`)}</span><span className="mt-2 block text-sm leading-6 text-muted-foreground">{t(`projects.templates.${template}.description`)}</span></span></button>)}</div></section>
+    </div>
+  </div>;
 }

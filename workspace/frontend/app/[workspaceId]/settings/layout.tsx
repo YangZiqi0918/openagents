@@ -14,7 +14,8 @@ import { useOpenAgentsAuth } from '@/lib/openagents-auth-context';
 import { goToCentralLogin } from '@/lib/auth-redirects';
 import { roleLabel } from '@/lib/roles';
 import { useT } from '@/lib/i18n';
-import { IS_LOCAL_MODE } from '@/lib/api-config';
+import { IS_LOCAL_AUTH, IS_LOCAL_MODE } from '@/lib/api-config';
+import { LegacyProjectRedirect } from '@/components/project/legacy-project-redirect';
 import { requestLocalWorkspaceAccess } from '@/lib/local-workspace';
 
 /** Read the workspace token persisted by the main workspace view (see
@@ -233,6 +234,7 @@ export default function SettingsLayout({
   params: Promise<{ workspaceId: string }>;
 }) {
   const { workspaceId } = use(params);
+  if (IS_LOCAL_AUTH) return <LegacyProjectRedirect workspaceId={workspaceId} />;
   return (
     <Suspense
       fallback={

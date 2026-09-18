@@ -6,7 +6,7 @@ import type { Messages } from './en-US';
  */
 export const messages: Messages = {
   metadata: {
-    title: 'OpenAgents 工作区',
+    title: 'OpenAgents',
     description: '实时与你的 AI 智能体协作',
   },
 

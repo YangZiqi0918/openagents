@@ -1,8 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { workspaceApi } from '@/lib/api';
-import { belongsToProject, projectChannelPrefix } from '@/lib/project-channels';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
+import { belongsToProject, isProjectCollaborationChannel, projectChannelPrefix } from '@/lib/project-channels';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
 import { networkChannelToSession, type WorkspaceSession } from '@/lib/types';
 import {
   activityStorageKey,
@@ -16,6 +17,8 @@ export function useProjectActivity(
   userId: string,
   initialSessionId?: string,
 ) {
+  const workspaceApi = useWorkspaceApi();
+  const belongs = useCallback((id: string) => IS_LOCAL_AUTH ? isProjectCollaborationChannel(id) : belongsToProject(id, projectId), [projectId]);
   const storageKey = activityStorageKey(workspaceId, projectId, userId);
   const [preferences, setPreferences] = useState<ActivityPreferences>(() => {
     let saved: string | null = null;
@@ -24,8 +27,8 @@ export function useProjectActivity(
     } catch {
       /* Storage is optional. */
     }
-    const next = readActivityPreferences(saved, projectId);
-    if (initialSessionId && belongsToProject(initialSessionId, projectId))
+    const next = readActivityPreferences(saved, projectId, IS_LOCAL_AUTH);
+    if (initialSessionId && belongs(initialSessionId))
       next.selectedId = initialSessionId;
     return next;
   });
@@ -57,7 +60,7 @@ export function useProjectActivity(
 
   const select = useCallback(
     (selectedId: string | null) => {
-      if (selectedId && !belongsToProject(selectedId, projectId)) return;
+      if (selectedId && !belongs(selectedId)) return;
       const next = preferencesRef.current;
       persist({
         ...next,
@@ -67,25 +70,25 @@ export function useProjectActivity(
           : next.readAt,
       });
     },
-    [persist, projectId],
+    [persist, belongs],
   );
 
   const draft = useCallback(
     (id: string, text: string) => {
-      if (!belongsToProject(id, projectId)) return;
+      if (!belongs(id)) return;
       const next = preferencesRef.current;
       persist({ ...next, drafts: { ...next.drafts, [id]: text } });
     },
-    [persist, projectId],
+    [persist, belongs],
   );
 
   const markRead = useCallback(
     (id: string) => {
-      if (!belongsToProject(id, projectId)) return;
+      if (!belongs(id)) return;
       const next = preferencesRef.current;
       persist({ ...next, readAt: { ...next.readAt, [id]: Date.now() } });
     },
-    [persist, projectId],
+    [persist, belongs],
   );
 
   const refresh = useCallback(async () => {
@@ -98,7 +101,7 @@ export function useProjectActivity(
         .map((channel) => networkChannelToSession(channel, workspaceId))
         .filter(
           (session) =>
-            belongsToProject(session.sessionId, projectId) &&
+            belongs(session.sessionId) &&
             session.status === 'active',
         )
         .sort(
@@ -119,7 +122,7 @@ export function useProjectActivity(
     } finally {
       if (alive.current && version === request.current) setLoading(false);
     }
-  }, [projectId, workspaceId, select]);
+  }, [workspaceApi, belongs, workspaceId, select]);
 
   useEffect(() => {
     alive.current = true;
@@ -161,7 +164,7 @@ export function useProjectActivity(
 
   const create = (title: string) =>
     operate(async () => {
-      const name = `${projectChannelPrefix(projectId)}${crypto.randomUUID()}`;
+      const name = `${IS_LOCAL_AUTH ? 'chat-' : projectChannelPrefix(projectId)}${crypto.randomUUID()}`;
       const event = await workspaceApi.sendEvent({
         type: 'network.channel.create',
         source: 'human:user',
@@ -192,7 +195,7 @@ export function useProjectActivity(
 
   const rename = (id: string, title: string) =>
     operate(async () => {
-      if (!belongsToProject(id, projectId))
+      if (!belongs(id))
         throw new Error('Invalid project channel');
       await workspaceApi.updateChannel(id, { title });
       if (alive.current)
@@ -205,7 +208,7 @@ export function useProjectActivity(
 
   const remove = (id: string) =>
     operate(async () => {
-      if (!belongsToProject(id, projectId))
+      if (!belongs(id))
         throw new Error('Invalid project channel');
       await workspaceApi.updateChannel(id, { status: 'deleted' });
       if (!alive.current) return;
@@ -224,7 +227,7 @@ export function useProjectActivity(
 
   const participant = (id: string, name: string, add: boolean) =>
     operate(async () => {
-      if (!belongsToProject(id, projectId))
+      if (!belongs(id))
         throw new Error('Invalid project channel');
       if (add) await workspaceApi.addChannelParticipant(id, name);
       else await workspaceApi.removeChannelParticipant(id, name);

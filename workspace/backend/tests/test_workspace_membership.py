@@ -6,6 +6,8 @@ Identity-token verification is stubbed (no real Firebase/Apple) by patching
 app.access.verify_identity_claims, which every caller routes through.
 """
 
+from tests.conftest import create_test_workspace
+
 import asyncio
 from types import SimpleNamespace
 
@@ -145,14 +147,12 @@ class TestReconciliation:
 # ---------------------------------------------------------------------------
 
 class TestAccountWorkspacesEndpoint:
-    def test_new_user_auto_provisioned(self, client, monkeypatch):
+    def test_new_user_has_no_automatically_created_project(self, client, monkeypatch):
         _stub_identity(monkeypatch, {"carol": _claims("carol@x.com")})
         r = client.get("/v1/account/workspaces", headers={"Authorization": "Bearer carol"})
         assert r.status_code == 200
         data = r.json()["data"]
-        assert len(data) == 1
-        assert data[0]["role"] == "owner"
-        assert data[0]["name"] == "My Workspace"
+        assert data == []
 
     def test_existing_creator_reconciled_not_provisioned(self, client, db, monkeypatch):
         _stub_identity(monkeypatch, {"dave": _claims("dave@x.com")})
@@ -189,7 +189,7 @@ class TestRequireLoginDefault:
     def test_anonymous_created_workspace_enforces_login_too(self, client):
         # Secure by default: even CLI/anonymous creation starts with
         # require_login on. Token (machine) access still works throughout.
-        r = client.post("/v1/workspaces", json={"name": "WS", "creator_email": "a@x.com"})
+        r = create_test_workspace(client, json={"name": "WS", "creator_email": "a@x.com"})
         data = r.json()["data"]
         detail = client.get(
             f"/v1/workspaces/{data['workspaceId']}",
@@ -252,21 +252,18 @@ class TestTeamApi:
         r = client.delete(f"/v1/workspaces/{wid}/team/al@x.com", headers=_auth("al"))
         assert r.status_code == 400
 
-    def test_self_join_via_token_link(self, client, monkeypatch):
+    def test_machine_token_link_does_not_grant_human_membership(self, client, monkeypatch):
         _stub_identity(monkeypatch, {"bob": _claims("bob@x.com")})
-        # Anonymous workspace with a token (a shared ?token= link).
-        data = client.post("/v1/workspaces", json={"name": "WS", "creator_email": "a@x.com"}).json()["data"]
+        # A project machine credential cannot substitute for a human invitation.
+        data = create_test_workspace(client, json={"name": "WS", "creator_email": "a@x.com"}).json()["data"]
         wid, tok = data["workspaceId"], data["token"]
-        # Logged-in bob arrives via the token link → self-join.
         r = client.post(
             f"/v1/workspaces/{wid}/team/self",
             headers={**_auth("bob"), "X-Workspace-Token": tok},
         )
-        assert r.status_code == 200
-        assert r.json()["data"] == {"email": "bob@x.com", "role": "member"}
-        # Now shows up on bob's Membership Home.
+        assert r.status_code in (401, 403)
         mine = client.get("/v1/account/workspaces", headers=_auth("bob")).json()["data"]
-        assert any(w["workspaceId"] == wid for w in mine)
+        assert not any(w["workspaceId"] == wid for w in mine)
 
 
 class TestProfile:
@@ -275,7 +272,7 @@ class TestProfile:
     def test_get_and_update_profile(self, client, monkeypatch):
         _stub_identity(monkeypatch, {"al": _claims("al@x.com")})
         p = client.get("/v1/account/profile", headers=_auth("al")).json()["data"]
-        assert p == {
+        assert {key: p[key] for key in ("email", "displayName", "avatarUrl", "welcomeSeen")} == {
             "email": "al@x.com", "displayName": "Test User",
             "avatarUrl": None, "welcomeSeen": False,
         }
@@ -286,21 +283,21 @@ class TestProfile:
             headers=_auth("al"),
         )
         assert r.status_code == 200
-        assert r.json()["data"] == {
+        assert {key: r.json()["data"][key] for key in ("email", "displayName", "avatarUrl", "welcomeSeen")} == {
             "email": "al@x.com", "displayName": "Ada L.",
             "avatarUrl": "data:image/jpeg;base64,abc123", "welcomeSeen": False,
         }
 
         # Empty string clears the avatar; omitted fields stay untouched.
         r = client.patch("/v1/account/profile", json={"avatar_url": ""}, headers=_auth("al"))
-        assert r.json()["data"] == {
+        assert {key: r.json()["data"][key] for key in ("email", "displayName", "avatarUrl", "welcomeSeen")} == {
             "email": "al@x.com", "displayName": "Ada L.",
             "avatarUrl": None, "welcomeSeen": False,
         }
 
         # welcomeSeen (camelCase wire name) persists; other fields untouched.
         r = client.patch("/v1/account/profile", json={"welcomeSeen": True}, headers=_auth("al"))
-        assert r.json()["data"] == {
+        assert {key: r.json()["data"][key] for key in ("email", "displayName", "avatarUrl", "welcomeSeen")} == {
             "email": "al@x.com", "displayName": "Ada L.",
             "avatarUrl": None, "welcomeSeen": True,
         }
@@ -362,7 +359,7 @@ class TestMeEndpoint:
         assert me["effectiveRole"] == "viewer"
 
     def test_token_access_is_owner_equivalent(self, client):
-        data = client.post("/v1/workspaces", json={"name": "WS"}).json()["data"]
+        data = create_test_workspace(client, json={"name": "WS"}).json()["data"]
         me = client.get(
             f"/v1/workspaces/{data['workspaceId']}/me",
             headers={"X-Workspace-Token": data["token"]},
@@ -524,7 +521,7 @@ class TestViewerEnforcement:
 
 
 class TestViewerToken:
-    def test_viewer_gets_null_token_owner_gets_token(self, client, monkeypatch):
+    def test_account_list_withholds_machine_tokens_for_all_roles(self, client, monkeypatch):
         _stub_identity(monkeypatch, {"al": _claims("al@x.com"), "vv": _claims("vv@x.com")})
         wid = client.post("/v1/workspaces", json={"name": "W"}, headers=_auth("al")).json()["data"]["workspaceId"]
         client.post(f"/v1/workspaces/{wid}/team", json={"email": "vv@x.com", "role": "viewer"}, headers=_auth("al"))
@@ -533,4 +530,4 @@ class TestViewerToken:
         assert vv["role"] == "viewer" and vv["token"] is None
 
         al = [w for w in client.get("/v1/account/workspaces", headers=_auth("al")).json()["data"] if w["workspaceId"] == wid][0]
-        assert al["role"] == "owner" and al["token"] is not None
+        assert al["role"] == "owner" and al["token"] is None

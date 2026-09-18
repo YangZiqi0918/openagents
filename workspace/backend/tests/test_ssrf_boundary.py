@@ -18,6 +18,8 @@ The Chromium tests skip when no browser binary is installed (the production
 image does not ship one); the rest always run.
 """
 
+from tests.conftest import create_test_workspace
+
 import asyncio
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -839,7 +841,7 @@ class TestLocalBrowserLaunchWiring:
 # ---------------------------------------------------------------------------
 
 def _create_workspace(client):
-    resp = client.post("/v1/workspaces", json={
+    resp = create_test_workspace(client, json={
         "name": "SSRF Boundary Workspace",
         "agent_name": "agent-ssrf",
         "creator_email": "test@example.com",

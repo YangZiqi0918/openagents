@@ -41,7 +41,7 @@ import type {
   WorkspaceSession,
 } from './types';
 import { eventToMessage } from './types';
-import { API_URL } from './api-config';
+import { API_URL, IS_LOCAL_AUTH } from './api-config';
 
 /** Map a snake_case custom-skill entry from the backend to camelCase. */
 function mapCustomSkill(raw: Record<string, unknown>): WorkspaceCustomSkill {
@@ -96,19 +96,72 @@ function mapTrashEntry(raw: Record<string, unknown>): TrashEntry {
   };
 }
 
-class WorkspaceApi {
+export class WorkspaceApiError extends Error {
+  constructor(public readonly status: number, public readonly path: string, body: string) {
+    super(`API ${status}: ${body}`);
+    this.name = 'WorkspaceApiError';
+  }
+}
+
+export class WorkspaceApi {
   private token: string = '';
   private bearerToken: string = '';
   private workspaceId: string = '';
+  private readonly fixedScope: boolean;
+  private accessDenied = false;
+  private accessListeners = new Set<(error: WorkspaceApiError) => void>();
+
+  constructor(workspaceId = '', token = '', bearerToken = '') {
+    this.fixedScope = workspaceId !== '';
+    this.workspaceId = workspaceId;
+    this.setCredentials(token, bearerToken);
+  }
 
   configure(workspaceId: string, token: string, bearerToken?: string) {
+    if (this.fixedScope && workspaceId !== this.workspaceId) {
+      throw new Error('A scoped API client cannot change project identity');
+    }
     this.workspaceId = workspaceId;
-    this.token = token;
-    if (bearerToken !== undefined) this.bearerToken = bearerToken;
+    this.setCredentials(token, bearerToken ?? this.bearerToken);
+  }
+
+  setCredentials(token: string, bearerToken = '') {
+    this.token = IS_LOCAL_AUTH ? '' : token;
+    if (this.bearerToken !== bearerToken) this.accessDenied = false;
+    this.bearerToken = bearerToken;
   }
 
   setBearerToken(bearerToken: string) {
-    this.bearerToken = bearerToken;
+    this.setCredentials(this.token, bearerToken);
+  }
+
+  hasBearerIdentity(): boolean {
+    return this.bearerToken !== '';
+  }
+
+  getScopeId(): string {
+    return this.workspaceId;
+  }
+
+  onAccessFailure(listener: (error: WorkspaceApiError) => void): () => void {
+    this.accessListeners.add(listener);
+    return () => { this.accessListeners.delete(listener); };
+  }
+
+  revokeAccess() {
+    this.accessDenied = true;
+  }
+
+  isAccessRevoked(): boolean {
+    return this.accessDenied;
+  }
+
+  private reportFailure(status: number, path: string, body: string): WorkspaceApiError {
+    const error = new WorkspaceApiError(status, path, body);
+    if (status === 401 || status === 403) {
+      this.accessListeners.forEach((listener) => listener(error));
+    }
+    return error;
   }
 
   getSSEUrl(channelName: string): string {
@@ -139,7 +192,8 @@ class WorkspaceApi {
     return this.workspaceId;
   }
 
-  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  async fetchResource(path: string, options: RequestInit = {}): Promise<Response> {
+    if (this.accessDenied) throw new WorkspaceApiError(403, path, 'Project access has been revoked');
     const authHeaders: Record<string, string> = {};
     if (this.token) {
       authHeaders['X-Workspace-Token'] = this.token;
@@ -161,9 +215,15 @@ class WorkspaceApi {
 
     if (!res.ok) {
       const body = await res.text();
-      throw new Error(`API ${res.status}: ${body}`);
+      throw this.reportFailure(res.status, path, body);
     }
 
+    if (this.accessDenied) throw new WorkspaceApiError(403, path, 'Project access has been revoked');
+    return res;
+  }
+
+  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+    const res = await this.fetchResource(path, options);
     const json: ApiResponse<T> = await res.json();
     return json.data;
   }
@@ -176,7 +236,7 @@ class WorkspaceApi {
     return this.request<Workspace>(`/v1/workspaces/${this.workspaceId}`);
   }
 
-  async updateWorkspace(updates: { name?: string; settings?: Record<string, unknown>; browserfabric_api_key?: string; require_login?: boolean }): Promise<Workspace> {
+  async updateWorkspace(updates: { name?: string; description?: string; settings?: Record<string, unknown>; browserfabric_api_key?: string; require_login?: boolean }): Promise<Workspace> {
     return this.request<Workspace>(`/v1/workspaces/${this.workspaceId}`, {
       method: 'PATCH',
       body: JSON.stringify(updates),
@@ -225,10 +285,10 @@ class WorkspaceApi {
   /** Create an invite. With `email` it is single-use, bound to that address,
    * and the backend emails them the link (best-effort — check `emailSent`).
    * Without, it's an open shareable link. */
-  async createInvite(role: WorkspaceRole, email?: string): Promise<TeamInvite & { emailSent: boolean }> {
+  async createInvite(role: WorkspaceRole, email?: string, username?: string): Promise<TeamInvite & { emailSent: boolean }> {
     return this.request(`/v1/workspaces/${this.requireWorkspace()}/invites`, {
       method: 'POST',
-      body: JSON.stringify(email ? { email, role } : { role }),
+      body: JSON.stringify(username ? { username, role } : email ? { email, role } : { role }),
     });
   }
 
@@ -579,8 +639,7 @@ class WorkspaceApi {
    * backend router only computes routing for channel targets, and adapters
    * treat an un-targeted human message as broadcast — without the list every
    * agent in the workspace would pick the DM up. The human side of web DMs is
-   * canonicalized to `human:user` so all of a user's DMs with a counterpart
-   * group into one conversation (real name/id still travel in the payload).
+   * uses the account's identity key; legacy anonymous DMs retain human:user.
    */
   async sendDirectMessage(
     counterpart: string,
@@ -591,7 +650,7 @@ class WorkspaceApi {
     const isAgent = counterpart.startsWith('openagents:');
     return this.sendEvent({
       type: 'workspace.message.posted',
-      source: 'human:user',
+      source: IS_LOCAL_AUTH && senderId ? `human:${senderId}` : 'human:user',
       target: counterpart,
       payload: {
         content,
@@ -681,9 +740,10 @@ class WorkspaceApi {
       signal?: AbortSignal;
     },
   ): Promise<WorkspaceFile> {
+    if (this.accessDenied) return Promise.reject(new WorkspaceApiError(403, '/v1/files', 'Project access has been revoked'));
     const formData = new FormData();
     formData.append('file', file);
-    formData.append('network', this.workspaceId);
+    formData.append('network', this.requireWorkspace());
     if (channelName) formData.append('channel_name', channelName);
 
     return new Promise<WorkspaceFile>((resolve, reject) => {
@@ -700,7 +760,11 @@ class WorkspaceApi {
 
       xhr.onload = () => {
         if (xhr.status < 200 || xhr.status >= 300) {
-          reject(new Error(`Upload failed: ${xhr.responseText || xhr.statusText}`));
+          reject(this.reportFailure(xhr.status, '/v1/files', xhr.responseText || xhr.statusText));
+          return;
+        }
+        if (this.accessDenied) {
+          reject(new WorkspaceApiError(403, '/v1/files', 'Project access has been revoked'));
           return;
         }
         try {
@@ -756,6 +820,30 @@ class WorkspaceApi {
     if (this.token) params.set('token', this.token);
     const qs = params.toString();
     return `${API_URL}/v1/files/${fileId}${qs ? `?${qs}` : ''}`;
+  }
+
+  async getFileBlob(fileId: string, options: { signal?: AbortSignal; contentType?: string } = {}): Promise<Blob> {
+    const res = await this.fetchResource(`/v1/files/${encodeURIComponent(fileId)}`, { signal: options.signal });
+    const blob = await res.blob();
+    return options.contentType ? new Blob([blob], { type: options.contentType }) : blob;
+  }
+
+  async getFileText(fileId: string, signal?: AbortSignal): Promise<string> {
+    const res = await this.fetchResource(`/v1/files/${encodeURIComponent(fileId)}`, { signal });
+    return res.text();
+  }
+
+  async downloadFile(fileId: string, filename: string): Promise<void> {
+    const blob = await this.getFileBlob(fileId);
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename.split('/').pop() || filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    // Give the browser one task to adopt the URL before releasing its bytes.
+    setTimeout(() => URL.revokeObjectURL(url), 0);
   }
 
   /** Delete a file. */
@@ -1800,6 +1888,7 @@ class WorkspaceApi {
   // ---------------------------------------------------------------------------
 
   async createShare(channelName: string, createdBy?: string): Promise<ShareSummary> {
+    if (IS_LOCAL_AUTH) throw new Error('Public conversation snapshots are disabled for local accounts');
     const raw = await this.request<Record<string, unknown>>('/v1/shares', {
       method: 'POST',
       body: JSON.stringify({

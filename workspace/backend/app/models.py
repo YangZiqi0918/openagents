@@ -81,6 +81,8 @@ class Workspace(Base):
     id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
     slug = Column(Text, unique=True)
     name = Column(Text, nullable=False)
+    kind = Column(Text, nullable=False, default="project", server_default=text("'project'"))
+    personal_owner_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     creator_email = Column(Text, nullable=True)
     password_hash = Column(Text, nullable=True)
     # When True, human web/mobile access requires a logged-in identity that is
@@ -100,6 +102,8 @@ class Workspace(Base):
     collaborators = relationship("WorkspaceCollaborator", back_populates="workspace", cascade="all, delete-orphan", lazy="selectin")
     memberships = relationship("WorkspaceMembership", back_populates="workspace", cascade="all, delete-orphan")
     nodes = relationship("Node", back_populates="workspace", cascade="all, delete-orphan")
+
+    __table_args__ = (UniqueConstraint("personal_owner_id", name="uq_personal_space_owner"),)
 
 
 class WorkspaceMember(Base):
@@ -277,6 +281,8 @@ class User(Base):
 
     id = Column(UUID(as_uuid=False), primary_key=True, default=_uuid, server_default=text("gen_random_uuid()"))
     email = Column(Text, nullable=False)                 # normalized lowercase
+    username = Column(Text, nullable=True)
+    local_password_hash = Column(Text, nullable=True)
     firebase_uid = Column(Text, nullable=True)           # Google/Firebase `uid` claim
     apple_sub = Column(Text, nullable=True)              # Sign in with Apple `sub` claim
     display_name = Column(Text, nullable=True)
@@ -293,6 +299,7 @@ class User(Base):
 
     __table_args__ = (
         UniqueConstraint("email", name="uq_users_email"),
+        UniqueConstraint("username", name="uq_users_username"),
     )
 
 

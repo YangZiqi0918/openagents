@@ -5,9 +5,17 @@ Tests for persistent browser contexts.
 BrowserManager is mocked since we don't run real Browserbase sessions in tests.
 """
 
+from tests.conftest import create_test_workspace
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def browser_context_test_key(monkeypatch):
+    # Persistent-context tests run a local mock, not the auto-provisioner.
+    monkeypatch.setattr("app.routers.browser.BROWSERFABRIC_API_KEY", "test-browser-key")
 
 
 # ---------------------------------------------------------------------------
@@ -15,7 +23,7 @@ import pytest
 # ---------------------------------------------------------------------------
 
 def _create_workspace(client):
-    resp = client.post("/v1/workspaces", json={
+    resp = create_test_workspace(client, json={
         "name": "Browser Test Workspace",
         "agent_name": "agent-browser",
         "creator_email": "test@example.com",
@@ -32,10 +40,11 @@ def _create_workspace(client):
 def _mock_manager():
     manager = MagicMock()
     manager.is_cloud = False
+    manager.is_cloud_for.return_value = False
     manager.get_session_id.return_value = None
     manager.get_live_url.return_value = None
     manager.open_tab = AsyncMock(return_value={"url": "https://example.com", "title": "Example"})
-    manager.close_tab = AsyncMock()
+    manager.close_tab = AsyncMock(return_value=(True, None))
     manager.delete_bb_context = MagicMock()
     return manager
 

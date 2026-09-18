@@ -1,5 +1,5 @@
 import { desktopHost } from './desktop-host';
-import { IS_LOCAL_MODE } from './api-config';
+import { IS_LOCAL_MODE, IS_LOCAL_AUTH } from './api-config';
 
 // Central auth redirects for the workspace app.
 //
@@ -21,6 +21,13 @@ function isLocalhost(): boolean {
  * @param fallbackSignIn used only on localhost (inline Firebase Google popup).
  */
 export function goToCentralLogin(fallbackSignIn?: () => void): void {
+  if (IS_LOCAL_AUTH && typeof window !== 'undefined') {
+    const route = window.location.hash.startsWith('#/') ? window.location.hash.slice(1) : window.location.pathname + window.location.search;
+    const target = `/login?returnTo=${encodeURIComponent(route)}`;
+    if (window.location.hash.startsWith('#/')) window.location.hash = target;
+    else window.location.assign(target);
+    return;
+  }
   if (IS_LOCAL_MODE) return;
   if (typeof window === 'undefined') return;
   const host = desktopHost();
@@ -43,6 +50,6 @@ export async function goToCentralLogout(signOut: () => Promise<void>): Promise<v
   } catch {
     /* already signed out */
   }
-  if (IS_LOCAL_MODE || typeof window === 'undefined' || isLocalhost() || desktopHost()) return;
+  if (IS_LOCAL_MODE || IS_LOCAL_AUTH || typeof window === 'undefined' || isLocalhost() || desktopHost()) return;
   window.location.href = `${CENTRAL}/logout`;
 }

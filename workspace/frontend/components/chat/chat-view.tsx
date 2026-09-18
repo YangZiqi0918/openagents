@@ -10,7 +10,10 @@ import { EmptyState } from './empty-state';
 import { useWorkspace } from '@/lib/workspace-context';
 import { useMessagePolling } from '@/hooks/use-polling';
 import { useComposingSignal } from '@/hooks/use-composing-signal';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
+import type { WorkspaceApi } from '@/lib/api';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
+import { useHumanLabels } from '@/hooks/use-human-labels';
 import { capture } from '@/lib/analytics';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
@@ -34,12 +37,17 @@ import { eventToMessage } from '@/lib/types';
 import type { WorkspaceMessage } from '@/lib/types';
 import { useT } from '@/lib/i18n';
 
-// Module-level message cache — survives component re-renders/unmounts.
-// Keyed by sessionId, stores the last known messages for instant thread switching.
-const messageCache = new Map<string, WorkspaceMessage[]>();
 const CACHE_MAX_SESSIONS = 10;
-// Track last seen message ID per cached session for incremental refresh
-const cacheLastSeenId = new Map<string, string>();
+const scopedCaches = new WeakMap<WorkspaceApi, { messageCache: Map<string, WorkspaceMessage[]>; cacheLastSeenId: Map<string, string> }>();
+
+function getMessageCache(api: WorkspaceApi) {
+  let cache = scopedCaches.get(api);
+  if (!cache) {
+    cache = { messageCache: new Map(), cacheLastSeenId: new Map() };
+    scopedCaches.set(api, cache);
+  }
+  return cache;
+}
 
 function parseDMSession(sessionId: string | null): [string, string] | null {
   if (!sessionId?.startsWith('dm:')) return null;
@@ -74,7 +82,8 @@ function messagesForSession(sessionId: string, msgs: WorkspaceMessage[]): Worksp
   });
 }
 
-function cacheMessages(sessionId: string, msgs: WorkspaceMessage[]) {
+function cacheMessages(api: WorkspaceApi, sessionId: string, msgs: WorkspaceMessage[]) {
+  const { messageCache, cacheLastSeenId } = getMessageCache(api);
   const scopedMessages = messagesForSession(sessionId, msgs);
   messageCache.set(sessionId, scopedMessages);
   if (scopedMessages.length > 0) {
@@ -96,7 +105,7 @@ const PREFETCH_COUNT = 6;
 const CACHE_REFRESH_INTERVAL = 5_000; // refresh caches every 5s
 
 /** Fetch recent messages for a session (cache prefetch). */
-async function fetchSessionMessages(sessionId: string): Promise<WorkspaceMessage[]> {
+async function fetchSessionMessages(workspaceApi: WorkspaceApi, sessionId: string): Promise<WorkspaceMessage[]> {
   try {
     const result = await workspaceApi.loadMessageHistory(sessionId, { limit: 50 });
     // Events come newest-first from sort=desc, reverse for chronological display
@@ -107,12 +116,13 @@ async function fetchSessionMessages(sessionId: string): Promise<WorkspaceMessage
 }
 
 /** Incrementally refresh a cached session — fetch only new messages since last seen. */
-async function refreshCachedSession(sessionId: string): Promise<void> {
+async function refreshCachedSession(workspaceApi: WorkspaceApi, sessionId: string): Promise<void> {
+  const { messageCache, cacheLastSeenId } = getMessageCache(workspaceApi);
   const lastId = cacheLastSeenId.get(sessionId);
   if (!lastId) {
     // No cache yet — do full fetch
-    const msgs = await fetchSessionMessages(sessionId);
-    cacheMessages(sessionId, msgs);
+    const msgs = await fetchSessionMessages(workspaceApi, sessionId);
+    cacheMessages(workspaceApi, sessionId, msgs);
     return;
   }
   try {
@@ -123,7 +133,7 @@ async function refreshCachedSession(sessionId: string): Promise<void> {
       const existingIds = new Set(existing.map((m) => m.messageId));
       const unique = scopedMessages.filter((m) => !existingIds.has(m.messageId));
       if (unique.length > 0) {
-        cacheMessages(sessionId, [...existing, ...unique]);
+        cacheMessages(workspaceApi, sessionId, [...existing, ...unique]);
       }
     }
   } catch {
@@ -132,7 +142,10 @@ async function refreshCachedSession(sessionId: string): Promise<void> {
 }
 
 export function ChatView() {
-  const { agents, currentUser, currentSessionId, sessions, updateLastMessage, setSessionActive, updateAgentMode, stopAllAgents, activeSessionIds, stoppingSessionIds, renameSession, addParticipant, removeParticipant, setSessionMaster, setSessionOrchestration, consumeSkipFocus, createRoutine, knowledge } = useWorkspace();
+  const workspaceApi = useWorkspaceApi();
+  const humanLabels = useHumanLabels();
+  const { messageCache } = getMessageCache(workspaceApi);
+  const { agents, currentUser, currentSessionId, sessions, updateLastMessage, setSessionActive, updateAgentMode, stopAllAgents, activeSessionIds, stoppingSessionIds, renameSession, addParticipant, removeParticipant, setSessionMaster, setSessionOrchestration, consumeSkipFocus, createRoutine, knowledge, canWrite = true } = useWorkspace();
   const t = useT();
   const [showCreateRoutine, setShowCreateRoutine] = useState(false);
 
@@ -212,8 +225,8 @@ export function ChatView() {
     const initial = getTopSessions();
     initial.forEach((s, i) => {
       if (!messageCache.has(s.sessionId)) {
-        setTimeout(() => fetchSessionMessages(s.sessionId).then((msgs) => {
-          if (msgs.length > 0) cacheMessages(s.sessionId, msgs);
+        setTimeout(() => fetchSessionMessages(workspaceApi, s.sessionId).then((msgs) => {
+          if (msgs.length > 0) cacheMessages(workspaceApi, s.sessionId, msgs);
         }), i * 300);
       }
     });
@@ -224,12 +237,12 @@ export function ChatView() {
       const top = getTopSessions();
       for (const s of top) {
         if (s.sessionId === currentSessionIdRef.current) continue;
-        await refreshCachedSession(s.sessionId);
+        await refreshCachedSession(workspaceApi, s.sessionId);
       }
     }, CACHE_REFRESH_INTERVAL);
 
     return () => clearInterval(interval);
-  }, [sessions]);
+  }, [sessions, workspaceApi, messageCache]);
 
   // Look up cached messages for the current session (read once per session switch)
   const initialMessagesRef = useRef<WorkspaceMessage[] | undefined>(undefined);
@@ -241,7 +254,7 @@ export function ChatView() {
     initialMessagesSessionRef.current = currentSessionId;
   }
 
-  const { messages, loading, forceRefresh, generation, loadOlder, hasOlder, loadingOlder } = useMessagePolling({
+  const { messages, loading, forceRefresh, generation, loadOlder, hasOlder, loadingOlder, error: pollingError } = useMessagePolling({
     sessionId: currentSessionId,
     initialMessages: initialMessagesRef.current,
   });
@@ -280,7 +293,7 @@ export function ChatView() {
       draftsRef.current[prevSessionIdRef.current] = currentDraft;
       // Cache messages for instant switching back
       if (messages.length > 0) {
-        cacheMessages(prevSessionIdRef.current, messages);
+        cacheMessages(workspaceApi, prevSessionIdRef.current, messages);
       }
     }
     // Restore draft for new session
@@ -297,7 +310,7 @@ export function ChatView() {
   // Keep cache updated with latest messages for the current session
   useEffect(() => {
     if (currentSessionId) {
-      cacheMessages(currentSessionId, messages);
+      cacheMessages(workspaceApi, currentSessionId, messages);
     }
   }, [currentSessionId, messages]);
 
@@ -314,10 +327,11 @@ export function ChatView() {
   // writable and titled by the counterpart alone. Agent↔agent DMs stay a
   // read-only observation view.
   const dmPairAddrs = isDM ? currentSessionId!.slice(3).split(',') : [];
-  const dmHasHuman = dmPairAddrs.some((a) => a.startsWith('human:'));
+  const ownHumanAddress = IS_LOCAL_AUTH ? `human:${currentUser.id}` : 'human:user';
+  const dmHasHuman = IS_LOCAL_AUTH ? dmPairAddrs.includes(ownHumanAddress) : dmPairAddrs.some((a) => a.startsWith('human:'));
   const dmCounterpart = isDM
     ? (dmPairAddrs.find((a) => !a.startsWith('human:'))
-        ?? dmPairAddrs.find((a) => a !== 'human:user')
+        ?? dmPairAddrs.find((a) => a !== ownHumanAddress)
         ?? dmPairAddrs[dmPairAddrs.length - 1])
     : null;
   const dmWritable = isDM && dmHasHuman && !!dmCounterpart;
@@ -325,7 +339,9 @@ export function ChatView() {
   const dmAddrLabel = (addr: string) => {
     const name = addr.replace(/^openagents:/, '').replace(/^human:/, '');
     const a = agents.find((x) => x.agentName === name);
-    return a ? agentLabel(a) : name;
+    if (a) return agentLabel(a);
+    if (addr.startsWith('human:') && IS_LOCAL_AUTH) return humanLabels[name] || (addr === ownHumanAddress ? currentUser.name : 'Member');
+    return name;
   };
   const dmTitle = isDM
     ? (dmHasHuman
@@ -584,7 +600,7 @@ export function ChatView() {
             <p className="text-sm mt-1 max-w-xs">
               {t('chat.newSessionBody')}
             </p>
-            {agents.length > 0 && (
+            {canWrite && (
               <Button className="mt-5 gap-1.5" onClick={openNewThread}>
                 <Plus className="size-4" />
                 {t('chat.newThread')}
@@ -844,7 +860,7 @@ export function ChatView() {
           })()}
 
           {/* Share conversation */}
-          <Button
+          {!IS_LOCAL_AUTH && <Button
             variant="ghost"
             size="sm"
             onClick={() => setShareDialogOpen(true)}
@@ -852,8 +868,10 @@ export function ChatView() {
             title={t('chat.shareConversation')}
           >
             <Share2 className="size-3.5" />
-          </Button>
+          </Button>}
       </DetailHeader>
+
+      {pollingError && <p role="alert" className="border-b px-4 py-2 text-xs text-destructive">{pollingError}</p>}
 
       {/* Agent roster bar — thin strip listing who's in the thread + a hint of
           their responsibility. Only shown for group threads (>1 agent), never DMs. */}
@@ -1059,7 +1077,7 @@ export function ChatView() {
               onFocusChange={(focused) => focused ? notifyFocus() : notifyBlur()}
               focusKey={focusKey}
               onCreateRoutine={() => setShowCreateRoutine(true)}
-              disabled={!currentUser.name.trim()}
+              disabled={!canWrite || !currentUser.name.trim()}
             />
           </div>
         )}
@@ -1077,7 +1095,7 @@ export function ChatView() {
           onCreateRoutine={createRoutine}
         />
 
-        {currentSessionId && (
+        {currentSessionId && !IS_LOCAL_AUTH && (
           <ShareDialog
             open={shareDialogOpen}
             onOpenChange={setShareDialogOpen}

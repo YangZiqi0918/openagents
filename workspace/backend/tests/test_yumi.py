@@ -12,6 +12,8 @@ Covers:
 - The assistant tool loop posts a chat reply (LLM stubbed).
 """
 
+from tests.conftest import create_test_workspace
+
 import asyncio
 
 import pytest
@@ -31,7 +33,7 @@ def yumi_enabled(monkeypatch):
 
 
 def _create_workspace(client, name="Yumi WS"):
-    resp = client.post("/v1/workspaces", json={
+    resp = create_test_workspace(client, json={
         "name": name,
         "agent_name": "agent-alpha",
         "creator_email": "test@example.com",

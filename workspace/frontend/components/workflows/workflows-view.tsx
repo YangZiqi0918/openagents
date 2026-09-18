@@ -182,7 +182,7 @@ function RunWorkflowDialog({
 export function WorkflowsView() {
   const {
     workflows, refreshWorkflows, createWorkflow, updateWorkflow, deleteWorkflow,
-    tasks, createTask, runTask,
+    tasks, createTask, runTask, canWrite = true,
   } = useWorkspace();
   const { openView } = useLayout();
   const t = useT();
@@ -262,7 +262,7 @@ export function WorkflowsView() {
       >
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button size="sm" className="gap-1.5">
+            <Button size="sm" disabled={!canWrite} className="gap-1.5">
               <Plus className="size-3.5" />
               {t('workflows.newWorkflow')}
               <ChevronDown className="size-3" />
@@ -301,6 +301,7 @@ export function WorkflowsView() {
                 <button
                   key={key}
                   onClick={() => openTemplate(tpl)}
+                  disabled={!canWrite}
                   className="rounded-lg border border-border bg-card p-3 text-left hover:border-foreground/30 transition-colors"
                 >
                   <div className="flex items-center gap-1.5">
@@ -324,13 +325,13 @@ export function WorkflowsView() {
                   <div className="flex items-start justify-between gap-2">
                     <h3 className="text-sm font-semibold leading-snug break-words min-w-0">{wf.name}</h3>
                     <div className="flex items-center gap-2 shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
-                      <button onClick={() => duplicate(wf)} className="-m-1 p-1 text-muted-foreground hover:text-foreground" title={t('workflows.duplicate')}>
+                      <button disabled={!canWrite} onClick={() => duplicate(wf)} className="-m-1 p-1 text-muted-foreground hover:text-foreground" title={t('workflows.duplicate')}>
                         <Copy className="size-3.5" />
                       </button>
-                      <button onClick={() => openEdit(wf)} className="-m-1 p-1 text-muted-foreground hover:text-foreground" title={t('common.edit')}>
+                      <button disabled={!canWrite} onClick={() => openEdit(wf)} className="-m-1 p-1 text-muted-foreground hover:text-foreground" title={t('common.edit')}>
                         <Pencil className="size-3.5" />
                       </button>
-                      <button onClick={() => deleteWorkflow(wf.id)} className="-m-1 p-1 text-muted-foreground hover:text-rose-500" title={t('workflows.deleteWorkflow')}>
+                      <button disabled={!canWrite} onClick={() => deleteWorkflow(wf.id)} className="-m-1 p-1 text-muted-foreground hover:text-rose-500" title={t('workflows.deleteWorkflow')}>
                         <Trash2 className="size-3.5" />
                       </button>
                     </div>
@@ -362,7 +363,7 @@ export function WorkflowsView() {
                     {wf.updatedAt && <span>· {t('workflows.metaEdited', { time: timeAgo(wf.updatedAt) })}</span>}
                   </div>
 
-                  <Button size="sm" variant="outline" onClick={() => setRunFor(wf)} className="gap-1.5 mt-1">
+                  <Button size="sm" disabled={!canWrite} variant="outline" onClick={() => setRunFor(wf)} className="gap-1.5 mt-1">
                     <Play className="size-3.5" />
                     {t('workflows.newTask')}
                   </Button>
@@ -374,7 +375,7 @@ export function WorkflowsView() {
       </div>
 
       <WorkflowBuilderDialog
-        open={builderOpen}
+        open={canWrite && builderOpen}
         onOpenChange={setBuilderOpen}
         workflow={editing}
         template={template}

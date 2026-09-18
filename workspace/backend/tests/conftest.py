@@ -8,6 +8,7 @@ Uses StaticPool to share a single in-memory database across all connections.
 """
 
 import pytest
+from unittest.mock import patch
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
@@ -94,9 +95,18 @@ def db():
 
 
 @pytest.fixture
-def workspace(client):
+def owner_headers(monkeypatch):
+    import app.access as access
+    original = access.verify_identity_claims
+    claims = {"provider": "firebase", "email": "test@example.com", "firebase_uid": None, "apple_sub": None, "display_name": "Test Owner"}
+    monkeypatch.setattr(access, "verify_identity_claims", lambda token: claims if token == "verified-fixture-owner" else original(token))
+    return {"Authorization": "Bearer verified-fixture-owner"}
+
+
+@pytest.fixture
+def workspace(client, owner_headers):
     """Create a workspace and return its details (id, slug, token)."""
-    resp = client.post("/v1/workspaces", json={
+    resp = create_test_workspace(client, json={
         "name": "Test Workspace",
         "agent_name": "agent-alpha",
         "creator_email": "test@example.com",
@@ -109,4 +119,17 @@ def workspace(client):
         "name": "Test Workspace",
         "token": data["token"],
         "channel": data["channel"],
+        "owner_headers": owner_headers,
     }
+
+
+def create_test_workspace(client, **kwargs):
+    """Exercise authenticated creation with the usual mocked provider seam."""
+    import app.access as access
+    original = access.verify_identity_claims
+    email = (kwargs.get("json", {}).get("creator_email") or "test@example.com").lower()
+    token = "verified-fixture-owner"
+    claims = {"provider": "firebase", "email": email, "firebase_uid": None, "apple_sub": None, "display_name": "Test Owner"}
+    headers = {**kwargs.pop("headers", {}), "Authorization": f"Bearer {token}"}
+    with patch.object(access, "verify_identity_claims", side_effect=lambda value: claims if value == token else original(value)):
+        return client.post("/v1/workspaces", headers=headers, **kwargs)

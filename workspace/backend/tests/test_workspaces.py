@@ -3,6 +3,8 @@
 Tests for workspace CRUD endpoints.
 """
 
+from tests.conftest import create_test_workspace
+
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -12,7 +14,7 @@ class TestCreateWorkspace:
 
     def test_create_workspace(self, client):
         """Create workspace returns ID, slug, token, and default channel."""
-        resp = client.post("/v1/workspaces", json={
+        resp = create_test_workspace(client, json={
             "name": "My Workspace",
             "agent_name": "test-agent",
         })
@@ -26,7 +28,7 @@ class TestCreateWorkspace:
 
     def test_create_workspace_has_channel_with_master(self, client):
         """Default channel has the creating agent as master and participant."""
-        resp = client.post("/v1/workspaces", json={
+        resp = create_test_workspace(client, json={
             "name": "Test",
             "agent_name": "agent-alpha",
         })
@@ -36,7 +38,7 @@ class TestCreateWorkspace:
 
     def test_create_workspace_with_email(self, client):
         """Creator email is stored."""
-        resp = client.post("/v1/workspaces", json={
+        resp = create_test_workspace(client, json={
             "name": "Test",
             "agent_name": "agent-alpha",
             "creator_email": "user@example.com",
@@ -159,7 +161,7 @@ class TestDeleteWorkspace:
         """Soft-delete sets status to 'deleted'."""
         resp = client.delete(
             f"/v1/workspaces/{workspace['id']}",
-            headers={"X-Workspace-Token": workspace["token"]},
+            headers=workspace["owner_headers"],
         )
         assert resp.status_code == 200
         assert resp.json()["data"]["status"] == "deleted"
@@ -168,9 +170,9 @@ class TestDeleteWorkspace:
         """Deleted workspace doesn't appear in list."""
         client.delete(
             f"/v1/workspaces/{workspace['id']}",
-            headers={"X-Workspace-Token": workspace["token"]},
+            headers=workspace["owner_headers"],
         )
-        resp = client.get("/v1/workspaces")
+        resp = client.get("/v1/workspaces", headers=workspace["owner_headers"])
         ids = [w["workspaceId"] for w in resp.json()["data"]]
         assert workspace["id"] not in ids
 
@@ -281,11 +283,11 @@ class TestGenerateMemberDescription:
         )
         assert resp.status_code == 401
 
-    def test_delete_by_slug_with_valid_token(self, client, workspace):
-        """Deletion by slug also works with a valid token."""
+    def test_delete_by_slug_with_owner_identity(self, client, workspace):
+        """Deletion by slug requires the project owner's identity."""
         resp = client.delete(
             f"/v1/workspaces/{workspace['slug']}",
-            headers={"X-Workspace-Token": workspace["token"]},
+            headers=workspace["owner_headers"],
         )
         assert resp.status_code == 200
         assert resp.json()["data"]["status"] == "deleted"
@@ -302,7 +304,7 @@ class TestGenerateMemberDescription:
         """After deletion the workspace returns 404 on GET."""
         client.delete(
             f"/v1/workspaces/{workspace['id']}",
-            headers={"X-Workspace-Token": workspace["token"]},
+            headers=workspace["owner_headers"],
         )
         resp = client.get(
             f"/v1/workspaces/{workspace['id']}",
@@ -312,7 +314,7 @@ class TestGenerateMemberDescription:
 
     def test_delete_already_deleted_workspace_returns_404(self, client, workspace):
         """A second DELETE on an already-deleted workspace returns 404."""
-        headers = {"X-Workspace-Token": workspace["token"]}
+        headers = workspace["owner_headers"]
         client.delete(f"/v1/workspaces/{workspace['id']}", headers=headers)
         resp = client.delete(f"/v1/workspaces/{workspace['id']}", headers=headers)
         assert resp.status_code == 404
@@ -321,23 +323,23 @@ class TestGenerateMemberDescription:
 class TestListWorkspaces:
     """GET /v1/workspaces — list workspaces."""
 
-    def test_list_empty(self, client):
+    def test_list_empty(self, client, owner_headers):
         """Empty workspace list."""
-        resp = client.get("/v1/workspaces")
+        resp = client.get("/v1/workspaces", headers=owner_headers)
         assert resp.status_code == 200
         assert resp.json()["data"] == []
 
     def test_list_returns_workspaces(self, client, workspace):
         """Workspaces appear in list."""
-        resp = client.get("/v1/workspaces")
+        resp = client.get("/v1/workspaces", headers=workspace["owner_headers"])
         assert len(resp.json()["data"]) >= 1
 
     def test_list_filter_by_agent(self, client, workspace):
         """Filter workspaces by agent membership."""
-        resp = client.get("/v1/workspaces", params={"agent_name": "agent-alpha"})
+        resp = client.get("/v1/workspaces", params={"agent_name": "agent-alpha"}, headers=workspace["owner_headers"])
         assert len(resp.json()["data"]) >= 1
 
-        resp2 = client.get("/v1/workspaces", params={"agent_name": "nonexistent"})
+        resp2 = client.get("/v1/workspaces", params={"agent_name": "nonexistent"}, headers=workspace["owner_headers"])
         assert resp2.json()["data"] == []
 
 
@@ -653,7 +655,7 @@ class TestMemberDisplayName:
         assert by_addr["openagents:evt-agent"]["role"] == "member"
 
     def test_create_workspace_rejects_unsafe_agent_name(self, client):
-        resp = client.post("/v1/workspaces", json={
+        resp = create_test_workspace(client, json={
             "name": "WS",
             "agent_name": "safe\n- forged",
             "creator_email": "t@example.com",

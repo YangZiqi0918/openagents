@@ -17,6 +17,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import config
+from app.access import access_policy_for_request, request_access_policy, request_authorization
 from app.routers import account, app_version, auth, browser, campaign, pilot, cloud_agents, devices, events, feedback, fetch, files, integrations, invites, knowledge, model_access, network, nodes, notifications, onboarding, routines, search, shares, tasks, timers, todos, workflows, workspaces
 
 logging.basicConfig(level=logging.INFO)
@@ -370,6 +371,11 @@ async def _timer_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("LIFESPAN: starting")
+    if config.AUTH_MODE == "local_password":
+        if config.LOCAL_MODE:
+            raise RuntimeError("LOCAL_MODE and local_password authentication cannot be enabled together")
+        if not config.WORKSPACE_SESSION_SECRET:
+            raise RuntimeError("Local password authentication requires WORKSPACE_SESSION_SECRET")
 
     # Align the threadpool with the DB pool. Synchronous handlers and explicitly
     # offloaded DB phases share this limiter. The per-worker connection pool holds
@@ -493,6 +499,29 @@ class UserAgentLogMiddleware(BaseHTTPMiddleware):
 app.add_middleware(UserAgentLogMiddleware)
 
 
+class ContainerAccessPolicyMiddleware:
+    """Carry write-role requirements through legacy routers and ONM pipelines."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        policy = request_access_policy.set(access_policy_for_request(scope["method"], scope["path"]))
+        authorization = next((value.decode("latin-1") for name, value in scope.get("headers", [])
+                              if name.lower() == b"authorization"), None)
+        identity = request_authorization.set(authorization)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            request_authorization.reset(identity)
+            request_access_policy.reset(policy)
+
+
+app.add_middleware(ContainerAccessPolicyMiddleware)
+
+
 # Log Pydantic validation failures with the offending body so we can
 # debug client/server schema drift from CloudWatch instead of guessing
 # from a bare 422. Triggered any time FastAPI rejects a request body
@@ -503,17 +532,23 @@ from fastapi.responses import JSONResponse as _ValidationJSONResponse
 
 @app.exception_handler(RequestValidationError)
 async def _log_validation_errors(request: Request, exc: RequestValidationError):
-    try:
-        body = await request.body()
-        body_preview = body.decode("utf-8", errors="replace")[:1024]
-    except Exception:
-        body_preview = "<unreadable>"
+    errors = exc.errors()
+    if request.url.path.startswith("/v1/auth/"):
+        body_preview = "<redacted authentication payload>"
+        errors = [{key: value for key, value in error.items() if key not in {"input", "ctx"}}
+                  for error in errors]
+    else:
+        try:
+            body = await request.body()
+            body_preview = body.decode("utf-8", errors="replace")[:1024]
+        except Exception:
+            body_preview = "<unreadable>"
     logger.warning(
         "validation 422 path=%s errors=%s body=%s",
-        request.url.path, exc.errors(), body_preview,
+        request.url.path, errors, body_preview,
     )
     return _ValidationJSONResponse(
-        status_code=422, content={"detail": exc.errors()},
+        status_code=422, content={"detail": errors},
     )
 
 

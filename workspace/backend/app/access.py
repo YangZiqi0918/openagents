@@ -7,26 +7,17 @@ the copies of `_verify_workspace_access` that were duplicated across the REST
 routers, and adding first-class user/membership resolution on top of the
 verified identity token.
 
-Access rules (evaluated in order):
-  1. Workspace token — `X-Workspace-Token` == `workspace.password_hash`.
-     The MACHINE credential (agents, daemons, adapters, iOS, legacy share
-     links). Always accepted regardless of `require_login`.
-  2. Member identity — a logged-in user (verified Google/Apple bearer) who has
-     a WorkspaceMembership row, or — for backward compatibility — whose email
-     matches `creator_email` (owner) or a collaborator row (editor→member,
-     viewer→viewer).
-  3. Open workspace — no token set AND `require_login` is False → allow
-     (grandfathers every pre-v1.0 open workspace).
-Otherwise: deny.
-
-With `require_login=False` (the default and every existing workspace) this
-reduces to exactly the legacy behaviour, so wiring it in is a no-op until a
-workspace opts in. The ONM pipeline guard (app/mods/auth.py) is intentionally
-left on its own path for now; enforcement there lands with Phase 3.
+An Authorization header selects human-identity access and can never inherit
+authority from an accompanying machine credential. Local accounts require
+explicit project membership; personal networks require the matching owner.
+Machine-only access is scoped to the token's execution network. Legacy open
+network and email fallback access remain available outside local-password mode.
 """
 
 import logging
+import re
 import secrets
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -35,6 +26,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm import Session as SqlaSession
 
 from app.firebase_auth import verify_identity_claims
+from app.config import config
 from app.models import Node, User, Workspace, WorkspaceCollaborator, WorkspaceMembership
 
 logger = logging.getLogger(__name__)
@@ -42,6 +34,31 @@ logger = logging.getLogger(__name__)
 # Role hierarchy, highest to lowest. Token/machine access is treated as
 # owner-equivalent for min-role checks (fully trusted credential).
 ROLE_RANK = {"viewer": 0, "member": 1, "admin": 2, "owner": 3}
+request_access_policy = ContextVar("request_access_policy", default=(None, False))
+request_authorization = ContextVar("request_authorization", default=None)
+
+
+def access_policy_for_request(method: str, path: str) -> tuple[Optional[str], bool]:
+    """Role defaults for legacy routers that only check container access.
+
+    Explicit router requirements can strengthen this policy, never weaken it.
+    Machine requests retain their execution access except human-only controls.
+    """
+    if config.AUTH_MODE != "local_password" or method in {"GET", "HEAD", "OPTIONS"}:
+        return None, False
+    if re.fullmatch(r"/v1/workspaces/[^/]+", path):
+        return ("owner", True) if method == "DELETE" else ("admin", False)
+    if re.match(r"/v1/workspaces/[^/]+/(team|invites)(/|$)", path):
+        return "admin", True
+    if re.match(r"/v1/workspaces/[^/]+/(members|pairing-codes|rotate-token|skills/custom|integrations|setup-email)(/|$)", path):
+        return "admin", False
+    if path == "/v1/model-probe" or re.match(r"/v1/(cloud-agents|model-access|nodes)(/|$)", path):
+        return "admin", False
+    if path in {"/v1/join", "/v1/leave", "/v1/remove"}:
+        return "admin", False
+    if re.match(r"/v1/workspaces/[^/]+/presence$", path):
+        return "viewer", True
+    return "member", False
 
 
 def _now() -> datetime:
@@ -78,6 +95,10 @@ def get_or_create_user(db: Session, claims: dict) -> Optional[User]:
         return None
 
     user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+    if user is not None and user.local_password_hash:
+        # An external email assertion must never impersonate a local account,
+        # including when a legacy profile shares the same database.
+        return None
     if user is None:
         user = User(
             email=email,
@@ -109,6 +130,11 @@ def resolve_current_user(db: Session, authorization: Optional[str]) -> Optional[
     claims = verify_identity_claims(bearer)
     if not claims:
         return None
+    if claims.get("local_user_id"):
+        return db.execute(select(User).where(
+            User.id == claims["local_user_id"], User.email == claims.get("email"),
+            User.username.is_not(None), User.local_password_hash.is_not(None),
+        )).scalar_one_or_none()
     return get_or_create_user(db, claims)
 
 
@@ -154,6 +180,8 @@ def reconcile_memberships(db: Session, user: User) -> None:
     user inherits their workspaces the first time they sign in, with no bulk
     data migration. Create-if-missing only. Does NOT commit.
     """
+    if config.AUTH_MODE == "local_password" or user.local_password_hash:
+        return
     email = user.email
 
     owned = db.execute(
@@ -195,6 +223,7 @@ def provision_workspace(db: Session, user: User, name: str = "My Workspace") -> 
         require_login=True,
         settings={},
         status="active",
+        kind="project",
     )
     db.add(ws)
     db.flush()
@@ -236,6 +265,12 @@ def resolve_user_role(db: Session, workspace: Workspace, authorization: Optional
         return None
 
     user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+    if user is not None and user.local_password_hash and not claims.get("local_user_id"):
+        return None
+    if claims.get("local_user_id") and (user is None or user.id != claims["local_user_id"] or not user.local_password_hash):
+        return None
+    if workspace.kind == "personal":
+        return "owner" if user is not None and workspace.personal_owner_id == user.id else None
     if user is not None:
         membership = db.execute(
             select(WorkspaceMembership).where(
@@ -245,6 +280,9 @@ def resolve_user_role(db: Session, workspace: Workspace, authorization: Optional
         ).scalar_one_or_none()
         if membership is not None:
             return membership.role
+
+    if claims.get("local_user_id") or config.AUTH_MODE == "local_password":
+        return None
 
     # Legacy email fallbacks (pre-reconciliation access).
     if workspace.creator_email and workspace.creator_email.strip().lower() == email:
@@ -298,6 +336,7 @@ def verify_workspace_access(
     authorization: Optional[str],
     db: Optional[Session] = None,
     min_role: Optional[str] = None,
+    human_only: bool = False,
 ) -> bool:
     """The single access check. See module docstring for the rule order.
 
@@ -307,12 +346,26 @@ def verify_workspace_access(
     (owner|admin|member|viewer) gates identity-based access; token (machine)
     access is fully trusted and bypasses the role check.
     """
-    # 1. Machine / legacy workspace token — fully trusted.
-    if workspace.password_hash and token and token == workspace.password_hash:
-        return True
+    policy_role, policy_human_only = request_access_policy.get()
+    human_only = human_only or policy_human_only
+    if policy_role and ROLE_RANK.get(policy_role, -1) > ROLE_RANK.get(min_role or "", -1):
+        min_role = policy_role
 
+    if workspace.status == "deleted":
+        return False
+    # Even a malformed identity header must not fall back to machine access.
     if db is None:
         db = SqlaSession.object_session(workspace)
+    if authorization is not None:
+        if db is None:
+            return False
+        return role_at_least(resolve_user_role(db, workspace, authorization), min_role)
+    if human_only:
+        return False
+
+    # Machine credentials remain scoped to their execution network.
+    if workspace.password_hash and token and token == workspace.password_hash:
+        return True
 
     # 1b. Per-node token belonging to THIS workspace — the machine credential
     # minted at pairing redeem. Same full trust as the workspace token, but
@@ -334,7 +387,15 @@ def verify_workspace_access(
             return role_at_least(role, min_role)
 
     # 3. Open, non-enforced workspace — grandfathered.
-    if not workspace.password_hash and not workspace.require_login:
+    if config.AUTH_MODE != "local_password" and workspace.kind != "personal" and not workspace.password_hash and not workspace.require_login:
         return True
 
     return False
+
+
+def verify_human_project_access(db: Session, workspace: Workspace,
+                                authorization: Optional[str], min_role: str = "admin") -> bool:
+    """Human membership/ownership controls never apply to personal networks."""
+    return workspace.kind != "personal" and verify_workspace_access(
+        workspace, None, authorization, db=db, min_role=min_role, human_only=True,
+    )

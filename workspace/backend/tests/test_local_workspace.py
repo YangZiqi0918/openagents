@@ -1,3 +1,5 @@
+
+from tests.conftest import create_test_workspace
 from datetime import datetime, timezone, timedelta
 
 import pytest
@@ -64,7 +66,7 @@ def test_local_mode_chooses_most_recent_workspace(client, db, workspace, local_m
     old = db.get(Workspace, workspace['id'])
     old.created_at = datetime.now(timezone.utc) - timedelta(days=1)
     db.commit()
-    new = client.post('/v1/workspaces', json={'name': 'Recent Workspace'}).json()['data']
+    new = create_test_workspace(client, json={'name': 'Recent Workspace'}).json()['data']
     assert client.post('/v1/workspaces/local-access', json={}).json()['data']['workspaceId'] == new['workspaceId']
 
 

@@ -3,7 +3,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { FileIcon, Loader2, Maximize2, Minimize2, Paperclip, RotateCcw, X } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -50,6 +51,7 @@ export function PlanRecordDialog({
   onSave: (record: PlanRecord) => boolean;
   onClose: () => void;
 }) {
+  const workspaceApi = useWorkspaceApi();
   const { locale } = useI18n();
   const l = planLabels(locale);
   const [draft, setDraft] = useState(initial);
@@ -280,7 +282,8 @@ export function PlanRecordDialog({
                     <li key={item.id} className="flex min-w-0 items-center gap-2 text-sm">
                       <FileIcon className="size-4 shrink-0" />
                       <a
-                        href={workspaceApi.getFileUrl(item.id)}
+                        href={IS_LOCAL_AUTH ? '#' : workspaceApi.getFileUrl(item.id)}
+                        onClick={IS_LOCAL_AUTH ? (event) => { event.preventDefault(); void workspaceApi.downloadFile(item.id, item.filename).catch((reason) => setError(reason instanceof Error ? reason.message : l.uploadFailed)); } : undefined}
                         target="_blank"
                         rel="noopener noreferrer"
                         aria-label={`${l.viewAttachment}: ${item.filename}`}

@@ -8,7 +8,8 @@ import { memo, useCallback, useMemo, useState } from 'react';
 import type { WorkspaceMessage, WorkspaceAgent } from '@/lib/types';
 import { AgentAvatar } from '@/components/agents/agent-avatar';
 import { MarkdownContent } from './markdown-content';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
+import { AuthenticatedFileImage } from '@/components/files/authenticated-file-image';
 import { useLayout } from '@/components/layout/layout-context';
 import { useWorkspace } from '@/lib/workspace-context';
 import { useFormatters, useT } from '@/lib/i18n';
@@ -38,7 +39,7 @@ function isPreviewable(contentType: string, filename: string): boolean {
 }
 
 function Attachments({ items }: { items: Attachment[] }) {
-  if (!items || items.length === 0) return null;
+  const workspaceApi = useWorkspaceApi();
 
   const { setViewMode } = useLayout();
   const { setSelectedFileId } = useWorkspace();
@@ -48,14 +49,9 @@ function Attachments({ items }: { items: Attachment[] }) {
     setViewMode('files');
   }, [setSelectedFileId, setViewMode]);
 
-  // Regenerate URLs from fileId to ensure they include current auth token
-  const fixedItems = useMemo(() =>
-    items.map((a) => ({ ...a, url: workspaceApi.getFileUrl(a.fileId) })),
-    [items]
-  );
-
-  const images = fixedItems.filter((a) => a.contentType?.startsWith('image/'));
-  const files = fixedItems.filter((a) => !a.contentType?.startsWith('image/'));
+  if (!items || items.length === 0) return null;
+  const images = items.filter((a) => a.contentType?.startsWith('image/'));
+  const files = items.filter((a) => !a.contentType?.startsWith('image/'));
 
   return (
     <div className="mt-2 space-y-2">
@@ -68,8 +64,9 @@ function Attachments({ items }: { items: Attachment[] }) {
               onClick={() => openPreview(img.fileId)}
               className="block rounded-lg overflow-hidden border hover:shadow-md transition-shadow max-w-sm cursor-pointer text-left"
             >
-              <img
-                src={img.url}
+              <AuthenticatedFileImage
+                fileId={img.fileId}
+                contentType={img.contentType}
                 alt={img.filename}
                 className="max-h-64 w-auto object-contain"
                 loading="lazy"
@@ -93,17 +90,16 @@ function Attachments({ items }: { items: Attachment[] }) {
                 <span className="truncate max-w-[200px]">{file.filename}</span>
               </button>
             ) : (
-              <a
+              <button
                 key={file.fileId}
-                href={file.url}
-                target="_blank"
-                rel="noopener noreferrer"
+                type="button"
+                onClick={() => { void workspaceApi.downloadFile(file.fileId, file.filename).catch((failure: unknown) => toast.error(failure instanceof Error ? failure.message : 'Unable to download file')); }}
                 className="flex items-center gap-2 px-3 py-2 rounded-lg border bg-muted hover:bg-muted/80 transition-colors text-sm"
               >
                 <FileIcon className="size-4 text-muted-foreground shrink-0" />
                 <span className="truncate max-w-[200px]">{file.filename}</span>
                 <Download className="size-3 text-muted-foreground shrink-0" />
-              </a>
+              </button>
             );
           })}
         </div>

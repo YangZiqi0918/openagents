@@ -1,15 +1,17 @@
 'use client';
 
 import React, { createContext, useContext, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { workspaceApi } from './api';
+import { WorkspaceApi, WorkspaceApiError } from './api';
+import { IS_LOCAL_AUTH } from './api-config';
+import { WorkspaceApiProvider, useWorkspaceApi } from './workspace-api-context';
 import { capture, group } from './analytics';
 import { useOpenAgentsAuth } from './openagents-auth-context';
 import { generateUserId, getStoredIdentity, storeIdentity } from './identity';
 import { networkAgentToWorkspaceAgent, networkChannelToSession } from './types';
 import { useUploadQueue } from '@/hooks/use-upload-queue';
-import { isProjectChannel, withoutProjectChannels } from './project-channels';
+import { isProjectChannel, isProjectCollaborationChannel, withoutProjectChannels } from './project-channels';
 import type { PendingUpload } from '@/hooks/use-upload-queue';
-import type { BrowserPersistentContext, BrowserTab, DMConversation, KanbanTask, Workflow, WorkflowStep, KnowledgeEntry, NotificationItem, OnlineUser, RoutineItem, TodoItem, TrashEntry, Workspace, WorkspaceAgent, WorkspaceFile, WorkspaceIdentity, WorkspaceSession } from './types';
+import type { BrowserPersistentContext, BrowserTab, DMConversation, KanbanTask, Workflow, WorkflowStep, KnowledgeEntry, NotificationItem, OnlineUser, RoutineItem, TodoItem, TrashEntry, Workspace, WorkspaceAgent, WorkspaceFile, WorkspaceIdentity, WorkspaceMe, WorkspaceSession } from './types';
 
 function useWorkspaceIdentity() {
   const { user } = useOpenAgentsAuth();
@@ -116,6 +118,10 @@ interface LastMessageInfo {
 }
 
 interface WorkspaceContextValue {
+  api: WorkspaceApi;
+  me: WorkspaceMe | null;
+  canWrite: boolean;
+  canManage: boolean;
   workspace: Workspace | null;
   token: string;
   agents: WorkspaceAgent[];
@@ -255,17 +261,38 @@ export function useWorkspace() {
   return ctx;
 }
 
-export function WorkspaceProvider({
+interface WorkspaceProviderProps {
+  workspaceId: string;
+  token: string | null;
+  bearerToken?: string;
+  scopeFilter?: 'personal' | 'project' | 'legacy';
+  children: React.ReactNode;
+}
+
+export function WorkspaceProvider(props: WorkspaceProviderProps) {
+  const api = useMemo(() => new WorkspaceApi(props.workspaceId, props.token || '', props.bearerToken || ''), [props.workspaceId]);
+  api.setCredentials(props.token || '', props.bearerToken || '');
+  return (
+    <WorkspaceApiProvider value={api}>
+      <WorkspaceStateProvider key={props.workspaceId} {...props} />
+    </WorkspaceApiProvider>
+  );
+}
+
+function WorkspaceStateProvider({
   workspaceId,
   token,
   bearerToken,
+  scopeFilter = 'legacy',
   children,
-}: {
-  workspaceId: string;
-  token: string;
-  bearerToken?: string;
-  children: React.ReactNode;
-}) {
+}: WorkspaceProviderProps) {
+  const workspaceApi = useWorkspaceApi();
+  const [me, setMe] = useState<WorkspaceMe | null>(null);
+  const [accessRevoked, setAccessRevoked] = useState(false);
+  const allowsChannel = useCallback((address: string) => {
+    if (scopeFilter === 'legacy') return !isProjectChannel(address);
+    return isProjectCollaborationChannel(address);
+  }, [scopeFilter]);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [agents, setAgents] = useState<WorkspaceAgent[]>([]);
   const { currentUser, setUserName } = useWorkspaceIdentity();
@@ -344,9 +371,9 @@ export function WorkspaceProvider({
    */
   const filesEpochRef = useRef(0);
   const commitFiles = useCallback((next: WorkspaceFile[], epoch: number) => {
-    if (epoch !== filesEpochRef.current) return;
+    if (epoch !== filesEpochRef.current || workspaceApi.isAccessRevoked()) return;
     setFiles(next);
-  }, []);
+  }, [workspaceApi]);
   const [selectedFileId, setSelectedFileId] = useState<string | null>(null);
   const [selectedKnowledgeId, setSelectedKnowledgeId] = useState<string | null>(null);
   const [currentFilePath, setCurrentFilePath] = useState('');
@@ -363,6 +390,65 @@ export function WorkspaceProvider({
   const [unreadNotificationCount, setUnreadNotificationCount] = useState(0);
   const [manuallyRenamedSessions, setManuallyRenamedSessions] = useState<Set<string>>(new Set());
   const pendingFirstSendsRef = useRef(0);
+
+  const revokeScope = useCallback((failure: unknown) => {
+    workspaceApi.revokeAccess();
+    filesEpochRef.current += 1;
+    setAccessRevoked(true);
+    setError(failure instanceof Error ? failure.message : 'Project access has been revoked');
+    setWorkspace(null);
+    setMe(null);
+    setAgents([]);
+    setSessions([]);
+    setFiles([]);
+    setTrashEntries([]);
+    setBrowserTabs([]);
+    setBrowserContexts([]);
+    setDMConversations([]);
+    setTodos([]);
+    setTasks([]);
+    setWorkflows([]);
+    setRoutines([]);
+    setKnowledge([]);
+    setNotifications([]);
+    setUnreadNotificationCount(0);
+    setLastMessageBySession({});
+    setOnlineUsers([]);
+    _setCurrentSessionId(null);
+    setSelectedFileId(null);
+    setSelectedKnowledgeId(null);
+    setSelectedBrowserTabId(null);
+  }, [workspaceApi]);
+
+  useEffect(() => {
+    if (!IS_LOCAL_AUTH) return;
+    let cancelled = false;
+    let checking = false;
+    const checkMembership = async () => {
+      if (cancelled || checking || accessRevoked) return;
+      checking = true;
+      try {
+        const caller = await workspaceApi.getMe();
+        if (!cancelled) setMe(caller);
+      } catch (failure) {
+        if (!cancelled && failure instanceof WorkspaceApiError && (failure.status === 401 || failure.status === 403 || failure.status === 404)) revokeScope(failure);
+      } finally {
+        checking = false;
+      }
+    };
+    const unsubscribe = workspaceApi.onAccessFailure((failure) => {
+      if (cancelled) return;
+      if (failure.path.endsWith('/me')) revokeScope(failure);
+      else void checkMembership();
+    });
+    // Role changes and membership removals must not leave mounted data usable.
+    const interval = setInterval(() => { void checkMembership(); }, 5_000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+      unsubscribe();
+    };
+  }, [workspaceApi, revokeScope, accessRevoked]);
 
   // Auto-select browser tabs for split browser view:
   // - On first load: select the most recently created agent tab (if any)
@@ -408,7 +494,7 @@ export function WorkspaceProvider({
 
   // Presence heartbeat
   useEffect(() => {
-    if (!currentUser.id || !currentUser.name.trim()) return;
+    if (!currentUser.id || !currentUser.name.trim() || accessRevoked) return;
 
     let cancelled = false;
     const sendPresence = (type: string) =>
@@ -491,7 +577,7 @@ export function WorkspaceProvider({
       window.removeEventListener('beforeunload', handlePageHide);
       void sendPresence('workspace.user.left');
     };
-  }, [currentUser.id, currentUser.name]);
+  }, [currentUser.id, currentUser.name, accessRevoked]);
 
   const updateLastMessage = useCallback((sessionId: string, senderName: string, content: string, isStatus?: boolean) => {
     if (!isStatus || /stopped|stopping failed/i.test(content)) {
@@ -580,20 +666,20 @@ export function WorkspaceProvider({
     }, 3000);
   }, [activeSessionIds, agents, sessions]);
 
-  // Configure API client on mount
+  // The scoped client is already configured before descendants mount.
   useEffect(() => {
-    workspaceApi.configure(workspaceId, token, bearerToken || '');
     // Tie all subsequent events to this workspace so they line up with the
     // website + launcher funnel stages for the same workspace ID.
     if (workspaceId) {
       group('workspace', workspaceId);
       capture('workspace_opened', { workspace_id: workspaceId });
     }
-  }, [workspaceId, token, bearerToken]);
+  }, [workspaceId]);
 
   const refreshWorkspace = useCallback(async () => {
     try {
       const ws = await workspaceApi.getWorkspace();
+      if (workspaceApi.isAccessRevoked()) return;
       setWorkspace(ws);
       setAgents(ws.agents);
       setError(null);
@@ -613,13 +699,14 @@ export function WorkspaceProvider({
 
   /** Refresh agents and channels from the discover endpoint. */
   const refreshDiscovery = useCallback(async () => {
-    if (pendingFirstSendsRef.current > 0) return;
+    if (accessRevoked || pendingFirstSendsRef.current > 0) return;
     try {
       const discovery = await workspaceApi.discover();
+      if (workspaceApi.isAccessRevoked()) return;
       if (pendingFirstSendsRef.current > 0) return;
       setAgents(discovery.agents.map(networkAgentToWorkspaceAgent));
 
-      const updated = discovery.channels.filter((ch) => !isProjectChannel(ch.address)).map((ch) =>
+      const updated = discovery.channels.filter((ch) => allowsChannel(ch.address)).map((ch) =>
         networkChannelToSession(ch, workspaceId)
       );
 
@@ -775,22 +862,23 @@ export function WorkspaceProvider({
       // Also refresh files, browser tabs, persistent contexts, and DM conversations so sidebar counts stay current
       const filesEpoch = filesEpochRef.current;
       workspaceApi.listFiles().then((r) => commitFiles(r.files, filesEpoch)).catch(() => {});
-      workspaceApi.listBrowserTabs().then((r) => setBrowserTabs(r.tabs)).catch(() => {});
-      workspaceApi.listBrowserContexts().then((r) => setBrowserContexts(r.contexts)).catch(() => {});
-      workspaceApi.listConversations().then((c) => setDMConversations(c)).catch(() => {});
-      workspaceApi.listTodos().then((r) => setTodos(r.todos)).catch(() => {});
-      workspaceApi.listTasks().then((r) => setTasks(r.tasks)).catch(() => {});
-      workspaceApi.listWorkflows().then((r) => setWorkflows(r.workflows)).catch(() => {});
-      workspaceApi.listRoutines().then((r) => setRoutines(r.routines)).catch(() => {});
-      workspaceApi.listKnowledge().then((r) => setKnowledge(r.entries)).catch(() => {});
+      workspaceApi.listBrowserTabs().then((r) => { if (!workspaceApi.isAccessRevoked()) setBrowserTabs(r.tabs); }).catch(() => {});
+      workspaceApi.listBrowserContexts().then((r) => { if (!workspaceApi.isAccessRevoked()) setBrowserContexts(r.contexts); }).catch(() => {});
+      workspaceApi.listConversations().then((c) => { if (!workspaceApi.isAccessRevoked()) setDMConversations(c); }).catch(() => {});
+      workspaceApi.listTodos().then((r) => { if (!workspaceApi.isAccessRevoked()) setTodos(r.todos); }).catch(() => {});
+      workspaceApi.listTasks().then((r) => { if (!workspaceApi.isAccessRevoked()) setTasks(r.tasks); }).catch(() => {});
+      workspaceApi.listWorkflows().then((r) => { if (!workspaceApi.isAccessRevoked()) setWorkflows(r.workflows); }).catch(() => {});
+      workspaceApi.listRoutines().then((r) => { if (!workspaceApi.isAccessRevoked()) setRoutines(r.routines); }).catch(() => {});
+      workspaceApi.listKnowledge().then((r) => { if (!workspaceApi.isAccessRevoked()) setKnowledge(r.entries); }).catch(() => {});
       workspaceApi.listNotifications().then((r) => {
+        if (workspaceApi.isAccessRevoked()) return;
         setNotifications(r.notifications);
         setUnreadNotificationCount(r.unreadCount);
       }).catch(() => {});
     } catch {
       // Non-critical — keep existing state
     }
-  }, [workspaceId, stoppingSessionIds, commitFiles]);
+  }, [workspaceId, stoppingSessionIds, commitFiles, accessRevoked, allowsChannel]);
 
   // Alias for backward compat
   const refreshAgents = refreshDiscovery;
@@ -1199,12 +1287,14 @@ export function WorkspaceProvider({
     let cancelled = false;
     const loadOptional = <T,>(request: Promise<T>, apply: (result: T) => void) => {
       void request.then((result) => {
-        if (!cancelled) apply(result);
+        if (!cancelled && !workspaceApi.isAccessRevoked()) apply(result);
       }).catch(() => {});
     };
     (async () => {
       setLoading(true);
       setError(null);
+      setAccessRevoked(false);
+      if (IS_LOCAL_AUTH) setMe(null);
       // Don't display the previous workspace's optional data while these load.
       filesEpochRef.current += 1;
       setFiles([]);
@@ -1223,13 +1313,19 @@ export function WorkspaceProvider({
       setUnreadNotificationCount(0);
       setDMConversations([]);
       try {
-        const [ws, discovery] = await Promise.all([
+        const [ws, discovery, caller] = await Promise.all([
           workspaceApi.getWorkspace(),
           workspaceApi.discover(),
+          IS_LOCAL_AUTH ? workspaceApi.getMe() : Promise.resolve(null),
         ]);
-        if (cancelled) return;
+        if (cancelled || workspaceApi.isAccessRevoked()) return;
+        if (IS_LOCAL_AUTH && (!caller?.authenticated || !caller.role)) {
+          revokeScope(new WorkspaceApiError(403, `/v1/workspaces/${workspaceId}/me`, 'Project membership required'));
+          return;
+        }
 
         setWorkspace(ws);
+        setMe(caller);
         const wsAgents = discovery.agents.map(networkAgentToWorkspaceAgent);
         setAgents(wsAgents);
         capture('workspace_opened', {
@@ -1238,7 +1334,7 @@ export function WorkspaceProvider({
           agent_types: wsAgents.map((a) => a.agentName),
         });
 
-        const channelSessions = discovery.channels.filter((ch) => !isProjectChannel(ch.address)).map((ch) =>
+        const channelSessions = discovery.channels.filter((ch) => allowsChannel(ch.address)).map((ch) =>
           networkChannelToSession(ch, workspaceId)
         );
         setSessions(channelSessions);
@@ -1284,7 +1380,8 @@ export function WorkspaceProvider({
         try {
           const cached = localStorage.getItem(cacheKey);
           if (cached && !cancelled) {
-            setLastMessageBySession((prev) => ({ ...withoutProjectChannels(JSON.parse(cached)), ...prev }));
+            const parsed = JSON.parse(cached) as Record<string, LastMessageInfo>;
+            setLastMessageBySession((prev) => ({ ...(scopeFilter === 'legacy' ? withoutProjectChannels(parsed) : parsed), ...prev }));
           }
         } catch { /* ignore corrupt cache */ }
 
@@ -1310,7 +1407,7 @@ export function WorkspaceProvider({
         loadOptional(workspaceApi.latestPerChannel(), (bulk) => {
           const batch: Record<string, LastMessageInfo> = {};
           for (const [channelName, event] of Object.entries(bulk.channels)) {
-            if (isProjectChannel(channelName)) continue;
+            if (!allowsChannel(channelName)) continue;
             const payload = event.payload as Record<string, string>;
             const sender = payload?.sender_name || event.source.replace(/^(openagents:|human:)/, '');
             const content = payload?.content || '';
@@ -1334,7 +1431,7 @@ export function WorkspaceProvider({
       }
     })();
     return () => { cancelled = true; };
-  }, [workspaceId, token]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [workspaceId, token, bearerToken, allowsChannel]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Locally-observed activity. `lastEventAt` is null on some workspaces, so a
   // changed message preview is the other signal that a thread moved. Status
@@ -1403,8 +1500,11 @@ export function WorkspaceProvider({
   hasActiveAgentsRef.current = Object.values(lastMessageBySession).some((m) => m.isStatus);
 
   useEffect(() => {
+    if (accessRevoked) return;
     let timeout: ReturnType<typeof setTimeout>;
+    let cancelled = false;
     const schedule = () => {
+      if (cancelled) return;
       const delay = hasActiveAgentsRef.current ? 5_000 : 15_000;
       timeout = setTimeout(async () => {
         await refreshDiscovery();
@@ -1412,8 +1512,8 @@ export function WorkspaceProvider({
       }, delay);
     };
     schedule();
-    return () => clearTimeout(timeout);
-  }, [refreshDiscovery]);
+    return () => { cancelled = true; clearTimeout(timeout); };
+  }, [refreshDiscovery, accessRevoked]);
 
   const createSession = useCallback(async (opts?: { title?: string; master?: string; participants?: string[]; resumeFrom?: string }) => {
     // Only set a channel leader when one is explicitly requested (e.g. the
@@ -1692,8 +1792,12 @@ export function WorkspaceProvider({
   return (
     <WorkspaceContext.Provider
       value={{
+        api: workspaceApi,
+        me,
+        canWrite: !IS_LOCAL_AUTH || !!me?.role && me.role !== 'viewer',
+        canManage: !IS_LOCAL_AUTH || me?.role === 'owner' || me?.role === 'admin',
         workspace,
-        token,
+        token: IS_LOCAL_AUTH ? '' : token || '',
         agents,
         currentUser,
         setUserName,
@@ -1799,7 +1903,7 @@ export function WorkspaceProvider({
         setNotificationSound,
       }}
     >
-      {children}
+      {accessRevoked || (IS_LOCAL_AUTH && !me && !loading) ? <div role="alert" className="p-6 text-sm text-destructive">{error || 'Unable to access this project'}</div> : IS_LOCAL_AUTH && !me ? <div role="status" className="p-6 text-sm text-muted-foreground">Loading...</div> : children}
     </WorkspaceContext.Provider>
   );
 }

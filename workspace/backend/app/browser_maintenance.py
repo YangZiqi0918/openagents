@@ -81,7 +81,7 @@ async def _emit_tab_closed(db, workspace: Workspace, tab: BrowserTab) -> None:
             target="core",
             payload=payload,
         )
-        await _emit_event(event, workspace, db, token=workspace.password_hash)
+        await _emit_event(event, workspace, db, token=workspace.password_hash, trusted_service=True)
     except Exception as e:
         logger.warning("tab.closed event failed for reaped tab %s: %s", tab.id, e)
 

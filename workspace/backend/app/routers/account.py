@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.access import provision_workspace, reconcile_memberships, resolve_current_user
+from app.access import reconcile_memberships, resolve_current_user
 from app.database import get_db
 from app.firebase_auth import verify_identity_token
 from app.models import (
@@ -44,6 +44,11 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["Account"])
 
 
+def _project_description(workspace: Workspace) -> str:
+    metadata = (workspace.settings or {}).get("project")
+    return metadata.get("description", "") if isinstance(metadata, dict) else ""
+
+
 def _authed_email(authorization: Optional[str]) -> Optional[str]:
     """Resolve the calling user's normalized email from the identity bearer,
     or None if absent/invalid."""
@@ -59,33 +64,13 @@ def list_account_workspaces(
     db: Session = Depends(get_db),
     authorization: Optional[str] = Header(None),
 ):
-    """List the signed-in user's workspaces — the Membership Home (v1.0).
-
-    Side effects (idempotent): resolves/creates the User row for the verified
-    identity, reconciles any pre-v1.0 email-keyed access (creator_email +
-    collaborator rows) into first-class WorkspaceMembership rows, and — for a
-    brand-new user with no memberships — auto-provisions an empty workspace they
-    own (Overleaf-style first run). This is why a GET writes.
-
-    Each entry includes the workspace's shared access token (`token`) so the
-    client can connect directly; the caller is a verified member, which is
-    exactly who is entitled to that token.
-    """
+    """The caller's real projects; personal networks and machine secrets are excluded."""
     user = resolve_current_user(db, authorization)
     if not user:
         return json_response(ResponseCode.UNAUTHORIZED, "Invalid identity token")
 
     # Migration bridge: pull legacy email-keyed access into memberships.
     reconcile_memberships(db, user)
-
-    # Brand-new user (no access anywhere) → give them an empty workspace to own.
-    has_membership = db.execute(
-        select(WorkspaceMembership.workspace_id)
-        .where(WorkspaceMembership.user_id == user.id)
-        .limit(1)
-    ).first()
-    if not has_membership:
-        provision_workspace(db, user)
 
     db.commit()
 
@@ -95,6 +80,7 @@ def list_account_workspaces(
         .where(
             WorkspaceMembership.user_id == user.id,
             Workspace.status != "deleted",
+            Workspace.kind == "project",
         )
         .order_by(Workspace.last_activity_at.desc())
     ).all()
@@ -104,19 +90,40 @@ def list_account_workspaces(
             "workspaceId": str(ws.id),
             "name": ws.name,
             "slug": ws.slug,
-            # Shared workspace access token (password_hash stores the raw token,
-            # compared by equality in app.access.verify_workspace_access). May be
-            # null for an open workspace with no token set. Withheld from viewers
-            # so they open the workspace bearer-only (read access) and can't use
-            # the token to bypass the read-only role.
-            "token": None if role == "viewer" else ws.password_hash,
+            "kind": ws.kind,
+            "token": None,
             "role": role,
+            "createdAt": ws.created_at.isoformat() if ws.created_at else None,
+            "description": _project_description(ws),
             "lastActivityAt": ws.last_activity_at.isoformat() if ws.last_activity_at else None,
         }
         for ws, role in rows
     ]
 
     return success_response(results)
+
+
+@router.get("/account/personal-space")
+def get_personal_space(
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+):
+    """Read the authenticated account's private context without provisioning a project."""
+    user = resolve_current_user(db, authorization)
+    if user is None:
+        return json_response(ResponseCode.UNAUTHORIZED, "Invalid identity token")
+    space = db.execute(select(Workspace).where(
+        Workspace.kind == "personal", Workspace.personal_owner_id == user.id,
+        Workspace.status != "deleted",
+    )).scalar_one_or_none()
+    if space is None:
+        return json_response(ResponseCode.NOT_FOUND, "Personal space not initialized; sign in again")
+    return success_response({
+        "workspaceId": str(space.id), "name": space.name, "slug": space.slug,
+        "kind": "personal", "role": "owner", "token": None, "description": "",
+        "createdAt": space.created_at.isoformat() if space.created_at else None,
+        "lastActivityAt": space.last_activity_at.isoformat() if space.last_activity_at else None,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +148,9 @@ class ProfileUpdateRequest(BaseModel):
 
 def _profile_row(user) -> dict:
     return {
+        "id": str(user.id),
+        "userId": str(user.id),
+        "username": user.username,
         "email": user.email,
         "displayName": user.display_name,
         "avatarUrl": user.avatar_url,

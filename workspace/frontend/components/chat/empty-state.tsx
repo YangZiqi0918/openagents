@@ -6,13 +6,14 @@ import { useWorkspace } from '@/lib/workspace-context';
 import { capture } from '@/lib/analytics';
 import { useLayout } from '@/components/layout/layout-context';
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { AgentIcon } from '@/components/icons/agent-icons';
 import { useT } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
 import type { AgentCatalogEntry } from '@/lib/types';
 
 export function EmptyState() {
+  const workspaceApi = useWorkspaceApi();
   const { agents, token } = useWorkspace();
   const { setViewMode } = useLayout();
   const { isCopied, copyToClipboard } = useCopyToClipboard();

@@ -16,7 +16,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Button } from '@/components/ui/button';
 import { useConfirm } from '@/components/ui/dialogs-provider';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { useWorkspace } from '@/lib/workspace-context';
 import { toast } from 'sonner';
 import type { WorkspaceAgent } from '@/lib/types';
@@ -26,6 +26,7 @@ interface AgentStatusCardProps {
 }
 
 export function AgentStatusCard({ agents }: AgentStatusCardProps) {
+  const workspaceApi = useWorkspaceApi();
   const { refreshAgents } = useWorkspace();
   const confirm = useConfirm();
   const t = useT();

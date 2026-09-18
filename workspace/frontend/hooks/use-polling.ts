@@ -1,7 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { workspaceApi } from '@/lib/api';
+import { WorkspaceApiError } from '@/lib/api';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { eventToMessage } from '@/lib/types';
 import { compareMessages, mergeMessages } from '@/lib/message-merge';
 import type { ONMEvent, WorkspaceMessage } from '@/lib/types';
@@ -67,6 +69,11 @@ function eventsToScopedMessages(
 }
 
 export function useMessagePolling({ sessionId, enabled = true, initialMessages }: UsePollingOptions) {
+  const workspaceApi = useWorkspaceApi();
+  const currentApiRef = useRef(workspaceApi);
+  currentApiRef.current = workspaceApi;
+  const [error, setError] = useState<string | null>(null);
+  const [denied, setDenied] = useState(false);
   const [messages, setMessages] = useState<WorkspaceMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -97,6 +104,8 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
 
   // Reset when session changes
   useEffect(() => {
+    setError(null);
+    setDenied(false);
     currentSessionRef.current = sessionId;
     const nextDMPair = parseDMSession(sessionId);
     const scopedInitialMessages = sessionId && initialMessages
@@ -121,7 +130,16 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
       setHasOlder(false);
       setLoading(false);
     }
-  }, [sessionId]); // intentionally omit initialMessages — only seed on session change
+  }, [sessionId, workspaceApi]); // only seed when the request scope changes
+
+  const handleError = useCallback((failure: unknown) => {
+    if (currentApiRef.current !== workspaceApi || sessionId !== currentSessionRef.current) return;
+    setError(failure instanceof Error ? failure.message : 'Unable to load conversation');
+    if (failure instanceof WorkspaceApiError && (failure.status === 401 || failure.status === 403)) {
+      setDenied(true);
+      setMessages([]);
+    }
+  }, [workspaceApi, sessionId]);
 
   // Advance the newest-message cursor, but only forward in time.
   const bumpNewest = useCallback((msg: WorkspaceMessage) => {
@@ -168,7 +186,8 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
         : await workspaceApi.loadMessageHistory(sessionId, { limit: 50 });
 
       // Discard if session changed
-      if (sessionId !== currentSessionRef.current) return false;
+      if (sessionId !== currentSessionRef.current || workspaceApi !== currentApiRef.current) return false;
+      setError(null);
 
       // Events come newest-first from sort=desc, reverse for chronological display.
       // Guard on the SCOPED result, not result.events: a page can be non-empty
@@ -197,17 +216,18 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
 
       historyLoadedRef.current = true;
       return true;
-    } catch {
+    } catch (failure) {
+      handleError(failure);
       historyLoadedRef.current = true;
       return false;
     } finally {
       setLoading(false);
     }
-  }, [sessionId, dmPair, bumpNewest]);
+  }, [sessionId, dmPair, bumpNewest, workspaceApi, handleError]);
 
   // Forward poll: fetch new messages since the newest known
   const poll = useCallback(async () => {
-    if (!sessionId || !historyLoadedRef.current) return;
+    if (!sessionId || denied || !historyLoadedRef.current) return;
 
     try {
       // Keep fetching while there are more events (handles bursts of status
@@ -233,7 +253,8 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
             );
 
         // Discard response if session changed while request was in flight
-        if (sessionId !== currentSessionRef.current) return;
+        if (sessionId !== currentSessionRef.current || workspaceApi !== currentApiRef.current) return;
+        setError(null);
 
         const newMessages = scopeMessagesToSession(result.messages, sessionId, dmPair);
         hasMore = result.hasMore && newMessages.length > 0;
@@ -245,10 +266,11 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
           setMessages((prev) => mergeMessages(prev, newMessages));
         }
       }
-    } catch {
+    } catch (failure) {
+      handleError(failure);
       // Polling error — will retry on next interval
     }
-  }, [sessionId, dmPair, bumpNewest]);
+  }, [sessionId, dmPair, bumpNewest, workspaceApi, handleError, denied]);
 
   // Load older messages (infinite scroll upward)
   const loadOlder = useCallback(async () => {
@@ -268,7 +290,7 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
             limit: 30,
           });
 
-      if (sessionId !== currentSessionRef.current) return;
+      if (sessionId !== currentSessionRef.current || workspaceApi !== currentApiRef.current) return;
 
       if (result.events.length > 0) {
         const olderMessages = eventsToScopedMessages(result.events, sessionId, dmPair).reverse();
@@ -279,16 +301,17 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
       } else {
         setHasOlder(false);
       }
-    } catch {
+    } catch (failure) {
+      handleError(failure);
       // Best-effort
     } finally {
       setLoadingOlder(false);
     }
-  }, [sessionId, hasOlder, loadingOlder, dmPair]);
+  }, [sessionId, hasOlder, loadingOlder, dmPair, workspaceApi, handleError]);
 
   // Initial load + SSE with polling fallback
   useEffect(() => {
-    if (!sessionId || !enabled) return;
+    if (!sessionId || !enabled || denied) return;
 
     if (!historyLoadedRef.current) {
       // History hydration excludes intermediate step events (thinking/status/
@@ -311,6 +334,7 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
     let eventSource: EventSource | null = null;
     let timeout: ReturnType<typeof setTimeout> | null = null;
     let usingSSE = false;
+    let disposed = false;
 
     const startPolling = () => {
       const getDelay = () => {
@@ -322,6 +346,7 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
         return idle > 60_000 ? 15_000 : 2_000;
       };
       const schedule = () => {
+        if (disposed) return;
         timeout = setTimeout(async () => {
           await poll();
           schedule();
@@ -330,7 +355,7 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
       schedule();
     };
 
-    if (!isDM) {
+    if (!isDM && !IS_LOCAL_AUTH && !workspaceApi.hasBearerIdentity?.()) {
       try {
         const sseUrl = workspaceApi.getSSEUrl(sessionId);
         eventSource = new EventSource(sseUrl);
@@ -369,9 +394,10 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
 
     return () => {
       if (eventSource) eventSource.close();
+      disposed = true;
       if (timeout) clearTimeout(timeout);
     };
-  }, [sessionId, enabled, poll, loadHistory, reconnectNonce]);
+  }, [sessionId, enabled, poll, loadHistory, reconnectNonce, workspaceApi, denied]);
 
   // Recover after the tab is backgrounded (esp. mobile browsers, which suspend
   // timers and kill the EventSource). On return to the foreground: immediately
@@ -405,5 +431,5 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
     poll();
   }, [poll]);
 
-  return { messages, loading, forceRefresh, generation, loadOlder, hasOlder, loadingOlder };
+  return { messages, loading, forceRefresh, generation, loadOlder, hasOlder, loadingOlder, error };
 }

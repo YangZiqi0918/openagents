@@ -116,6 +116,7 @@ export const RAIL_WIDTH_EXPANDED = 264;
 export type MobilePane = 'list' | 'detail';
 
 interface LayoutState {
+  embedded: boolean;
   isMobile: boolean;
   /** Whether the list panel beside the rail is showing (the sidebar's open state) */
   isSidebarOpen: boolean;
@@ -184,9 +185,9 @@ interface LayoutState {
 
 const LayoutContext = createContext<LayoutState | undefined>(undefined);
 
-export function LayoutProvider({ children }: { children: ReactNode }) {
+export function LayoutProvider({ children, onNavigate, initialView = 'threads', embedded = false }: { children: ReactNode; onNavigate?: (mode: ViewMode) => void; initialView?: ViewMode; embedded?: boolean }) {
   const isMobile = useIsMobile();
-  const [viewMode, setViewMode] = useState<ViewMode>('threads');
+  const [viewMode, setViewMode] = useState<ViewMode>(initialView);
   const [filesSection, setFilesSection] = useState<FilesSection>('folders');
   const [filesBrowse, setFilesBrowseState] = useState<FilesBrowseState>(DEFAULT_FILES_BROWSE);
   const setFilesBrowse = useCallback((updates: Partial<FilesBrowseState>) => {
@@ -212,6 +213,7 @@ export function LayoutProvider({ children }: { children: ReactNode }) {
   const [newThreadOpen, setNewThreadOpen] = useState(false);
   const [draftThreadOpen, setDraftThreadOpen] = useState(false);
   const openNewThread = () => {
+    onNavigate?.('threads');
     if (isMobile) setNewThreadOpen(true);
     else {
       setViewMode('threads');
@@ -260,6 +262,7 @@ export function LayoutProvider({ children }: { children: ReactNode }) {
 
   // Switching views keeps whatever the user last chose for the target view.
   const openView = (mode: ViewMode) => {
+    onNavigate?.(mode);
     setViewMode(mode);
     // Files is the exception: its list pane is a folder tree, and what you want
     // on opening it is usually the file you or an agent just added — which is
@@ -295,6 +298,7 @@ export function LayoutProvider({ children }: { children: ReactNode }) {
 
   return (
     <LayoutContext.Provider value={{
+      embedded,
       isMobile,
       isSidebarOpen,
       setSidebarOpen,

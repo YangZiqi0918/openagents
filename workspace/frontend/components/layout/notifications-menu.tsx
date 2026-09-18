@@ -1,6 +1,7 @@
 'use client';
 
 import { useMemo, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import { Bell, CheckCheck, RefreshCw } from 'lucide-react';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -10,6 +11,7 @@ import { useWorkspace } from '@/lib/workspace-context';
 import type { NotificationItem } from '@/lib/types';
 import { useT } from '@/lib/i18n';
 import { useLayout } from './layout-context';
+import { invitationNotificationPath } from '@/lib/notification-target';
 
 const PRIORITY_ORDER = { high: 0, normal: 1, low: 2 } as const;
 
@@ -30,6 +32,7 @@ export function NotificationsMenu({ side, align = 'end' }: NotificationsMenuProp
     sessions,
   } = useWorkspace();
   const { openView } = useLayout();
+  const router = useRouter();
   const t = useT();
   const [open, setOpen] = useState(false);
 
@@ -49,6 +52,8 @@ export function NotificationsMenu({ side, align = 'end' }: NotificationsMenuProp
 
   const handleNavigate = (notification: NotificationItem) => {
     if (!notification.isRead) markNotificationRead(notification.id);
+    const invitation = invitationNotificationPath(notification);
+    if (invitation) { setOpen(false); router.push(invitation); return; }
     if (notification.channelName && sessions.some((s) => s.sessionId === notification.channelName)) {
       setCurrentSessionId(notification.channelName);
       openView('threads');

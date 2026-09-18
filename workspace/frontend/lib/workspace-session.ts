@@ -18,6 +18,37 @@ export interface WorkspaceSession {
   displayName: string | null;
   /** Unix seconds. */
   expiresAt: number;
+  source?: 'local_password' | 'handoff';
+  userId?: string;
+  username?: string;
+}
+
+export async function authenticateLocalAccount(
+  mode: 'register' | 'login',
+  username: string,
+  password: string,
+): Promise<WorkspaceSession> {
+  const response = await fetch(`${API_URL}/v1/auth/local/${mode}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username: username.trim(), password }),
+  });
+  const body = await response.json().catch(() => null);
+  if (!response.ok || !body?.data?.session_token) {
+    throw new Error(body?.message || body?.detail || `Authentication failed (${response.status})`);
+  }
+  const account = body.data.user;
+  const session: WorkspaceSession = {
+    token: body.data.session_token,
+    email: account.identity_key,
+    displayName: account.display_name || account.username,
+    username: account.username,
+    userId: account.id,
+    source: 'local_password',
+    expiresAt: Math.floor(new Date(body.data.expires_at).getTime() / 1000),
+  };
+  saveWorkspaceSession(session);
+  return session;
 }
 
 /** Exchange a login-handoff custom token for a workspace session (server-side). */

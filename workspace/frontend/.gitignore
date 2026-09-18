@@ -1,5 +1,7 @@
 node_modules/
 .next/
+.next-accounts/
+.next-verification/
 
 # The desktop build's output (vite build). The launcher builds it from source
 # and ships it in the installer; it is never committed.

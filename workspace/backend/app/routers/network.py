@@ -133,7 +133,7 @@ def _check_lifecycle_auth(
     """
     if _verify_workspace_access(workspace, token, authorization):
         return None
-    if config.ENFORCE_AGENT_LIFECYCLE_AUTH:
+    if config.ENFORCE_AGENT_LIFECYCLE_AUTH or config.AUTH_MODE == "local_password":
         return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
     logger.warning(
         "%s without valid credentials (workspace=%s agent=%s token_present=%s) — "
@@ -143,14 +143,25 @@ def _check_lifecycle_auth(
     return None
 
 
-async def _emit_event(event: Event, workspace, db: Session, token: str = None):
+async def _emit_event(event: Event, workspace, db: Session, token: str = None, *, trusted_service: bool = False):
     """Push an event through the mod pipeline. Returns None on rejection."""
+    from app.access import request_authorization, resolve_current_user
+    authorization = None if trusted_service else request_authorization.get()
+    if authorization is not None:
+        actor = resolve_current_user(db, authorization)
+        if actor is None:
+            return None
+        event.source = f"human:{actor.email}"
+        event.payload = {**(event.payload or {}), "sender_type": "human", "sender_id": actor.email,
+                         "sender_email": actor.email, "sender_name": actor.display_name or actor.username}
+        event.metadata = {**(event.metadata or {}), "sender_email": actor.email}
     context = PipelineContext(
         network_id=str(workspace.id),
         agent_address=event.source,
         db=db,
         workspace=workspace,
         token=token,
+        bearer_token=_extract_bearer(authorization),
     )
     try:
         result = await pipeline.process(event, context)
@@ -160,7 +171,7 @@ async def _emit_event(event: Event, workspace, db: Session, token: str = None):
     return result
 
 
-def _emit_event_blocking(event: Event, workspace, db: Session, token: str = None):
+def _emit_event_blocking(event: Event, workspace, db: Session, token: str = None, *, trusted_service: bool = False):
     """Sync variant of _emit_event for `def` (threadpool) handlers.
 
     The pipeline is async-shaped but everything inside it is synchronous
@@ -172,7 +183,7 @@ def _emit_event_blocking(event: Event, workspace, db: Session, token: str = None
     waits in a thread. Safe because no mod touches the outer loop (no
     create_task / get_running_loop / loop-bound clients).
     """
-    return asyncio.run(_emit_event(event, workspace, db, token=token))
+    return asyncio.run(_emit_event(event, workspace, db, token=token, trusted_service=trusted_service))
 
 
 # ---------------------------------------------------------------------------

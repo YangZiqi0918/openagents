@@ -4,7 +4,7 @@ import { useState, useMemo, useCallback, useEffect } from 'react';
 import { Search, ExternalLink, Star, ArrowRight, Check, Plus, Loader2, AlertCircle, Upload, Package } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useWorkspace } from '@/lib/workspace-context';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import type { WorkspaceCustomSkill } from '@/lib/types';
 import { AgentAvatar } from '@/components/agents/agent-avatar';
 import { agentLabel } from '@/lib/helpers';
@@ -284,6 +284,7 @@ function SkillCard({ skill, onSelect }: { skill: Skill; onSelect: (s: Skill) => 
 // ---------------------------------------------------------------------------
 
 function SkillDetail({ skill, onClose }: { skill: Skill; onClose: () => void }) {
+  const workspaceApi = useWorkspaceApi();
   const isCustom = skill.sourceType === 'workspace_file';
   const ghUrl = skill.sourceRepo
     ? `https://github.com/${skill.sourceRepo}/tree/main/${skill.sourcePath}`
@@ -540,6 +541,7 @@ function SkillDetail({ skill, onClose }: { skill: Skill; onClose: () => void }) 
 // ---------------------------------------------------------------------------
 
 export function SkillsView() {
+  const workspaceApi = useWorkspaceApi();
   const { workspace } = useWorkspace();
   const t = useT();
   const [search, setSearch] = useState('');
@@ -722,6 +724,7 @@ function UploadSkillDialog({
   onOpenChange: (open: boolean) => void;
   onUploaded: (skill: WorkspaceCustomSkill) => void;
 }) {
+  const workspaceApi = useWorkspaceApi();
   const t = useT();
   const [file, setFile] = useState<File | null>(null);
   const [id, setId] = useState('');

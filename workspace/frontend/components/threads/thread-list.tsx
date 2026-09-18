@@ -12,7 +12,9 @@ import { useWorkspace } from '@/lib/workspace-context';
 import { useLayout } from '@/components/layout/layout-context';
 import { useFormatters, useT, type MessageKey } from '@/lib/i18n';
 import { AgentAvatar } from '@/components/agents/agent-avatar';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
+import { useHumanLabels } from '@/hooks/use-human-labels';
 import type { WorkspaceAgent, WorkspaceSession } from '@/lib/types';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -36,10 +38,10 @@ import { selectUserThreads, type ThreadSortOrder } from './thread-selectors';
 /** Title of a DM conversation as the human viewer sees it: just the
  * counterpart. Mixed human↔agent pairs show the agent; human↔human pairs show
  * the other human; agent↔agent observation pairs keep both names. */
-function dmDisplayTitle(pair: string[]): string {
+function dmDisplayTitle(pair: string[], ownAddress = 'human:user'): string {
   const humans = pair.filter((a) => a.startsWith('human:'));
   if (humans.length === pair.length) {
-    return (pair.find((a) => a !== 'human:user') ?? pair[pair.length - 1] ?? '').replace(/^human:/, '');
+    return (pair.find((a) => a !== ownAddress) ?? pair[pair.length - 1] ?? '').replace(/^human:/, '');
   }
   if (humans.length > 0) {
     return (pair.find((a) => !a.startsWith('human:')) ?? '').replace(/^openagents:/, '');
@@ -51,9 +53,9 @@ function dmDisplayTitle(pair: string[]): string {
  * groups by exact address pair, so the same counterpart shows up once per
  * human identity variant — human:user, human:<uuid>, …). Agent↔agent pairs
  * stay unique per pair. */
-function dmDedupKey(pair: string[]): string {
+function dmDedupKey(pair: string[], ownAddress = 'human:user'): string {
   const hasHuman = pair.some((a) => a.startsWith('human:'));
-  return hasHuman ? `counterpart:${dmDisplayTitle(pair)}` : `pair:${pair.join(',')}`;
+  return hasHuman ? `counterpart:${dmDisplayTitle(pair, ownAddress)}` : `pair:${pair.join(',')}`;
 }
 
 // ── Filter tabs ──
@@ -263,10 +265,12 @@ function ThreadRow({
 // ── Thread list ──
 
 export function ThreadList() {
+  const workspaceApi = useWorkspaceApi();
+  const humanLabels = useHumanLabels();
   const {
     sessions, currentSessionId, setCurrentSessionId, agents, lastMessageBySession,
     activeSessionIds, completedSessionIds, updateSession, renameSession, dmConversations,
-    unreadSessionIds, refreshAgents, refreshDMConversations,
+    unreadSessionIds, refreshAgents, refreshDMConversations, currentUser,
   } = useWorkspace();
   const { isMobile, openMobileDetail, openNewThread } = useLayout();
   const prompt = usePrompt();
@@ -357,12 +361,12 @@ export function ThreadList() {
     );
     const seen = new Set<string>();
     return filtered.filter((c) => {
-      const key = dmDedupKey(c.agents);
+      const key = dmDedupKey(c.agents, IS_LOCAL_AUTH ? `human:${currentUser.id}` : 'human:user');
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
     });
-  }, [dmConversations, agents]);
+  }, [dmConversations, agents, currentUser.id]);
 
   // While searching, the query spans every thread regardless of the active tab
   const visibleSessions = isSearching
@@ -598,19 +602,19 @@ export function ThreadList() {
   // Candidates: online agents plus the workspace's human members (fetched
   // lazily on first open; token-only sessions may not have team access, in
   // which case the picker just shows agents).
-  const [dmHumans, setDmHumans] = useState<string[] | null>(null);
+  const [dmHumans, setDmHumans] = useState<{ id: string; name: string }[] | null>(null);
   const loadDmHumans = () => {
     if (dmHumans !== null) return;
     workspaceApi
       .getTeam()
-      .then((team) => setDmHumans(team.map((m) => m.email).filter(Boolean)))
+      .then((team) => setDmHumans(team.filter((m) => !!m.email && m.email !== currentUser.id).map((m) => ({ id: m.email, name: m.username || m.displayName || m.email }))))
       .catch(() => setDmHumans([]));
   };
   const startDM = (address: string) => {
     // Canonical DM id: sorted pair, matching the backend's (lesser, greater)
     // conversation normalization — so opening the same counterpart always
     // lands on the same session id.
-    const pair = ['human:user', address].sort();
+    const pair = [IS_LOCAL_AUTH ? `human:${currentUser.id}` : 'human:user', address].sort();
     selectSession(`dm:${pair[0]},${pair[1]}`);
   };
   const renderNewDmButton = () => {
@@ -645,10 +649,10 @@ export function ThreadList() {
                 <DropdownMenuLabel className="text-xs text-muted-foreground">
                   {t('threads.dmPeople')}
                 </DropdownMenuLabel>
-                {humans.map((email) => (
-                  <DropdownMenuItem key={email} onClick={() => startDM(`human:${email}`)}>
-                    <AgentAvatar name={email} size={16} />
-                    <span className="truncate">{email}</span>
+                {humans.map((human) => (
+                  <DropdownMenuItem key={human.id} onClick={() => startDM(`human:${human.id}`)}>
+                    <AgentAvatar name={human.name} size={16} />
+                    <span className="truncate">{human.name}</span>
                   </DropdownMenuItem>
                 ))}
               </>
@@ -667,18 +671,20 @@ export function ThreadList() {
       const dmId = `dm:${convo.agents[0]},${convo.agents[1]}`;
       // rawTitle stays address-derived (stable avatar seed and dedup); the
       // rendered title maps each agent name to its display label.
-      const rawTitle = dmDisplayTitle(convo.agents);
+      const rawTitle = dmDisplayTitle(convo.agents, IS_LOCAL_AUTH ? `human:${currentUser.id}` : 'human:user');
       const title = rawTitle
         .split(' ↔ ')
         .map((n) => {
+          if (IS_LOCAL_AUTH && convo.agents.includes(`human:${n}`)) return humanLabels[n] || 'Member';
           const a = agents.find((x) => x.agentName === n);
           return a ? agentLabel(a) : n;
         })
         .join(' ↔ ');
       const isAgentPair = !convo.agents.some((a) => a.startsWith('human:'));
-      const senderName = convo.lastMessage.sender.replace(/^openagents:/, '').replace(/^human:user$/, t('threads.you'));
+      const senderName = convo.lastMessage.sender === `human:${currentUser.id}` || convo.lastMessage.sender === 'human:user'
+        ? t('threads.you') : convo.lastMessage.sender.replace(/^(openagents:|human:)/, '');
       const senderAgentDm = agents.find((x) => x.agentName === senderName);
-      const sender = senderAgentDm ? agentLabel(senderAgentDm) : senderName;
+      const sender = senderAgentDm ? agentLabel(senderAgentDm) : humanLabels[senderName] || (IS_LOCAL_AUTH && convo.lastMessage.sender.startsWith('human:') && senderName !== t('threads.you') ? 'Member' : senderName);
 
       return (
         <div

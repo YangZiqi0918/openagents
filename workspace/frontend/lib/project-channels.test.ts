@@ -4,6 +4,7 @@ import {
   belongsToProject,
   clearProjectLink,
   isProjectChannel,
+  isProjectCollaborationChannel,
   projectShareUrl,
   readCurrentProjectLink,
   readProjectLink,
@@ -17,6 +18,16 @@ import {
 afterEach(() => window.history.replaceState(null, '', '/'));
 
 describe('project channel isolation', () => {
+  it('uses the real container identity in project links and includes welcome conversations', () => {
+    const link = new URL(projectShareUrl('http://localhost:3001', 'real-id', { projectId: 'real-id', projectName: 'Never trust URL names', sessionId: 'welcome' }));
+    expect(link.pathname).toBe('/projects/real-id');
+    expect(link.searchParams.get('session')).toBe('welcome');
+    expect(link.searchParams.has('projectId')).toBe(false);
+    expect(link.searchParams.has('projectName')).toBe(false);
+    expect(isProjectCollaborationChannel('welcome')).toBe(true);
+    for (const system of ['task:one', 'workflow:one', 'routine:one', 'system:one', 'dm:a,b']) expect(isProjectCollaborationChannel(system)).toBe(false);
+    expect(readActivityPreferences(JSON.stringify({ selectedId: 'welcome', drafts: { welcome: 'Draft', 'task:one': 'Hidden' }, readAt: { welcome: 12 } }), 'real-id', true)).toEqual({ selectedId: 'welcome', drafts: { welcome: 'Draft' }, readAt: { welcome: 12 } });
+  });
   it('matches exact project boundaries, not personal channels or similar IDs', () => {
     expect(belongsToProject('project:one:abc', 'one')).toBe(true);
     for (const name of [

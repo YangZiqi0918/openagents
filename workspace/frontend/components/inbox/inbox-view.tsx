@@ -10,6 +10,9 @@ import { DetailHeader } from '@/components/layout/app-header';
 import { AgentAvatar } from '@/components/agents/agent-avatar';
 import { agentLabel } from '@/lib/helpers';
 import type { NotificationItem } from '@/lib/types';
+import { useRouter } from 'next/navigation';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
+import { invitationNotificationPath } from '@/lib/notification-target';
 
 function PriorityDot({ priority }: { priority: NotificationItem['priority'] }) {
   return (
@@ -40,7 +43,8 @@ export function NotificationCard({
   const { agents } = useWorkspace();
   const agentName = notification.createdBy.replace(/^(openagents:|system:)/, '');
   const senderAgent = agents.find((a) => a.agentName === agentName);
-  const senderLabel = senderAgent ? agentLabel(senderAgent) : agentName;
+  const senderLabel = IS_LOCAL_AUTH && notification.createdBy.startsWith('human:') ? null : senderAgent ? agentLabel(senderAgent) : agentName;
+  const invitePath = invitationNotificationPath(notification);
 
   return (
     <div
@@ -69,7 +73,7 @@ export function NotificationCard({
           {notification.message}
         </p>
         <div className="flex items-center gap-2 mt-1">
-          <span className="text-[10px] text-muted-foreground">{senderLabel}</span>
+          {senderLabel && <span className="text-[10px] text-muted-foreground">{senderLabel}</span>}
           <span className="text-[10px] text-muted-foreground">{timeAgo(notification.createdAt)}</span>
           {notification.channelName && (
             <span className="text-[10px] text-foreground/70 flex items-center gap-0.5">
@@ -79,9 +83,9 @@ export function NotificationCard({
           )}
           {notification.linkUrl && (
             <a
-              href={notification.linkUrl}
-              target="_blank"
-              rel="noopener noreferrer"
+              href={invitePath || notification.linkUrl}
+              target={invitePath ? undefined : '_blank'}
+              rel={invitePath ? undefined : 'noopener noreferrer'}
               className="text-[10px] text-foreground/70 flex items-center gap-0.5 hover:text-foreground"
               onClick={(e) => e.stopPropagation()}
             >
@@ -142,6 +146,7 @@ function NotificationSection({
 }
 
 export function InboxView() {
+  const router = useRouter();
   const t = useT();
   const {
     notifications,
@@ -183,6 +188,11 @@ export function InboxView() {
   const handleNavigate = (notification: NotificationItem) => {
     if (!notification.isRead) {
       markNotificationRead(notification.id);
+    }
+    const invitePath = invitationNotificationPath(notification);
+    if (invitePath) {
+      router.push(invitePath);
+      return;
     }
     if (notification.channelName) {
       // Task threads are hidden from the Threads sidebar — landing there would

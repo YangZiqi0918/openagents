@@ -1,13 +1,35 @@
 'use client';
 
-import { useState } from 'react';
-import { FolderKanban } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { FolderKanban, PlusSquare, X } from 'lucide-react';
 import { useI18n, useT } from '@/lib/i18n';
 import { ProjectWorkspaceContent, type ProjectWorkspaceTab } from './project-workspace-content';
 import { ProjectPlanPage } from './project-plan-page';
 import { ProjectActivityPage } from './project-activity-page';
+import { ProjectMembersPage } from './project-members-page';
+import { ConnectAgentView } from '@/components/connect/connect-agent-view';
+import { useWorkspace } from '@/lib/workspace-context';
+import { Button } from '@/components/ui/button';
+import { useLayout, type ViewMode } from '@/components/layout/layout-context';
 
 type ProjectTab = 'activity' | 'plan' | 'members' | ProjectWorkspaceTab;
+
+function ProjectConnectControl({ onOpen }: { onOpen: () => void }) {
+  const { me } = useWorkspace();
+  const t = useT();
+  if (!['admin', 'owner'].includes(me?.role || '')) return null;
+  return <Button variant="ghost" size="sm" onClick={onOpen} className="ml-auto"><PlusSquare className="size-4" /><span className="hidden sm:inline">{t('nav.connectAgent')}</span></Button>;
+}
+
+function ProjectModuleNavigation({ onSwitch }: { onSwitch: (tab: ProjectWorkspaceTab) => void }) {
+  const { viewMode } = useLayout();
+  useEffect(() => {
+    if (['tasks', 'files', 'workflows', 'browser', 'knowledge'].includes(viewMode)) {
+      onSwitch(viewMode as ProjectWorkspaceTab);
+    }
+  }, [viewMode, onSwitch]);
+  return null;
+}
 
 const TABS: ProjectTab[] = ['activity', 'plan', 'tasks', 'files', 'workflows', 'browser', 'knowledge', 'members'];
 
@@ -18,12 +40,14 @@ interface ProjectInternalPageProps {
   workspaceModulesAvailable?: boolean;
   planStorageKey?: string;
   initialSessionId?: string;
+  projectScoped?: boolean;
 }
 
-export function ProjectInternalPage({ projectId, projectName, onBack, workspaceModulesAvailable = true, planStorageKey, initialSessionId }: ProjectInternalPageProps) {
+export function ProjectInternalPage({ projectId, projectName, onBack, workspaceModulesAvailable = true, planStorageKey, initialSessionId, projectScoped = false }: ProjectInternalPageProps) {
   const t = useT();
   const { locale } = useI18n();
   const [activeTab, setActiveTab] = useState<ProjectTab>('activity');
+  const [connecting, setConnecting] = useState(false);
   const labels: Record<ProjectTab, string> = {
     activity: locale === 'zh-CN' ? '动态' : 'Activity',
     plan: locale === 'zh-CN' ? '计划' : 'Plan',
@@ -37,6 +61,7 @@ export function ProjectInternalPage({ projectId, projectName, onBack, workspaceM
 
   return (
     <div data-testid="project-internal-page" data-project-id={projectId} className="flex h-full min-h-0 w-full flex-col bg-background text-foreground">
+      {projectScoped && <ProjectModuleNavigation onSwitch={setActiveTab} />}
       <header className={`flex h-14 shrink-0 items-center gap-2 border-b border-border px-5 sm:px-8 lg:px-10 ${workspaceModulesAvailable ? '' : 'max-lg:pl-14'}`}>
         <FolderKanban className="size-5 shrink-0 text-muted-foreground" aria-hidden="true" />
         <button type="button" onClick={onBack} className="shrink-0 rounded-sm text-sm text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">
@@ -44,6 +69,7 @@ export function ProjectInternalPage({ projectId, projectName, onBack, workspaceM
         </button>
         <span className="text-muted-foreground" aria-hidden="true">/</span>
         <span className="min-w-0 truncate text-sm font-medium" title={projectName}>{projectName}</span>
+        {workspaceModulesAvailable && projectScoped && <ProjectConnectControl onOpen={() => setConnecting(true)} />}
       </header>
 
       <nav aria-label={locale === 'zh-CN' ? '项目导航' : 'Project navigation'} className="shrink-0 overflow-x-auto border-b border-border px-5 sm:px-8 lg:px-10">
@@ -57,11 +83,14 @@ export function ProjectInternalPage({ projectId, projectName, onBack, workspaceM
       </nav>
 
       <div data-testid="project-tab-content" data-active-tab={activeTab} className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {connecting ? <><div className="flex h-11 shrink-0 items-center justify-end border-b px-5"><Button variant="ghost" mode="icon" size="sm" onClick={() => setConnecting(false)} title={t('common.close')} aria-label={t('common.close')}><X className="size-4" /></Button></div><div className="min-h-0 flex-1"><ConnectAgentView onConnected={() => setConnecting(false)} /></div></> : <>
         {activeTab === 'activity' && workspaceModulesAvailable && <ProjectActivityPage projectId={projectId} projectName={projectName} initialSessionId={initialSessionId} />}
         {activeTab === 'plan' && <ProjectPlanPage projectId={projectId} storageKey={planStorageKey} workspaceModulesAvailable={workspaceModulesAvailable} />}
         {activeTab !== 'activity' && activeTab !== 'plan' && activeTab !== 'members' && workspaceModulesAvailable && (
           <ProjectWorkspaceContent key={activeTab} tab={activeTab} />
         )}
+        {activeTab === 'members' && workspaceModulesAvailable && projectScoped && <ProjectMembersPage />}
+        </>}
       </div>
     </div>
   );

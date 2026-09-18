@@ -9,7 +9,7 @@ import {
   SheetTrigger,
 } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
-import { Menu, MessageSquare, FileText, Globe } from 'lucide-react';
+import { Menu, MessageSquare, FileText, Globe, FolderKanban, Inbox } from 'lucide-react';
 import Image from 'next/image';
 import { useEffect, useState } from 'react';
 import { SidebarProvider } from '@/components/ui/sidebar';
@@ -24,6 +24,7 @@ import { useLayout, type ViewMode } from './layout-context';
 import { useWorkspace } from '@/lib/workspace-context';
 import { useT } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
 
 export function MobileHeader() {
   const [isSheetOpen, setIsSheetOpen] = useState(false);
@@ -52,8 +53,8 @@ export function MobileHeader() {
 
   const tabs: { mode: ViewMode; icon: typeof MessageSquare; label: string }[] = [
     { mode: 'threads', icon: MessageSquare, label: t('views.threads') },
-    { mode: 'files', icon: FileText, label: t('views.files') },
-    { mode: 'browser', icon: Globe, label: t('views.browser') },
+    IS_LOCAL_AUTH ? { mode: 'projects', icon: FolderKanban, label: t('views.projects') } : { mode: 'files', icon: FileText, label: t('views.files') },
+    IS_LOCAL_AUTH ? { mode: 'inbox', icon: Inbox, label: t('views.inbox') } : { mode: 'browser', icon: Globe, label: t('views.browser') },
   ];
 
   return (
@@ -102,7 +103,7 @@ export function MobileHeader() {
             </div>
 
             <span className="text-sm font-medium truncate">
-              {workspace?.name || t('nav.workspaceFallback')}
+              {IS_LOCAL_AUTH ? 'OpenAgents' : workspace?.name || t('nav.workspaceFallback')}
             </span>
           </div>
 

@@ -9,7 +9,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { useLayout } from '@/components/layout/layout-context';
 import { useWorkspace } from '@/lib/workspace-context';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import type { KnowledgeEntry } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import { useFormatters, useT } from '@/lib/i18n';
@@ -20,9 +20,10 @@ import { KnowledgeEditor } from './knowledge-editor';
  * a header on the shared `--header-height` baseline, a search row, then rows.
  */
 export function KnowledgeList() {
+  const workspaceApi = useWorkspaceApi();
   const {
     knowledge, refreshKnowledge, deleteKnowledge,
-    selectedKnowledgeId, setSelectedKnowledgeId,
+    selectedKnowledgeId, setSelectedKnowledgeId, canWrite = true,
   } = useWorkspace();
   const { isMobile, openMobileDetail } = useLayout();
   const t = useT();
@@ -104,6 +105,7 @@ export function KnowledgeList() {
                 size="sm"
                 aria-label={t('knowledge.newEntry')}
                 onClick={openNew}
+                disabled={!canWrite}
                 className="text-muted-foreground"
               >
                 <Plus className="size-3.5" />
@@ -153,7 +155,7 @@ export function KnowledgeList() {
                 {t('knowledge.clearSearch')}
               </Button>
             ) : (
-              <Button variant="outline" size="sm" className="gap-1.5" onClick={openNew}>
+              <Button variant="outline" size="sm" disabled={!canWrite} className="gap-1.5" onClick={openNew}>
                 <Plus className="size-3.5" />
                 {t('knowledge.createFirst')}
               </Button>
@@ -207,6 +209,7 @@ export function KnowledgeList() {
                   size="sm"
                   aria-label={t('knowledge.editEntry')}
                   onClick={(e) => { e.stopPropagation(); handleEdit(entry); }}
+                  disabled={!canWrite}
                   className="text-muted-foreground"
                 >
                   <Pencil className="size-3" />
@@ -217,6 +220,7 @@ export function KnowledgeList() {
                   size="sm"
                   aria-label={t('knowledge.deleteEntry')}
                   onClick={(e) => { e.stopPropagation(); handleDelete(entry); }}
+                  disabled={!canWrite}
                   className="text-muted-foreground hover:text-destructive"
                 >
                   <Trash2 className="size-3" />
@@ -228,7 +232,7 @@ export function KnowledgeList() {
       </ScrollArea>
 
       <KnowledgeEditor
-        open={editorOpen}
+        open={canWrite && editorOpen}
         entry={editingEntry}
         onClose={() => { setEditorOpen(false); setEditingEntry(null); }}
         onSaved={async () => {

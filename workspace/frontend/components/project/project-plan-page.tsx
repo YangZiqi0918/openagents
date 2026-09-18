@@ -15,7 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { agentLabel } from '@/lib/helpers';
 import { useWorkspace } from '@/lib/workspace-context';
 import type { TeamMember } from '@/lib/types';
@@ -68,7 +68,8 @@ export function ProjectPlanPage({ projectId, storageKey, workspaceModulesAvailab
 }
 
 function ConnectedPlan({ projectId, storageKey }: ProjectPlanPageProps) {
-  const { workspace, agents } = useWorkspace();
+  const workspaceApi = useWorkspaceApi();
+  const { workspace, agents, me } = useWorkspace();
   const [team, setTeam] = useState<TeamMember[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
@@ -94,13 +95,13 @@ function ConnectedPlan({ projectId, storageKey }: ProjectPlanPageProps) {
     return () => {
       cancelled = true;
     };
-  }, [workspaceId, attempt]);
+  }, [workspaceApi, workspaceId, attempt]);
 
   const options: Assignee[] = [
     ...team.map(
       (member): Assignee => ({
         id: `human:${member.email}`,
-        name: member.displayName || member.email,
+        name: member.username || member.displayName || member.email,
         kind: 'human',
         avatarUrl: member.avatarUrl,
       }),
@@ -117,7 +118,7 @@ function ConnectedPlan({ projectId, storageKey }: ProjectPlanPageProps) {
   return (
     <PlanTable
       key={key}
-      canUpload
+      canUpload={me?.role !== 'viewer'}
       storageKey={key}
       members={{
         options,

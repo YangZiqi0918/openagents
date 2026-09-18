@@ -6,20 +6,21 @@ import { useWorkspace } from '@/lib/workspace-context';
 import { useLayout } from '@/components/layout/layout-context';
 import { DetailHeader } from '@/components/layout/app-header';
 import { FeatureTourBanner } from '@/components/tours/feature-tours';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
 import { useConfirm, usePrompt } from '@/components/ui/dialogs-provider';
 import { useT } from '@/lib/i18n';
 
 export function BrowserView() {
+  const workspaceApi = useWorkspaceApi();
   const t = useT();
   const confirm = useConfirm();
   const prompt = usePrompt();
   const {
     browserTabs, selectedBrowserTabId, setSelectedBrowserTabId,
     closeBrowserTab, navigateBrowserTab, reconnectBrowserTab, persistBrowserTab, unpersistBrowserTab, browserContexts,
-    refreshBrowserTabs,
+    refreshBrowserTabs, canWrite = true,
   } = useWorkspace();
   const { isMobile, openMobileList, isDetailExpanded, toggleDetailExpanded } = useLayout();
   const [screenshotUrl, setScreenshotUrl] = useState<string | null>(null);
@@ -47,7 +48,7 @@ export function BrowserView() {
   //
   // Depends on whether there IS a live URL, not on its value: validate can hand
   // back a new one, and depending on the string would re-trigger itself.
-  const hasLiveUrl = !!tab?.liveUrl;
+  const hasLiveUrl = canWrite && !!tab?.liveUrl;
   useEffect(() => {
     if (!selectedBrowserTabId || !hasLiveUrl) return;
     let cancelled = false;
@@ -73,7 +74,7 @@ export function BrowserView() {
 
   // Poll screenshot every 2 seconds (only when no live URL)
   useEffect(() => {
-    if (!selectedBrowserTabId || !tab || tab.liveUrl) {
+    if (!selectedBrowserTabId || !tab || (canWrite && tab.liveUrl)) {
       setScreenshotUrl(null);
       return;
     }
@@ -84,14 +85,7 @@ export function BrowserView() {
 
     const fetchScreenshot = async () => {
       try {
-        const url = workspaceApi.getBrowserScreenshotUrl(selectedBrowserTabId);
-        const headers: Record<string, string> = {};
-        const token = (workspaceApi as unknown as { token: string }).token;
-        if (token) headers['X-Workspace-Token'] = token;
-        const bearerToken = (workspaceApi as unknown as { bearerToken: string }).bearerToken;
-        if (bearerToken) headers['Authorization'] = `Bearer ${bearerToken}`;
-
-        const res = await fetch(url, { headers });
+        const res = await workspaceApi.fetchResource(`/v1/browser/tabs/${encodeURIComponent(selectedBrowserTabId)}/screenshot?network=${encodeURIComponent(workspaceApi.getScopeId())}`);
         if (cancelled) return;
         if (!res.ok) {
           failCountRef.current++;
@@ -135,7 +129,7 @@ export function BrowserView() {
         prevBlobRef.current = null;
       }
     };
-  }, [selectedBrowserTabId, tab]);
+  }, [selectedBrowserTabId, tab, workspaceApi, canWrite]);
 
   const handleReconnect = async () => {
     if (!tab || reconnecting) return;
@@ -272,6 +266,7 @@ export function BrowserView() {
         {tab.contextId ? (
           <button
             onClick={handleUnpersist}
+            disabled={!canWrite}
             className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-green-600 dark:text-green-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-orange-500 dark:hover:text-orange-400 transition-colors shrink-0"
             title={t('browser.removePersistentHint')}
           >
@@ -281,6 +276,7 @@ export function BrowserView() {
         ) : (
           <button
             onClick={handlePersist}
+            disabled={!canWrite}
             className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] text-muted-foreground hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-green-600 transition-colors shrink-0"
             title={t('browser.makePersistentHint')}
           >
@@ -291,7 +287,7 @@ export function BrowserView() {
 
         <button
           onClick={handleReconnect}
-          disabled={reconnecting}
+          disabled={!canWrite || reconnecting}
           className="p-1 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 text-muted-foreground transition-colors shrink-0 disabled:opacity-50"
           title={t('browser.reconnectHint')}
         >
@@ -310,6 +306,7 @@ export function BrowserView() {
 
         <button
           onClick={handleClose}
+          disabled={!canWrite}
           className="p-1 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 text-muted-foreground hover:text-red-500 transition-colors shrink-0"
           title={t('browser.closeTab')}
         >
@@ -339,7 +336,7 @@ export function BrowserView() {
         ) : (
           <p
             className="min-w-0 flex-1 cursor-pointer truncate font-mono text-xs text-muted-foreground transition-colors hover:text-foreground"
-            onClick={startEditingUrl}
+            onClick={canWrite ? startEditingUrl : undefined}
             title={t('browser.editUrl')}
           >
             {tab.url}
@@ -360,7 +357,7 @@ export function BrowserView() {
               <p className="text-xs text-muted-foreground">{t('browser.expiredBody')}</p>
               <button
                 onClick={handleReconnect}
-                disabled={reconnecting}
+                disabled={!canWrite || reconnecting}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
               >
                 <RefreshCw className={cn("size-3.5", reconnecting && "animate-spin")} />
@@ -368,7 +365,7 @@ export function BrowserView() {
               </button>
             </div>
           </div>
-        ) : tab.liveUrl && !reconnecting ? (
+        ) : tab.liveUrl && canWrite && !reconnecting ? (
           <iframe
             src={tab.liveUrl}
             className="w-full h-full border-0"

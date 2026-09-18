@@ -38,6 +38,7 @@ import { QrcodeMenu } from './qrcode-menu';
 import { UserMenu } from './user-menu';
 import { CampaignSidebarCard } from '@/components/campaign/campaign-sidebar-card';
 import { AllConversationList } from './all-conversation-list';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
 
 interface RailItem {
   mode?: ViewMode;
@@ -217,7 +218,7 @@ export function NavRail() {
       icon: <SquarePen />,
     },
     { mode: 'projects', label: t('views.projects'), icon: <FolderKanban /> },
-    ...(hasAgents
+    ...(hasAgents || IS_LOCAL_AUTH
       ? ([
           { mode: 'files', label: t('views.files'), icon: <FileText /> },
           { mode: 'browser', label: t('views.browser'), icon: <Globe /> },
@@ -244,7 +245,7 @@ export function NavRail() {
 
   const isConnectActive = viewMode === 'connect';
   const connectLabel = hasAgents ? t('nav.connectAgent') : t('nav.connectFirstAgent');
-  const workspaceLabel = workspace?.name || t('nav.workspaceFallback');
+  const workspaceLabel = IS_LOCAL_AUTH ? 'OpenAgents' : workspace?.name || t('nav.workspaceFallback');
 
   // Mid-drag the rail previews the state it would snap to, so labels appear
   // and disappear under the pointer instead of only after the release.
@@ -540,7 +541,7 @@ export function NavRail() {
         >
           <SearchMenu iconOnly />
           <NotificationsMenu side="right" align="end" />
-          <QrcodeMenu side="right" align="end" />
+          {!IS_LOCAL_AUTH && <QrcodeMenu side="right" align="end" />}
           <UserMenu side="right" align="end" />
         </div>
 

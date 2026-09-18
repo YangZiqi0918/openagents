@@ -12,6 +12,8 @@ Covers:
   - Auth via collaborator email: bearer token with collaborator email grants access
 """
 
+from tests.conftest import create_test_workspace
+
 import pytest
 from unittest.mock import patch
 
@@ -24,7 +26,7 @@ def _create_workspace(client, name="Test WS", agent_name="agent-alpha", creator_
     body = {"name": name, "agent_name": agent_name}
     if creator_email:
         body["creator_email"] = creator_email
-    resp = client.post("/v1/workspaces", json=body)
+    resp = create_test_workspace(client, json=body)
     assert resp.status_code == 200
     return resp.json()["data"]
 
@@ -309,15 +311,17 @@ class TestCollaboratorProfiles:
         assert data["avatarUrl"] == self.AVATAR
         assert data["displayName"] == "Bob"
 
-    def test_presence_ping_returns_the_avatar(self, client, db, workspace):
-        """Self-registration on workspace open is where most rows come from."""
-        self._account(db, "carol@example.com", "Carol", self.AVATAR)
+    def test_presence_ping_uses_authenticated_caller_not_claimed_email(self, client, db, workspace):
+        """A caller cannot self-register a different identity by posting an email."""
+        from app.models import User
+        owner = db.query(User).filter_by(email="test@example.com").one()
+        owner.avatar_url = self.AVATAR
+        db.commit()
         resp = client.post(
             f"/v1/workspaces/{workspace['id']}/presence",
             json={"senderEmail": "Carol@Example.com", "senderDisplayName": "C"},
-            headers={"X-Workspace-Token": workspace["token"]},
+            headers=workspace["owner_headers"],
         )
         data = resp.json()["data"]
-        # Matched case-insensitively: the collaborator row is lowercased on
-        # write, the account row is not guaranteed to be.
+        assert data["email"] == "test@example.com"
         assert data["avatarUrl"] == self.AVATAR

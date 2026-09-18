@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { ChevronDown, MessageSquare, Search, X } from 'lucide-react';
 import { SidebarGroup, SidebarGroupContent, SidebarGroupLabel, SidebarMenu, SidebarMenuItem } from '@/components/ui/sidebar';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { useWorkspace } from '@/lib/workspace-context';
 import { useT } from '@/lib/i18n';
 import { selectAllConversations } from '@/components/threads/thread-selectors';
@@ -11,6 +11,7 @@ import { useLayout } from './layout-context';
 import { cn } from '@/lib/utils';
 
 export function AllConversationList({ showLabels }: { showLabels: boolean }) {
+  const workspaceApi = useWorkspaceApi();
   const { sessions, dmConversations, agents, currentSessionId, setCurrentSessionId } = useWorkspace();
   const { viewMode, draftThreadOpen, setDraftThreadOpen, openView } = useLayout();
   const t = useT();
@@ -31,7 +32,7 @@ export function AllConversationList({ showLabels }: { showLabels: boolean }) {
         .catch(() => { if (!cancelled) setHits(new Set()); });
     }, 300);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [query]);
+  }, [workspaceApi, query]);
 
   const conversations = useMemo(() => {
     const all = selectAllConversations(sessions, dmConversations, agents, currentSessionId);

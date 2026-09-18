@@ -8,7 +8,8 @@ import { useWorkspace } from '@/lib/workspace-context';
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { useT, useFormatters } from '@/lib/i18n';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
 import { desktopHost } from '@/lib/desktop-host';
 import { AgentSetup } from '@/components/agents/agent-setup';
 import { DesktopComputerStep } from './desktop-computer-step';
@@ -95,12 +96,15 @@ export function ConnectAgentView({
   autoPair = false,
   autoAddAgent = false,
   preferredNodeId,
+  onConnected,
 }: {
   initialTab?: 'local' | 'cloud' | 'node';
   autoPair?: boolean;
   autoAddAgent?: boolean;
   preferredNodeId?: string;
+  onConnected?: () => void;
 } = {}) {
+  const workspaceApi = useWorkspaceApi();
   const t = useT();
   const { openView } = useLayout();
   const { workspace, token, refreshWorkspace, agents, requestFirstThread } = useWorkspace();
@@ -109,7 +113,7 @@ export function ConnectAgentView({
   const isDesktop = desktopHost() !== null;
 
   const [selectedTab, setSelectedTab] = useState<'local' | 'cloud' | 'node'>(initialTab);
-  const activeTab = isDesktop ? 'node' : selectedTab;
+  const activeTab = isDesktop || (IS_LOCAL_AUTH && selectedTab === 'local') ? 'node' : selectedTab;
   const [loading, setLoading] = useState(true);
 
   // Onboarding checkpoint: the user reached the agent-setup surface. One event
@@ -242,6 +246,7 @@ export function ConnectAgentView({
       capture('cloud_agent_created', { provider: 'openagents', agent: 'yumi', builtin: true });
       refreshWorkspace();
       loadCloudAgents();
+      onConnected?.();
     } catch (err: unknown) {
       toast.error(err instanceof Error ? err.message : t('connect.cloudAgentAddFailed'));
     } finally {
@@ -278,6 +283,7 @@ export function ConnectAgentView({
       setSelectedProvider(null);
       setCfgKey('');
       setCfgPrompt('');
+      onConnected?.();
     } catch (err: unknown) {
       toast.error(err instanceof Error ? err.message : t('connect.cloudAgentAddFailed'));
     } finally {
@@ -332,8 +338,9 @@ export function ConnectAgentView({
       setPairing(null);
       toast.success(t('connect.nodeConnectedToast'));
       capture('node_connected', { source: 'workspace_ui' });
+      onConnected?.();
     }
-  }, [nodes, pairing, t]);
+  }, [nodes, pairing, t, onConnected]);
 
   const handleGeneratePairingCode = async () => {
     setPairingLoading(true);
@@ -373,7 +380,7 @@ export function ConnectAgentView({
       {/* Header — title in the app header, actions in its toolbar */}
       <DetailHeader title={<h2 className="text-base font-semibold">{t('connect.title')}</h2>}>
         <button
-          onClick={() => openView('threads')}
+          onClick={() => onConnected ? onConnected() : openView('threads')}
           className="size-7 flex items-center justify-center rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-800 text-muted-foreground transition-colors"
           title={t('common.close')}
         >
@@ -389,7 +396,7 @@ export function ConnectAgentView({
             { id: 'cloud', icon: Cloud, label: t('connect.tabCloud') },
             // Manual connection is being retired — kept last, with a notice.
             { id: 'local', icon: Terminal, label: t('connect.tabLocal') },
-          ] as const).map((tab) => {
+          ] as const).filter((tab) => !IS_LOCAL_AUTH || tab.id !== 'local').map((tab) => {
             const active = activeTab === tab.id;
             const Icon = tab.icon;
             return (
@@ -464,7 +471,7 @@ export function ConnectAgentView({
             cloudProviders={cloudProviders}
             autoAddAgent={autoAddAgent}
             preferredNodeId={preferredNodeId}
-            onFirstAgentCreated={requestFirstThread}
+            onFirstAgentCreated={(agentName) => { requestFirstThread(agentName); onConnected?.(); }}
             loading={nodesLoading}
             pairing={pairing}
             pairingLoading={pairingLoading}
@@ -774,6 +781,7 @@ function NodeCard({
   onEditAgent: (agent: import('@/lib/types').NodeAgent) => void;
   onChanged: () => void;
 }) {
+  const workspaceApi = useWorkspaceApi();
   const t = useT();
   const { timeAgo } = useFormatters();
   const confirm = useConfirm();
@@ -1119,6 +1127,7 @@ function NodesTab({
   onDismissPairing: () => void;
   onRefresh: () => void;
 }) {
+  const workspaceApi = useWorkspaceApi();
   const t = useT();
   const [addingNodeId, setAddingNodeId] = useState<string | null>(null);
   const [editing, setEditing] = useState<{ nodeId: string; agent: import('@/lib/types').NodeAgent } | null>(null);
@@ -1650,6 +1659,7 @@ function CloudAgentsTab({
   showBuiltinCard: boolean;
   onAddBuiltin: () => void;
 }) {
+  const workspaceApi = useWorkspaceApi();
   const t = useT();
   const providerGroups = [
     { label: t('connect.groupChat'), names: ['openai', 'anthropic', 'google', 'xai', 'deepseek', 'mistral', 'sensenova'] },
@@ -2135,6 +2145,7 @@ function NodeOnboardingStep({ footer }: { footer?: React.ReactNode }) {
 }
 
 function RemoteNodeOnboardingStep({ onBack, footer, requireNewNode = false }: { onBack?: () => void; footer?: React.ReactNode; requireNewNode?: boolean }) {
+  const workspaceApi = useWorkspaceApi();
   const t = useT();
   const isMobile = useIsMobile();
   const { idToken: setupIdToken } = useOpenAgentsAuth();
@@ -2288,6 +2299,7 @@ function RemoteNodeOnboardingStep({ onBack, footer, requireNewNode = false }: { 
 }
 
 function WorkspaceAgentSetup({ cloudProviders, ...props }: Omit<React.ComponentProps<typeof AgentSetup>, 'api' | 'extensions'> & { cloudProviders: CloudAgentProvider[] }) {
+  const workspaceApi = useWorkspaceApi();
   const { workspace } = useWorkspace();
   const t = useT();
   const [localNodeId, setLocalNodeId] = useState<string | null>(null);

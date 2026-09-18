@@ -19,8 +19,10 @@ from sqlalchemy import and_, case, cast, func, or_, select, Text
 from sqlalchemy.orm import Session
 
 from app import cache
+from app.access import resolve_current_user, resolve_user_role, verify_workspace_access
 from app.database import SessionLocal, get_db
-from app.models import Channel, ChannelMember, EventRecord, Workspace
+from app.models import Channel, ChannelMember, EventRecord, FileRecord, User, Workspace, WorkspaceMember, WorkspaceMembership
+from app.config import config
 from app.pipeline_factory import pipeline
 from app.response import ResponseCode, json_response, success_response
 from app.routers.network import _verify_workspace_access, _workspace_filter
@@ -164,14 +166,14 @@ def _resolve_and_auth_cached(db, network, token, authorization):
     """
     ck = "v1ws:resolve:" + hashlib.sha1(network.encode("utf-8")).hexdigest()
     cached = cache.get_bytes(ck)
-    if cached is not None:
+    if cached is not None and authorization is None:
         try:
             meta = _json.loads(cached)
         except Exception:
             meta = None
         if meta and meta.get("id"):
             ph_sha = meta.get("ph_sha")
-            if ph_sha is None:
+            if ph_sha is None and meta.get("open_access") and config.AUTH_MODE != "local_password":
                 # Public workspace (no password) — token path grants access.
                 return meta["id"], None
             if token and hashlib.sha256(token.encode("utf-8")).hexdigest() == ph_sha:
@@ -190,6 +192,7 @@ def _resolve_and_auth_cached(db, network, token, authorization):
     meta = {
         "id": str(workspace.id),
         "ph_sha": hashlib.sha256(ph.encode("utf-8")).hexdigest() if ph else None,
+        "open_access": not ph and not workspace.require_login and workspace.kind != "personal",
     }
     try:
         cache.set_bytes(ck, _json.dumps(meta).encode("utf-8"), ttl_seconds=30.0)
@@ -238,13 +241,73 @@ def send_event(
     if not workspace:
         return json_response(ResponseCode.NOT_FOUND, "Network not found")
 
+    source = body.source
+    payload = dict(body.payload or {})
+    metadata = dict(body.metadata or {})
+    required_role = "member"
+    if body.type.startswith("network.agent.") or body.type == "network.ping":
+        required_role = "admin"
+    elif body.type == "workspace.agent.control" and payload.get("action") not in {"stop", "interrupt", "cancel"}:
+        required_role = "admin"
+    if not verify_workspace_access(workspace, x_workspace_token, authorization, db=db, min_role=required_role):
+        code = ResponseCode.FORBIDDEN if resolve_user_role(db, workspace, authorization) is not None else ResponseCode.UNAUTHORIZED
+        return json_response(code, "Project membership and sufficient role required")
+    if authorization is not None:
+        actor = resolve_current_user(db, authorization)
+        if actor is None:
+            return json_response(ResponseCode.UNAUTHORIZED, "Invalid identity token")
+        source = f"human:{actor.email}"
+        sender = {"sender_type": "human", "sender_email": actor.email,
+                  "sender_id": actor.email, "sender_name": actor.display_name or actor.username}
+        payload.update(sender)
+        metadata.update(sender)
+        payload["sender_display_name"] = actor.display_name or actor.username
+        metadata["sender_display_name"] = actor.display_name or actor.username
+
+    # Event references must belong to this execution network, too.
+    if config.AUTH_MODE == "local_password" or workspace.kind == "personal":
+        attachments = payload.get("attachments") or []
+        if not isinstance(attachments, list):
+            return json_response(ResponseCode.BAD_REQUEST, "Attachments must be a list")
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                return json_response(ResponseCode.BAD_REQUEST, "Invalid attachment")
+            file_id = attachment.get("fileId") or attachment.get("file_id")
+            if file_id is not None and not isinstance(file_id, str):
+                return json_response(ResponseCode.BAD_REQUEST, "Invalid attachment file identity")
+            if file_id and db.execute(select(FileRecord.id).where(
+                FileRecord.id == file_id, FileRecord.workspace_id == workspace.id, FileRecord.status == "active",
+            )).first() is None:
+                return json_response(ResponseCode.BAD_REQUEST, "Attachment does not belong to this project")
+        if body.type in {"network.channel.create", "network.channel.join"}:
+            agent_names = payload.get("participants", []) if body.type == "network.channel.create" else [payload.get("agent_name")]
+            if not isinstance(agent_names, list):
+                return json_response(ResponseCode.BAD_REQUEST, "Participants must be a list")
+            agent_names = [name for name in agent_names + [payload.get("master")] if name and name != "__no_response__"]
+            if any(not isinstance(name, str) for name in agent_names):
+                return json_response(ResponseCode.BAD_REQUEST, "Invalid agent participant")
+            valid_names = set(db.execute(select(WorkspaceMember.agent_name).where(
+                WorkspaceMember.workspace_id == workspace.id, WorkspaceMember.status != "removed",
+                WorkspaceMember.agent_name.in_(agent_names),
+            )).scalars().all())
+            if any(name not in valid_names for name in agent_names):
+                return json_response(ResponseCode.BAD_REQUEST, "Agent does not belong to this project")
+            human_names = payload.get("human_participants") or []
+            if not isinstance(human_names, list) or any(not isinstance(email, str) for email in human_names):
+                return json_response(ResponseCode.BAD_REQUEST, "Human participants must be a list of identities")
+            valid_humans = set(db.execute(select(User.email).join(WorkspaceMembership, WorkspaceMembership.user_id == User.id).where(
+                WorkspaceMembership.workspace_id == workspace.id,
+            )).scalars().all())
+            if any(email.strip().lower() not in valid_humans for email in human_names):
+                return json_response(ResponseCode.BAD_REQUEST, "Human participant is not a member of this project")
+
     # Build ONM Event
     event = Event(
         type=body.type,
-        source=body.source,
+        source=source,
         target=body.target,
-        payload=body.payload,
-        metadata=body.metadata or {},
+        payload=payload,
+        metadata=metadata,
         visibility=body.visibility or "channel",
         network=str(workspace.id),
     )
@@ -252,7 +315,7 @@ def send_event(
     # Build pipeline context — extra kwargs become context.extra dict
     context = PipelineContext(
         network_id=str(workspace.id),
-        agent_address=body.source,
+        agent_address=source,
         db=db,
         workspace=workspace,
         token=x_workspace_token,
@@ -874,6 +937,13 @@ def latest_per_channel(
 # GET /v1/events/stream — Server-Sent Events
 # ---------------------------------------------------------------------------
 
+def _stream_access_valid(workspace_id: str, token: Optional[str], authorization: Optional[str]) -> bool:
+    """Recheck revocable access without keeping a connection for the stream's lifetime."""
+    with SessionLocal() as db:
+        workspace = db.execute(select(Workspace).where(Workspace.id == workspace_id)).scalar_one_or_none()
+        return workspace is not None and verify_workspace_access(workspace, token, authorization, db=db)
+
+
 @router.get("/events/stream")
 async def stream_events(
     request: Request,
@@ -914,6 +984,7 @@ async def stream_events(
     async def event_generator():
         keepalive_interval = 30
         last_keepalive = asyncio.get_event_loop().time()
+        last_access_check = last_keepalive
 
         # subscribe_events yields raw event bytes, plus None on idle ticks
         # (~1/s). The idle tick is what lets us emit keepalives and notice a
@@ -924,6 +995,20 @@ async def stream_events(
         async for data in cache.subscribe_events(f"ws:{workspace_id}:events"):
             if await request.is_disconnected():
                 break
+
+            # Redis idles tick about once per second; four-second checks bound
+            # identity revocation to five seconds even when no events arrive.
+            now = asyncio.get_event_loop().time()
+            if now - last_access_check >= 4:
+                try:
+                    allowed = await asyncio.to_thread(_stream_access_valid, workspace_id, effective_token, authorization)
+                except Exception:
+                    logger.warning("events: stream access recheck failed for %s", workspace_id, exc_info=True)
+                    allowed = False
+                if not allowed:
+                    yield "event: access-revoked\ndata: {}\n\n"
+                    break
+                last_access_check = now
 
             if data is not None:
                 try:

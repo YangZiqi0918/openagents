@@ -51,6 +51,8 @@ export default defineConfig(({ mode }) => ({
     // launcher's preload — which runs before any page script — can set it to
     // a self-hosted endpoint first.
     'process.env.NEXT_PUBLIC_API_URL': '__OA_API_URL__',
+    'process.env.NEXT_PUBLIC_AUTH_MODE': JSON.stringify(process.env.NEXT_PUBLIC_AUTH_MODE || ''),
+    'process.env.NEXT_PUBLIC_LOCAL_MODE': JSON.stringify(process.env.NEXT_PUBLIC_LOCAL_MODE || 'false'),
     // Analytics is deliberately off in the desktop build; see shims/next-script.
     'process.env.NEXT_PUBLIC_POSTHOG_KEY': 'undefined',
     'process.env.NEXT_PUBLIC_POSTHOG_HOST': 'undefined',

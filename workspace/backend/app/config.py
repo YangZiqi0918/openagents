@@ -6,6 +6,7 @@ All settings are loaded from environment variables.
 """
 
 import os
+from pathlib import Path
 
 
 class Config:
@@ -55,7 +56,11 @@ class Config:
     # bearer alongside Firebase / Apple ID tokens, so a signed-in browser never
     # has to talk to Google. Unset = the endpoint is disabled (503).
     WORKSPACE_SESSION_SECRET: str = os.environ.get("WORKSPACE_SESSION_SECRET", "")
-    WORKSPACE_SESSION_TTL_DAYS: int = int(os.environ.get("WORKSPACE_SESSION_TTL_DAYS", "30"))
+    if AUTH_MODE == "local_password" and not WORKSPACE_SESSION_SECRET:
+        _session_secret_file = Path(os.environ.get("WORKSPACE_SESSION_SECRET_FILE", str(Path(__file__).resolve().parent.parent / "secrets" / "local-session.key")))
+        if _session_secret_file.is_file():
+            WORKSPACE_SESSION_SECRET = _session_secret_file.read_text(encoding="ascii").strip()
+    WORKSPACE_SESSION_TTL_DAYS: int = int(os.environ.get("WORKSPACE_SESSION_TTL_DAYS", "1" if AUTH_MODE == "local_password" else "30"))
 
     # Sign in with Apple. Native ("Sign in with Apple" on the iOS app) issues an
     # identity token whose `aud` is the app's bundle id; web/services flows use

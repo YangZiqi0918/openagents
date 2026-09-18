@@ -15,7 +15,7 @@ import { FileRowIcon, FolderRowIcon, dirname, getFileIcon } from './file-utils';
 
 export function TrashView() {
   const confirm = useConfirm();
-  const { trashEntries: entries, refreshTrash, restoreFromTrash, purgeTrash, emptyTrash } =
+  const { trashEntries: entries, refreshTrash, restoreFromTrash, purgeTrash, emptyTrash, canWrite = true } =
     useWorkspace();
   const t = useT();
   const { isMobile, openMobileList } = useLayout();
@@ -150,7 +150,7 @@ export function TrashView() {
               mode="icon"
               size="sm"
               onClick={handleEmpty}
-              disabled={entries.length === 0 || emptying}
+              disabled={!canWrite || entries.length === 0 || emptying}
               aria-label={t('trash.emptyTrash')}
               className="shrink-0 text-muted-foreground hover:text-destructive"
             >
@@ -236,7 +236,7 @@ export function TrashView() {
                         mode="icon"
                         size="sm"
                         onClick={() => handleRestore(entry)}
-                        disabled={busy}
+                        disabled={!canWrite || busy}
                         aria-label={t('trash.restoreItem', { name: entry.name })}
                         className="size-6 text-muted-foreground"
                       >
@@ -252,7 +252,7 @@ export function TrashView() {
                         mode="icon"
                         size="sm"
                         onClick={() => handleDelete(entry)}
-                        disabled={busy}
+                        disabled={!canWrite || busy}
                         aria-label={t('trash.deleteItemPermanently', { name: entry.name })}
                         className="size-6 text-muted-foreground hover:text-red-500"
                       >

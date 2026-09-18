@@ -29,7 +29,7 @@ function IconWrapper({ name, size = 20, className }: { name: string } & IconProp
       style={{ width: size, height: size }}
     >
       <img
-        src={`${ICON_BASE}/${name}.svg`}
+        src={name === 'openagents' ? '/logo-icon.png' : `${ICON_BASE}/${name}.svg`}
         alt={name}
         width={needsBg ? size - 4 : size}
         height={needsBg ? size - 4 : size}

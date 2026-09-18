@@ -19,7 +19,7 @@ import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { capture } from '@/lib/analytics';
 import { getCampaignStatus, type CampaignStatus } from '@/lib/account-api';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { useT, type MessageKey } from '@/lib/i18n';
 import { useOpenAgentsAuth } from '@/lib/openagents-auth-context';
 import type { ModelAccessEntry } from '@/lib/types';
@@ -198,6 +198,7 @@ export function CampaignPromoAccess({
   selectedAccessId?: string;
   onUse: (entry: ModelAccessEntry, created: boolean) => void;
 }) {
+  const workspaceApi = useWorkspaceApi();
   const t = useT();
   const { idToken } = useOpenAgentsAuth();
   const [status, setStatus] = useState<CampaignStatus | null>(null);

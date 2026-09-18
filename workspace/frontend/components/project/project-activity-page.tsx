@@ -1,6 +1,6 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   Check,
   ChevronLeft,
@@ -21,6 +21,7 @@ import { useIsMobile } from '@/hooks/use-mobile';
 import { agentLabel } from '@/lib/helpers';
 import { projectShareUrl } from '@/lib/project-channels';
 import { shareOrigin } from '@/lib/share-origin';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
 import { AgentAvatar } from '@/components/agents/agent-avatar';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -85,7 +86,7 @@ function ActivityContent({
   initialSessionId,
   workspaceId,
 }: ProjectActivityPageProps & { workspaceId: string }) {
-  const { agents, currentUser } = useWorkspace();
+  const { agents, currentUser, me } = useWorkspace();
   const { locale } = useI18n();
   const l = activityLabels(locale);
   const isMobile = useIsMobile();
@@ -96,6 +97,12 @@ function ActivityContent({
     currentUser.id,
     initialSessionId,
   );
+  useEffect(() => {
+    if (initialSessionId && activity.sessions.some((session) => session.sessionId === initialSessionId)) {
+      activity.select(initialSessionId);
+      setPane('detail');
+    }
+  }, [initialSessionId, activity.sessions]); // eslint-disable-line react-hooks/exhaustive-deps
   const [pane, setPane] = useState<'list' | 'detail'>(
     initialSessionId ? 'detail' : 'list',
   );
@@ -111,6 +118,7 @@ function ActivityContent({
     (session) => session.sessionId === activity.preferences.selectedId,
   );
   const disabled = activity.busy || sending;
+  const readOnly = IS_LOCAL_AUTH && me?.role === 'viewer';
   const shareUrl = projectShareUrl(shareOrigin(), workspaceId, {
     projectId,
     projectName,
@@ -124,7 +132,7 @@ function ActivityContent({
   );
 
   const deleteConversation = async (id: string) => {
-    if (disabled) return;
+    if (disabled || readOnly) return;
     if (
       !(await confirm({
         title: l.delete,
@@ -139,7 +147,7 @@ function ActivityContent({
   };
 
   const saveConversation = async () => {
-    if (!form?.name.trim() || form.name.trim().length > 60) return;
+    if (readOnly || !form?.name.trim() || form.name.trim().length > 60) return;
     const success = form.id
       ? await activity.rename(form.id, form.name.trim())
       : await activity.create(form.name.trim());
@@ -220,7 +228,7 @@ function ActivityContent({
                 type="button"
                 title={l.newConversation}
                 aria-label={l.newConversation}
-                disabled={disabled}
+                disabled={disabled || readOnly}
                 onClick={() => setForm({ name: '' })}
                 className={iconClass}
               >
@@ -247,7 +255,7 @@ function ActivityContent({
                   <p className="text-sm">{l.empty}</p>
                   <Button
                     variant="outline"
-                    disabled={disabled}
+                    disabled={disabled || readOnly}
                     onClick={() => setForm({ name: '' })}
                   >
                     <Plus className="size-4" />
@@ -307,7 +315,7 @@ function ActivityContent({
                             type="button"
                             aria-label={`${l.title}: ${session.title}`}
                             title={session.title}
-                            disabled={disabled}
+                            disabled={disabled || readOnly}
                             className={`${iconClass} mr-1`}
                           >
                             <MoreVertical className="size-4" />
@@ -407,7 +415,7 @@ function ActivityContent({
                               type="checkbox"
                               checked={included}
                               disabled={
-                                disabled ||
+                                disabled || readOnly ||
                                 (!included && agent?.status !== 'online')
                               }
                               onChange={() =>
@@ -475,6 +483,7 @@ function ActivityContent({
                     selected.participants.includes(agent.agentName),
                   )}
                   currentUser={currentUser}
+                  readOnly={readOnly}
                   draft={activity.preferences.drafts[selected.sessionId] || ''}
                   onDraftChange={(text) =>
                     activity.draft(selected.sessionId, text)

@@ -1,4 +1,4 @@
-import { IS_LOCAL_MODE } from './api-config';
+import { IS_LOCAL_MODE, IS_LOCAL_AUTH } from './api-config';
 
 const HOSTED_ORIGIN = 'https://workspace.openagents.org';
 
@@ -16,7 +16,7 @@ const HOSTED_ORIGIN = 'https://workspace.openagents.org';
  */
 export function shareOrigin(): string {
   if (typeof window === 'undefined') return HOSTED_ORIGIN;
-  if (IS_LOCAL_MODE) return window.location.origin;
+  if (IS_LOCAL_MODE || (IS_LOCAL_AUTH && ['http:', 'https:'].includes(window.location.protocol))) return window.location.origin;
   const { protocol, hostname, origin } = window.location;
   const isWeb = protocol === 'https:' || protocol === 'http:';
   if (isWeb && hostname !== 'localhost') return origin;

@@ -12,7 +12,7 @@ import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import type { CloudAgentProvider, ModelAccessEntry } from '@/lib/types';
 import { useT } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
@@ -35,6 +35,7 @@ export function AddModelAccessDialog({
   onClose: () => void;
   onSaved: (entry: ModelAccessEntry) => void;
 }) {
+  const workspaceApi = useWorkspaceApi();
   const t = useT();
   const [provider, setProvider] = useState('');
   const [label, setLabel] = useState('');

@@ -44,14 +44,17 @@ def _inviter_name(db: Session, created_by: str | None) -> str | None:
     if not created_by:
         return None
     user = db.execute(select(User).where(User.email == created_by)).scalar_one_or_none()
-    if user is not None and user.display_name:
-        return user.display_name
+    if user is not None and (user.display_name or user.username):
+        return user.display_name or user.username
     return created_by.partition("@")[0]
 
 
-def _load(db: Session, token: str):
+def _load(db: Session, token: str, lock: bool = False):
+    query = select(WorkspaceInvite).where(WorkspaceInvite.token == token)
+    if lock:
+        query = query.with_for_update()
     invite = db.execute(
-        select(WorkspaceInvite).where(WorkspaceInvite.token == token)
+        query
     ).scalar_one_or_none()
     if invite is None:
         return None, None
@@ -79,14 +82,17 @@ def get_invite(token: str, db: Session = Depends(get_db)):
     """Public peek so the accept page can render before login. Reveals only
     the workspace name, the offered role and (masked) who it's bound to."""
     invite, workspace = _load(db, token)
-    if invite is None or workspace is None or workspace.status == "deleted":
+    if invite is None or workspace is None or workspace.status == "deleted" or workspace.kind == "personal":
         return json_response(ResponseCode.NOT_FOUND, "Invite not found")
+    target = db.execute(select(User).where(User.email == invite.email)).scalar_one_or_none() if invite.email else None
     return success_response({
+        "workspaceId": str(workspace.id),
         "workspaceName": workspace.name,
         "role": invite.role,
         "status": _status(invite),
         "invitedBy": _inviter_name(db, invite.created_by),
-        "invitedEmail": _mask_email(invite.email) if invite.email else None,
+        "invitedEmail": _mask_email(invite.email) if invite.email and not (target and target.username) else None,
+        "invitedUsername": target.username if target else None,
         "expiresAt": invite.expires_at.isoformat() if invite.expires_at else None,
     })
 
@@ -104,8 +110,8 @@ def accept_invite(
     existing higher role is never downgraded. Returns the workspace slug so
     the frontend can land the new member in the workspace (bearer access —
     no token in the URL)."""
-    invite, workspace = _load(db, token)
-    if invite is None or workspace is None or workspace.status == "deleted":
+    invite, workspace = _load(db, token, lock=True)
+    if invite is None or workspace is None or workspace.status == "deleted" or workspace.kind == "personal":
         return json_response(ResponseCode.NOT_FOUND, "Invite not found")
 
     status = _status(invite)
@@ -119,7 +125,7 @@ def accept_invite(
     if invite.email and user.email != invite.email:
         return json_response(
             ResponseCode.FORBIDDEN,
-            "This invite was issued for a different email address",
+            "This invite was issued for a different account",
         )
 
     membership = db.execute(
@@ -145,6 +151,7 @@ def accept_invite(
         invite.id, user.email, workspace.slug, membership.role,
     )
     return success_response({
+        "kind": "project",
         "workspaceId": workspace.id,
         "slug": workspace.slug,
         "workspaceName": workspace.name,

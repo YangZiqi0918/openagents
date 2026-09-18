@@ -61,6 +61,7 @@ export function FileList() {
     deleteFolder,
     pendingFolderPaths,
     trashEntries,
+    canWrite = true,
   } = useWorkspace()
   const { isMobile, openMobileDetail, filesSection, setFilesSection } =
     useLayout()
@@ -296,6 +297,7 @@ export function FileList() {
                 size="sm"
                 aria-label={t("files.newTopLevelFolder")}
                 onClick={() => handleCreateFolder()}
+                disabled={!canWrite}
                 className="text-muted-foreground"
               >
                 <FolderPlus className="size-3.5" />
@@ -416,7 +418,7 @@ export function FileList() {
                     variant="ghost"
                     mode="icon"
                     size="sm"
-                    disabled={Boolean(pending)}
+                    disabled={!canWrite || Boolean(pending)}
                     aria-label={t("folders.actionsFor", { name: basename(folder.path) })}
                     className="mr-1 size-6 shrink-0 text-muted-foreground opacity-0 transition-opacity group-hover:opacity-100 data-[state=open]:opacity-100 disabled:opacity-0"
                     onClick={(e) => e.stopPropagation()}
@@ -467,6 +469,7 @@ export function FileList() {
                 size="sm"
                 className="mt-1"
                 onClick={() => handleCreateFolder()}
+                disabled={!canWrite}
               >
                 <FolderPlus className="size-3.5" />
                 {t("folders.newFolder")}

@@ -15,7 +15,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { useCopyToClipboard } from '@/hooks/use-copy-to-clipboard';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { useT } from '@/lib/i18n';
 import { shareOrigin } from '@/lib/share-origin';
 
@@ -26,6 +26,7 @@ interface ShareDialogProps {
 }
 
 export function ShareDialog({ open, onOpenChange, sessionId }: ShareDialogProps) {
+  const workspaceApi = useWorkspaceApi();
   const [loading, setLoading] = useState(false);
   const [shareUrl, setShareUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);

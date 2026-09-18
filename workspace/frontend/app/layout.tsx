@@ -7,16 +7,17 @@ import { DialogsProvider } from '@/components/ui/dialogs-provider';
 import { I18nProvider } from '@/lib/i18n';
 import { getServerTranslations, resolveLocale } from '@/lib/i18n/server';
 import '@/styles/globals.css';
-import { IS_LOCAL_MODE } from '@/lib/api-config';
+import { IS_LOCAL_AUTH, IS_LOCAL_MODE } from '@/lib/api-config';
+import { LocalAccountShell } from '@/components/layout/local-account-shell';
 
 // Analytics identifiers are injected via Vercel env vars (Project → Settings →
 // Environment Variables) rather than hardcoded. NEXT_PUBLIC_* values are inlined
 // into the client bundle at build time. When a key is unset the corresponding
 // snippet is skipped entirely, so analytics simply no-ops (e.g. local dev or
 // preview deploys without the vars configured).
-const POSTHOG_KEY = !IS_LOCAL_MODE && process.env.NEXT_PUBLIC_POSTHOG_KEY;
+const POSTHOG_KEY = !IS_LOCAL_MODE && !IS_LOCAL_AUTH && process.env.NEXT_PUBLIC_POSTHOG_KEY;
 const POSTHOG_HOST = process.env.NEXT_PUBLIC_POSTHOG_HOST ?? 'https://d.openagents.org';
-const GA_ID = !IS_LOCAL_MODE && process.env.NEXT_PUBLIC_GA_ID;
+const GA_ID = !IS_LOCAL_MODE && !IS_LOCAL_AUTH && process.env.NEXT_PUBLIC_GA_ID;
 
 export async function generateMetadata(): Promise<Metadata> {
   const { t } = await getServerTranslations();
@@ -102,7 +103,7 @@ export default async function RootLayout({
                 Firebase (OpenAgentsAuthProvider) is the sole identity path. */}
             <OpenAgentsAuthProvider>
               <DialogsProvider>
-                {children}
+                <LocalAccountShell>{children}</LocalAccountShell>
               </DialogsProvider>
             </OpenAgentsAuthProvider>
             <Toaster />

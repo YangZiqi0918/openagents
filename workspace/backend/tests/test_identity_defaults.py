@@ -13,6 +13,20 @@ _verify_workspace_access grants that email full access.
 import importlib
 import os
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def restore_reloaded_config():
+    """Reload checks must not leave a different config object in auth modules."""
+    import app.config as config_module
+    import app.firebase_auth as firebase_auth
+    original_config = config_module.config
+    original_auth_config = firebase_auth.config
+    yield
+    config_module.config = original_config
+    firebase_auth.config = original_auth_config
+
 
 def _fresh_config(monkeypatch, **env):
     """Re-import the config module with a controlled environment."""

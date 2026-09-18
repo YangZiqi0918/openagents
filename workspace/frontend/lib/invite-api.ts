@@ -15,6 +15,7 @@ export interface InvitePeek {
   invitedBy: string | null;
   /** Masked (r***@example.com) when the invite is email-bound, else null. */
   invitedEmail: string | null;
+  invitedUsername?: string | null;
   expiresAt: string | null;
 }
 

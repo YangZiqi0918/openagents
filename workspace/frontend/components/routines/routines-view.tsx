@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { CalendarClock, RefreshCw, Trash2, Plus } from 'lucide-react';
 import { useWorkspace } from '@/lib/workspace-context';
 import { useLayout } from '@/components/layout/layout-context';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { AgentAvatar } from '@/components/agents/agent-avatar';
 import { agentLabel } from '@/lib/helpers';
 import { CreateRoutineDialog } from './create-routine-dialog';
@@ -12,6 +12,7 @@ import { useFormatters, useT } from '@/lib/i18n';
 import { useRoutineFormat } from './use-routine-format';
 
 export function RoutinesView() {
+  const workspaceApi = useWorkspaceApi();
   const { routines, refreshRoutines, createRoutine, sessions, agents, setCurrentSessionId } = useWorkspace();
   const { setViewMode } = useLayout();
   const t = useT();

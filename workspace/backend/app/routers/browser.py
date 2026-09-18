@@ -40,7 +40,9 @@ from app.browser_creds import (
 )
 from app.database import get_db
 from app.net_security import UnsafeURLError
-from app.models import BrowserContext, BrowserTab, BrowserUsage, Workspace
+from app.models import BrowserContext, BrowserTab, BrowserUsage, Workspace, WorkspaceMember
+from app.access import resolve_user_role
+from app.config import config
 from app.response import ResponseCode, json_response, success_response
 from app.routers.network import (
     _emit_event,
@@ -218,7 +220,7 @@ class PersistTabRequest(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _tab_to_dict(tab: BrowserTab, context_name: str = None) -> dict:
+def _tab_to_dict(tab: BrowserTab, context_name: str = None, *, include_interactive: bool = True) -> dict:
     d = {
         "id": tab.id,
         "url": tab.url,
@@ -229,9 +231,9 @@ def _tab_to_dict(tab: BrowserTab, context_name: str = None) -> dict:
         "created_at": tab.created_at.isoformat() if tab.created_at else None,
         "last_active_at": tab.last_active_at.isoformat() if tab.last_active_at else None,
     }
-    if tab.live_url:
+    if tab.live_url and include_interactive:
         d["live_url"] = tab.live_url
-    if tab.session_id:
+    if tab.session_id and include_interactive:
         d["session_id"] = tab.session_id
     if tab.last_error:
         d["last_error"] = tab.last_error
@@ -543,7 +545,8 @@ def _load_tab_list(db, network, status, x_workspace_token, authorization):
             context_names = {c.id: c.name for c in contexts}
 
         return {
-            "tabs": [_tab_to_dict(t, context_name=context_names.get(t.context_id)) for t in rows],
+            "tabs": [_tab_to_dict(t, context_name=context_names.get(t.context_id),
+                                  include_interactive=resolve_user_role(db, workspace, authorization) != "viewer") for t in rows],
             "total": len(rows),
         }
 
@@ -633,7 +636,7 @@ async def get_tab(
         except Exception as e:
             logger.warning("Tab %s validation/reconnect failed: %s", tab_id, e)
 
-    return success_response(_tab_to_dict(tab))
+    return success_response(_tab_to_dict(tab, include_interactive=resolve_user_role(db, workspace, authorization) != "viewer"))
 
 
 # ---------------------------------------------------------------------------
@@ -1042,6 +1045,13 @@ def share_tab(
         return json_response(ResponseCode.NOT_FOUND, "Network not found")
     if not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Invalid workspace credentials")
+
+    if config.AUTH_MODE == "local_password" or workspace.kind == "personal":
+        if db.execute(select(WorkspaceMember.agent_name).where(
+            WorkspaceMember.workspace_id == workspace.id, WorkspaceMember.agent_name == body.agent_name,
+            WorkspaceMember.status != "removed",
+        )).first() is None:
+            return json_response(ResponseCode.BAD_REQUEST, "Agent does not belong to this project")
 
     shared = list(tab.shared_with or [])
     if body.agent_name not in shared:

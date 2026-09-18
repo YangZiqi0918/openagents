@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 """Tests for the connect-a-node flow: pairing codes + node register/heartbeat."""
 
+from tests.conftest import create_test_workspace
+
 from datetime import datetime, timedelta, timezone
 
 from app.models import NodePairingCode, Workspace
 
 
 def _make_workspace(client, name="WS"):
-    r = client.post("/v1/workspaces", json={"name": name, "creator_email": "a@x.com"})
+    r = create_test_workspace(client, json={"name": name, "creator_email": "a@x.com"})
     assert r.status_code == 200
     return r.json()["data"]  # {workspaceId, slug, name, token, ...}
 

@@ -8,6 +8,7 @@ import { getInvitePeek, acceptInvite, type InvitePeek } from '@/lib/invite-api';
 import { useOpenAgentsAuth } from '@/lib/openagents-auth-context';
 import { goToCentralLogin, goToCentralLogout } from '@/lib/auth-redirects';
 import { useT } from '@/lib/i18n';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
 
 /**
  * The invitee's landing page for /invite/{token} links. The token in the URL
@@ -42,7 +43,7 @@ export default function InvitePage({ params }: { params: Promise<{ token: string
       const result = await acceptInvite(token, idToken);
       // Member now — land in the workspace via bearer access (clean URL, no
       // credentials in the address bar).
-      router.replace(`/${result.slug}`);
+      router.replace(IS_LOCAL_AUTH ? `/projects/${encodeURIComponent(result.workspaceId)}` : `/${result.slug}`);
     } catch (e) {
       setAcceptError(e instanceof Error ? e.message : t('invitePage.acceptFailed'));
       setJoining(false);
@@ -51,7 +52,7 @@ export default function InvitePage({ params }: { params: Promise<{ token: string
 
   const card = (children: React.ReactNode) => (
     <div className="flex min-h-screen items-center justify-center bg-background p-6">
-      <div className="w-full max-w-md space-y-5 rounded-2xl border bg-card p-8 text-center shadow-sm">
+      <div className="w-full max-w-md space-y-5 rounded-lg border bg-card p-8 text-center shadow-sm">
         <img src="/logo-icon.png" alt="OpenAgents" className="mx-auto size-12 dark:hidden" />
         <img src="/logo-white.png" alt="OpenAgents" className="mx-auto hidden size-12 dark:block" />
         {children}
@@ -95,10 +96,10 @@ export default function InvitePage({ params }: { params: Promise<{ token: string
           ? t('invitePage.invitedByAs', { inviter: peek.invitedBy, role: peek.role })
           : t('invitePage.invitedAs', { role: peek.role })}
       </p>
-      {peek.invitedEmail && (
+      {(peek.invitedUsername || (!IS_LOCAL_AUTH && peek.invitedEmail)) && (
         <p className="flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
           <Mail className="size-3.5" />
-          {t('invitePage.boundTo', { email: peek.invitedEmail })}
+          {t('invitePage.boundTo', { email: peek.invitedUsername || peek.invitedEmail || '' })}
         </p>
       )}
 
@@ -109,10 +110,10 @@ export default function InvitePage({ params }: { params: Promise<{ token: string
             {t('invitePage.join', { workspace: peek.workspaceName })}
           </Button>
           <p className="text-xs text-muted-foreground">
-            {t('invitePage.signedInAs', { email: user.email })}{' '}
+            {t('invitePage.signedInAs', { email: user.username || user.displayName || user.email })}{' '}
             <button
               className="underline hover:text-foreground"
-              onClick={() => goToCentralLogout(signOut)}
+              onClick={() => { if (IS_LOCAL_AUTH) void signOut().then(() => router.replace(`/login?returnTo=${encodeURIComponent(`/invite/${token}`)}`)); else goToCentralLogout(signOut); }}
             >
               {t('invitePage.switchAccount')}
             </button>
@@ -126,7 +127,7 @@ export default function InvitePage({ params }: { params: Promise<{ token: string
             <LogIn className="size-4" />
             {t('invitePage.signInToAccept')}
           </Button>
-          <p className="text-xs text-muted-foreground">{t('invitePage.signInHint')}</p>
+          {!IS_LOCAL_AUTH && <p className="text-xs text-muted-foreground">{t('invitePage.signInHint')}</p>}
         </div>
       )}
     </>,

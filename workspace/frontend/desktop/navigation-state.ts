@@ -5,7 +5,8 @@ export function restorableRoute(value: unknown): string | null {
     const url = new URL(value, 'https://desktop.invalid');
     if (url.origin !== 'https://desktop.invalid' || url.hash) return null;
     const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
-    if (parts.some(p => !/^[\w-]+$/.test(p)) || ['auth', 'share', 'invite'].includes(parts[0])) return null;
+    if (parts.some(p => !/^[\w-]+$/.test(p)) || ['auth', 'share', 'invite', 'login'].includes(parts[0])) return null;
+    if (parts[0] === 'projects') return parts.length <= 2 ? url.pathname : null;
     if (parts.length > 1 && (parts[1] !== 'settings' || parts.length > 3)) return null;
     // Workspace membership resolves its access token on load. Never save tokens
     // or other query parameters from a shared link as navigation state.

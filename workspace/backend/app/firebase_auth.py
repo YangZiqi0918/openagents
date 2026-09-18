@@ -268,6 +268,8 @@ def mint_workspace_session(claims: dict) -> tuple:
         payload["firebase_uid"] = claims["firebase_uid"]
     if claims.get("display_name"):
         payload["name"] = claims["display_name"]
+    if claims.get("local_user_id"):
+        payload["local_user_id"] = claims["local_user_id"]
     token = jwt.encode(payload, config.WORKSPACE_SESSION_SECRET, algorithm=_SESSION_ALG)
     return token, exp
 
@@ -311,12 +313,15 @@ def verify_workspace_session(token: str) -> Optional[dict]:
     email = (decoded.get("email") or "").strip().lower()
     if not email:
         return None
-    return {
+    claims = {
         "provider": "workspace_session",
         "email": email,
         "firebase_uid": decoded.get("firebase_uid"),
         "display_name": decoded.get("name"),
     }
+    if decoded.get("local_user_id"):
+        claims["local_user_id"] = decoded["local_user_id"]
+    return claims
 
 
 def verify_identity_token(token: str) -> Optional[str]:
@@ -332,7 +337,11 @@ def verify_identity_token(token: str) -> Optional[str]:
     """
     if looks_like_workspace_session(token):
         claims = verify_workspace_session(token)
+        if config.AUTH_MODE == "local_password" and not (claims or {}).get("local_user_id"):
+            return None
         return claims["email"] if claims else None
+    if config.AUTH_MODE == "local_password":
+        return None
     email = verify_firebase_token(token)
     if email:
         return email
@@ -418,7 +427,12 @@ def verify_identity_claims(token: str) -> Optional[dict]:
     ids are None), or None if neither provider accepts the token. This is the
     entry point for user-row resolution (app/access.py)."""
     if looks_like_workspace_session(token):
-        return verify_workspace_session(token)
+        claims = verify_workspace_session(token)
+        if config.AUTH_MODE == "local_password" and not (claims or {}).get("local_user_id"):
+            return None
+        return claims
+    if config.AUTH_MODE == "local_password":
+        return None
     claims = verify_firebase_claims(token)
     if claims:
         return claims

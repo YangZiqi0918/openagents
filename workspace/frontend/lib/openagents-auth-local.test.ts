@@ -5,7 +5,7 @@ import { createRoot } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({ firebaseLoaded: vi.fn(), loadSession: vi.fn(), clearSession: vi.fn() }));
-vi.mock('./api-config', () => ({ IS_LOCAL_MODE: true }));
+vi.mock('./api-config', () => ({ IS_LOCAL_MODE: true, IS_LOCAL_AUTH: false }));
 vi.mock('./workspace-session', () => ({ loadWorkspaceSession: mocks.loadSession, clearWorkspaceSession: mocks.clearSession }));
 vi.mock('./firebase', () => { mocks.firebaseLoaded(); return {}; });
 import { OpenAgentsAuthProvider, useOpenAgentsAuth } from './openagents-auth-context';

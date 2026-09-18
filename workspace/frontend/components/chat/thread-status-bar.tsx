@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState, useCallback } from 'react';
 import { Circle, Loader2, Timer, MessageSquareMore, X } from 'lucide-react';
 import { useWorkspace } from '@/lib/workspace-context';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import type { TimerItem, WorkspaceMessage } from '@/lib/types';
 import { useT } from '@/lib/i18n';
 
@@ -24,6 +24,7 @@ interface QueuedMessage {
 }
 
 export function ThreadStatusBar({ channelName, messages = [] }: { channelName: string; messages?: WorkspaceMessage[] }) {
+  const workspaceApi = useWorkspaceApi();
   const { todos, refreshTodos } = useWorkspace();
   const t = useT();
   const [timers, setTimers] = useState<TimerItem[]>([]);

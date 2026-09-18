@@ -15,7 +15,7 @@ import {
   Video,
   type LucideIcon,
 } from 'lucide-react';
-import { workspaceApi } from '@/lib/api';
+import { useFileBlobUrl } from '@/hooks/use-file-blob-url';
 import type { WorkspaceFile } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import type { MessageKey, TranslateFn } from '@/lib/i18n';
@@ -396,11 +396,12 @@ function FileThumbnail({
   /** Shown inside the box until it does. */
   placeholder: ReactNode;
 }) {
+  const { url, error } = useFileBlobUrl(file.id, file.contentType);
   const [broken, setBroken] = useState(() => brokenThumbnails.has(file.id));
   const [loaded, setLoaded] = useState(false);
   const { color } = getFileTypeMeta(file.contentType, file.filename);
 
-  if (broken) return <>{fallback}</>;
+  if (broken || error) return <>{fallback}</>;
 
   return (
     <span
@@ -415,8 +416,8 @@ function FileThumbnail({
       style={loaded ? { background: `color-mix(in oklab, ${color} 12%, transparent)` } : undefined}
     >
       {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img
-        src={workspaceApi.getFileUrl(file.id)}
+      {url && <img
+        src={url}
         // Decorative: the filename sits right beside it in every caller.
         alt=""
         loading="lazy"
@@ -430,7 +431,7 @@ function FileThumbnail({
           'size-full object-cover transition-opacity duration-200',
           loaded ? 'opacity-100' : 'opacity-0',
         )}
-      />
+      />}
       {!loaded && (
         <span
           className="absolute inset-0 flex animate-pulse items-center justify-center"

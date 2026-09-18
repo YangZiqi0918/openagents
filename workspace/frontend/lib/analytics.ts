@@ -1,3 +1,5 @@
+import { IS_LOCAL_AUTH } from './api-config';
+
 declare global {
   interface Window {
     posthog?: {
@@ -30,15 +32,18 @@ function baseProps(): Record<string, unknown> {
 }
 
 export function capture(event: string, properties?: Record<string, unknown>): void {
+  if (IS_LOCAL_AUTH || typeof window === 'undefined') return;
   window.posthog?.capture(event, { ...baseProps(), ...properties });
 }
 
 export function identify(userId: string, properties?: Record<string, unknown>): void {
+  if (IS_LOCAL_AUTH || typeof window === 'undefined') return;
   window.posthog?.identify(userId, properties);
 }
 
 // Tie subsequent events to a workspace. The workspace ID is the join key that connects
 // this user's activity to the website + launcher funnel stages for the same workspace.
 export function group(groupType: string, groupKey: string, properties?: Record<string, unknown>): void {
+  if (IS_LOCAL_AUTH || typeof window === 'undefined') return;
   window.posthog?.group(groupType, groupKey, properties);
 }

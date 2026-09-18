@@ -38,7 +38,7 @@ export function DraftChatView() {
   useEffect(() => { textareaRef.current?.focus(); }, []);
 
   const send = async () => {
-    if (sending || (!draft.trim() && files.length === 0) || participants.length === 0 || !currentUser.name.trim()) return;
+    if (sending || (!draft.trim() && files.length === 0) || !currentUser.name.trim()) return;
     setSending(true);
     try {
       await createAndSendSession({ content: draft.trim(), participants, files });
@@ -114,7 +114,7 @@ export function DraftChatView() {
                 </PopoverContent>
               </Popover>
             </div>
-            <button type="button" onClick={() => void send()} disabled={sending || (!draft.trim() && files.length === 0) || participants.length === 0 || !currentUser.name.trim()} className="flex size-8 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground disabled:cursor-not-allowed disabled:opacity-40" aria-label={t('draftThread.send')} title={t('draftThread.send')}>
+            <button type="button" onClick={() => void send()} disabled={sending || (!draft.trim() && files.length === 0) || !currentUser.name.trim()} className="flex size-8 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground disabled:cursor-not-allowed disabled:opacity-40" aria-label={t('draftThread.send')} title={t('draftThread.send')}>
               {sending ? <span className="size-4 animate-spin rounded-full border-2 border-current border-t-transparent" /> : <ArrowUp className="size-4" />}
             </button>
           </div>

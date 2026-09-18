@@ -280,9 +280,8 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 
 -- ===========================================================================
--- Alembic stamp — schema is at head; backend's `alembic upgrade head` no-ops.
--- Update '015' to match the latest revision in
--- workspace/backend/alembic/versions/ when the source schema changes.
+-- Alembic stamp — this import is the historical 015 baseline.
+-- Run `alembic upgrade head` after importing to apply later additions.
 -- ===========================================================================
 CREATE TABLE IF NOT EXISTS alembic_version (
     version_num varchar(32) NOT NULL,

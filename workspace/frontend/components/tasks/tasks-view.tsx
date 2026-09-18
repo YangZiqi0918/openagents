@@ -57,7 +57,7 @@ function TaskCard({
 }) {
   const t = useT();
   const { timeAgo } = useFormatters();
-  const { agents, workflows } = useWorkspace();
+  const { agents, workflows, canWrite = true } = useWorkspace();
   const onlineAgents = agents.filter((a) => a.status === 'online');
 
   const isBacklog = task.status === 'backlog' || task.status === 'todo';
@@ -71,7 +71,7 @@ function TaskCard({
 
   return (
     <div
-      onClick={openable ? onOpenChat : isBacklog ? onEdit : undefined}
+      onClick={openable ? onOpenChat : isBacklog && canWrite ? onEdit : undefined}
       title={openable ? t('tasks.openChat') : isBacklog ? t('tasks.editTaskTitle') : undefined}
       className={cn(
         'group relative rounded-lg border bg-card p-3 shadow-sm transition-colors',
@@ -91,7 +91,7 @@ function TaskCard({
 
       <div className="flex items-start justify-between gap-2">
         <p className="text-sm font-medium leading-snug break-words min-w-0">{task.title}</p>
-        <div className="flex items-center gap-1.5 shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
+        {canWrite && <div className="flex items-center gap-1.5 shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
           {isBacklog && (
             <button
               onClick={(e) => { e.stopPropagation(); onEdit(); }}
@@ -108,7 +108,7 @@ function TaskCard({
           >
             <Trash2 className="size-3.5" />
           </button>
-        </div>
+        </div>}
       </div>
 
       {needsInput && (
@@ -194,7 +194,7 @@ function TaskCard({
 
       <div className="mt-1.5 flex items-center gap-2">
         {/* Run — backlog only. Needs an agent or a workflow first. */}
-        {isBacklog && (
+        {isBacklog && canWrite && (
           <button
             onClick={(e) => { e.stopPropagation(); if (runnable) onRun(); }}
             disabled={!runnable}
@@ -212,7 +212,7 @@ function TaskCard({
         )}
 
         {/* Stop — while running or awaiting input. */}
-        {(isRunning || needsInput) && (
+        {(isRunning || needsInput) && canWrite && (
           <button
             onClick={(e) => { e.stopPropagation(); onStop(); }}
             className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 transition-colors"
@@ -224,7 +224,7 @@ function TaskCard({
         )}
 
         {/* Re-run — a done task can be run again (workflow restarts at step 1). */}
-        {task.status === 'done' && runnable && (
+        {task.status === 'done' && runnable && canWrite && (
           <button
             onClick={(e) => { e.stopPropagation(); onRun(); }}
             className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/10 transition-colors"
@@ -243,7 +243,7 @@ function TaskCard({
             <Waypoints className="size-3.5 shrink-0" />
             <span className="truncate">{workflowName}</span>
           </span>
-        ) : isBacklog ? (
+        ) : isBacklog && canWrite ? (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
@@ -330,7 +330,7 @@ function BoardColumn({
 // ── Board ─────────────────────────────────────────────────────────────────
 
 export function TasksView() {
-  const { tasks, refreshTasks, createTask, updateTask, runTask, stopTask, deleteTask } = useWorkspace();
+  const { tasks, refreshTasks, createTask, updateTask, runTask, stopTask, deleteTask, canWrite = true } = useWorkspace();
   const t = useT();
 
   const [newTaskOpen, setNewTaskOpen] = useState(false);
@@ -392,7 +392,7 @@ export function TasksView() {
           <h2 className="text-sm font-semibold">{t('views.tasks')}</h2>
         </>}
       >
-        <Button size="sm" onClick={() => setNewTaskOpen(true)} className="gap-1.5">
+        <Button size="sm" disabled={!canWrite} onClick={() => setNewTaskOpen(true)} className="gap-1.5">
           <Plus className="size-3.5" />
           {t('tasks.newTask')}
         </Button>
@@ -415,7 +415,7 @@ export function TasksView() {
             dotClass="bg-zinc-400"
             title={t('tasks.col.backlog')}
             count={backlog.length}
-            canAdd
+            canAdd={canWrite}
             onAdd={() => setNewTaskOpen(true)}
             className="sm:flex-1 sm:min-w-0"
           >
@@ -423,6 +423,7 @@ export function TasksView() {
                 the full create dialog (title/description/context/run-with). */}
             <Button
               size="lg"
+              disabled={!canWrite}
               onClick={() => setNewTaskOpen(true)}
               className="w-full gap-1.5 shrink-0"
             >
@@ -468,7 +469,7 @@ export function TasksView() {
       </div>
 
       <NewTaskDialog
-        open={newTaskOpen || !!editTask}
+        open={canWrite && (newTaskOpen || !!editTask)}
         onOpenChange={(o) => {
           if (!o) { setNewTaskOpen(false); setEditTask(null); }
         }}

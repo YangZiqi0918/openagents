@@ -7,7 +7,7 @@ import { MarkdownContent } from '@/components/chat/markdown-content';
 import { Button } from '@/components/ui/button';
 import { useLayout } from '@/components/layout/layout-context';
 import { DetailHeader } from '@/components/layout/app-header';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import type { KnowledgeEntry } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import { useWorkspace } from '@/lib/workspace-context';
@@ -21,7 +21,8 @@ import { knowledgeAuthorName, stripLeadingTitle } from './knowledge-utils';
  * same list/detail split as threads and files.
  */
 export function KnowledgeView() {
-  const { knowledge, refreshKnowledge, agents, selectedKnowledgeId } = useWorkspace();
+  const workspaceApi = useWorkspaceApi();
+  const { knowledge, refreshKnowledge, agents, selectedKnowledgeId, canWrite = true } = useWorkspace();
   const { isMobile, openMobileList } = useLayout();
   const t = useT();
   const { timeAgo } = useFormatters();
@@ -113,6 +114,7 @@ export function KnowledgeView() {
           size="sm"
           aria-label={t('knowledge.editEntry')}
           onClick={handleEdit}
+          disabled={!canWrite}
           className="text-muted-foreground"
         >
           <Pencil className="size-3.5" />
@@ -209,7 +211,7 @@ export function KnowledgeView() {
       </div>
 
       <KnowledgeEditor
-        open={editorOpen}
+        open={canWrite && editorOpen}
         entry={editingEntry}
         onClose={() => { setEditorOpen(false); setEditingEntry(null); }}
         onSaved={async () => {

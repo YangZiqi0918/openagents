@@ -12,6 +12,8 @@ Covers the Workspace → Launcher contract:
     state.
 """
 
+from tests.conftest import create_test_workspace
+
 import io
 import zipfile
 
@@ -28,7 +30,7 @@ def _make_zip(files: dict) -> bytes:
 
 
 def _make_workspace(client, name="WS2", agent="beta"):
-    resp = client.post("/v1/workspaces", json={
+    resp = create_test_workspace(client, json={
         "name": name, "agent_name": agent, "creator_email": "other@example.com",
     })
     assert resp.status_code == 200, resp.text

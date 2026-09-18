@@ -32,6 +32,8 @@ import { NewThreadDialogHost } from '@/components/threads/new-thread-dialog-host
 import { DraftChatView } from '@/components/chat/draft-chat-view';
 import { ProjectsView } from '@/components/project/projects-view';
 import { readCurrentProjectLink } from '@/lib/project-channels';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
+import type { ViewMode } from './layout-context';
 
 function WorkspaceLoadingScreen() {
   const t = useT();
@@ -51,7 +53,7 @@ function WorkspaceLoadingScreen() {
         />
         <div className="text-center">
           <h1 className="text-xl font-semibold tracking-tight">OpenAgents</h1>
-          <p className="text-sm text-muted-foreground mt-0.5">{t('nav.workspaceFallback')}</p>
+          {!IS_LOCAL_AUTH && <p className="text-sm text-muted-foreground mt-0.5">{t('nav.workspaceFallback')}</p>}
         </div>
       </div>
       <div className="absolute bottom-0 left-0 right-0 h-1 bg-muted overflow-hidden">
@@ -68,13 +70,17 @@ function WorkspaceLoadingScreen() {
   );
 }
 
-export function Wrapper() {
+export function Wrapper({ projectContent }: { projectContent?: React.ReactNode } = {}) {
   useDesktopWorkspaceState();
   const {
-    isMobile, viewMode, draftThreadOpen, isAgentPanelOpen, isSidebarOpen, setSidebarOpen,
+    isMobile, viewMode: layoutViewMode, draftThreadOpen, isAgentPanelOpen, isSidebarOpen, setSidebarOpen,
     hasListPanel, mobilePane, splitBrowser, showBrowserPreview, isRailExpanded,
     railDragWidth, filesSection, selectedAgentName, setSelectedAgentName, openView,
   } = useLayout();
+  const personalView = useRef<ViewMode>('threads');
+  if (layoutViewMode !== 'projects') personalView.current = layoutViewMode;
+  const projectsShowing = IS_LOCAL_AUTH && layoutViewMode === 'projects';
+  const viewMode = projectsShowing ? personalView.current : layoutViewMode;
   const { workspace, monitorMode, agents, loading, sessions, currentSessionId } = useWorkspace();
   const projectsStorageKey = `oa:projects:workspace:${workspace?.workspaceId ?? 'local'}:v1`;
   const openViewRef = useRef(openView);
@@ -131,7 +137,7 @@ export function Wrapper() {
     (s) => !(s.master && agents.some((a) => a.builtin && a.agentName === s.master)),
   );
   const showOnboarding =
-    !hasAgents && userSessions.length === 0 && viewMode === 'threads' &&
+    !IS_LOCAL_AUTH && !hasAgents && userSessions.length === 0 && viewMode === 'threads' &&
     !currentSessionId?.startsWith('dm:');
 
   if (loading) {
@@ -141,9 +147,11 @@ export function Wrapper() {
   // ── Mobile layout: single-pane with list/detail switching ──
   if (isMobile) {
     return (
-      <div className="flex flex-col h-screen w-full [&_.container-fluid]:px-5">
+      <div className="flex h-[100dvh] w-full flex-col [&_.container-fluid]:px-5">
         <MobileHeader />
         <div className="flex-1 min-h-0 pt-[var(--header-height-mobile)] pb-[calc(48px+env(safe-area-inset-bottom))]">
+          {projectsShowing && <div className="h-full">{projectContent}</div>}
+          <div className={projectsShowing ? 'hidden' : 'h-full'}>
           {/* Full-screen views (no list/detail split) */}
           {viewMode === 'projects' ? (
             <ProjectsView storageKey={projectsStorageKey} />
@@ -185,7 +193,7 @@ export function Wrapper() {
             <div className="relative h-full bg-background overflow-hidden">
               {(viewMode === 'threads' || viewMode === 'routines') && (
                 <div className="h-full">
-                  <ChatView />
+                  {viewMode === 'threads' && IS_LOCAL_AUTH && draftThreadOpen ? <DraftChatView /> : <ChatView />}
                 </div>
               )}
               {viewMode === 'files' && (filesSection === 'trash' ? <TrashView /> : <FilePreview />)}
@@ -193,6 +201,7 @@ export function Wrapper() {
               {viewMode === 'knowledge' && <KnowledgeView />}
             </div>
           )}
+          </div>
         </div>
 
         {/* The agent profile is opened from the nav drawer, which is reachable
@@ -223,7 +232,7 @@ export function Wrapper() {
     showOnboarding ||
     (viewMode === 'threads' && monitorMode) ||
     (viewMode === 'threads' && splitBrowser && showBrowserPreview);
-  const sidebarOpen = isSidebarOpen && hasListPanel && viewMode !== 'threads' && !listSuppressed;
+  const sidebarOpen = !projectsShowing && isSidebarOpen && hasListPanel && viewMode !== 'threads' && !listSuppressed;
 
   // The shell sizes itself: rail width plus the list panel when it is showing.
   // Expanding the rail to show labels widens the shell by the same amount.
@@ -237,7 +246,7 @@ export function Wrapper() {
     <SidebarProvider
       open={sidebarOpen}
       onOpenChange={setSidebarOpen}
-      className="h-screen min-h-0 [&_.container-fluid]:px-5"
+      className="h-[100dvh] min-h-0 [&_.container-fluid]:px-5"
       style={{
         '--sidebar-width': `${shellWidth}px`,
         '--sidebar-width-icon': `${railWidth}px`,
@@ -247,8 +256,10 @@ export function Wrapper() {
       <AppSidebar />
 
       <SidebarInset className="min-w-0">
-        {viewMode !== 'projects' && <AppHeader />}
+        <div className={projectsShowing ? 'hidden' : 'contents'}>{viewMode !== 'projects' && <AppHeader />}</div>
         <div className="relative flex min-h-0 grow overflow-hidden">
+          {projectsShowing && <div className="absolute inset-0 z-10 flex min-h-0 flex-col overflow-hidden bg-background">{projectContent}</div>}
+          <div className={projectsShowing ? 'hidden' : 'flex min-h-0 flex-1'}>
           {viewMode === 'projects' ? (
             <div className="relative flex-1 min-w-0 overflow-hidden bg-background">
               <ProjectsView storageKey={projectsStorageKey} />
@@ -304,6 +315,7 @@ export function Wrapper() {
               {isAgentPanelOpen && viewMode !== 'threads' && viewMode !== 'routines' && <AgentProfilePanel />}
             </div>
           )}
+          </div>
         </div>
       </SidebarInset>
 

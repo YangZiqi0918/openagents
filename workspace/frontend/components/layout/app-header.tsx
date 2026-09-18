@@ -14,6 +14,7 @@ import { isRecentAgent } from "@/lib/helpers"
 import { useT } from "@/lib/i18n"
 import type { MessageKey } from "@/lib/i18n"
 import { cn } from "@/lib/utils"
+import { IS_LOCAL_AUTH } from '@/lib/api-config'
 import { useLayout, type ViewMode } from "./layout-context"
 import { useConfirm, usePrompt } from '@/components/ui/dialogs-provider'
 import {
@@ -80,9 +81,9 @@ export function DetailHeader({
   titleInHeader?: boolean
   children?: React.ReactNode
 }) {
-  const { isMobile } = useLayout()
+  const { isMobile, embedded } = useLayout()
 
-  if (!isMobile) {
+  if (!isMobile && !embedded) {
     return (
       <>
         {titleInHeader && <AppHeaderTitle>{title}</AppHeaderTitle>}
@@ -270,7 +271,7 @@ export function AppHeader() {
   // A fresh workspace (no real agent, no threads) is in guided onboarding — the
   // threads view renders the onboarding flow, so title it "Onboarding".
   const isOnboarding =
-    !agents.some((a) => isRecentAgent(a) && !a.builtin) && sessions.length === 0
+    !IS_LOCAL_AUTH && !agents.some((a) => isRecentAgent(a) && !a.builtin) && sessions.length === 0
 
   // Title: the selected item for list-backed views, the view name otherwise.
   let title: React.ReactNode

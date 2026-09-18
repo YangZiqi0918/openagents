@@ -99,9 +99,11 @@ function matchPattern(
 export function DesktopRouter({
   routes,
   notFound,
+  shell,
 }: {
   routes: RouteTable;
   notFound: React.ReactNode;
+  shell?: (children: React.ReactNode) => React.ReactNode;
 }): React.JSX.Element {
   const [location, setLocation] = useState(readLocation);
 
@@ -175,7 +177,7 @@ export function DesktopRouter({
 
   return (
     <RouterContext.Provider value={value}>
-      <React.Fragment key={location.pathname}>{matched ? matched.route.render(matched.params) : notFound}</React.Fragment>
+      {shell ? shell(<React.Fragment key={location.pathname}>{matched ? matched.route.render(matched.params) : notFound}</React.Fragment>) : <React.Fragment key={location.pathname}>{matched ? matched.route.render(matched.params) : notFound}</React.Fragment>}
     </RouterContext.Provider>
   );
 }

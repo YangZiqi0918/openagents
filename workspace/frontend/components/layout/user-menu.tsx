@@ -27,6 +27,7 @@ import { goToCentralLogin, goToCentralLogout } from '@/lib/auth-redirects';
 import { useT } from '@/lib/i18n';
 import { LanguageMenuSub } from './language-menu';
 import { FeedbackDialog } from '@/components/feedback/feedback-dialog';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
 
 interface UserMenuProps {
   side?: 'top' | 'right' | 'bottom' | 'left';
@@ -63,6 +64,7 @@ export function UserMenu({ side, align = 'end' }: UserMenuProps = {}) {
   const ActiveThemeIcon = activeThemeOption.icon;
 
   const isOwnedByUser = workspace && user && workspace.creatorEmail === user.email;
+  const accountLabel = user?.username || user?.displayName || user?.email;
 
   const handleCopyToken = async () => {
     if (!token) {
@@ -99,12 +101,15 @@ export function UserMenu({ side, align = 'end' }: UserMenuProps = {}) {
     const ok = await confirm({
       title: t('userMenu.signOutTitle'),
       description: user
-        ? t('userMenu.signOutDescriptionWithEmail', { email: user.email })
+        ? t('userMenu.signOutDescriptionWithEmail', { email: accountLabel || '' })
         : t('userMenu.signOutDescription'),
       confirmText: t('userMenu.signOut'),
       destructive: true,
     });
-    if (ok) goToCentralLogout(signOut);
+    if (ok) {
+      if (IS_LOCAL_AUTH) { await signOut(); router.replace('/login'); }
+      else goToCentralLogout(signOut);
+    }
   };
 
   return (
@@ -113,12 +118,12 @@ export function UserMenu({ side, align = 'end' }: UserMenuProps = {}) {
         <DropdownMenuTrigger asChild>
           <button
             type="button"
-            title={user?.email || t('userMenu.account')}
+            title={accountLabel || t('userMenu.account')}
             className="flex size-8 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
           >
             {user ? (
               <span className="flex size-6 items-center justify-center rounded-full bg-primary text-[10px] font-bold text-primary-foreground">
-                {user.email[0].toUpperCase()}
+                {(accountLabel || '?')[0].toUpperCase()}
               </span>
             ) : (
               <User className="size-4" />
@@ -130,8 +135,8 @@ export function UserMenu({ side, align = 'end' }: UserMenuProps = {}) {
           {user && (
             <>
               <DropdownMenuLabel className="flex flex-col gap-0.5">
-                <span className="truncate text-sm font-medium">{user.email}</span>
-                {isOwnedByUser && (
+                <span className="truncate text-sm font-medium">{accountLabel}</span>
+                {!IS_LOCAL_AUTH && isOwnedByUser && (
                   <span className="flex items-center gap-1 text-[11px] font-normal text-emerald-600">
                     <Shield className="size-3" /> {t('userMenu.ownsWorkspace')}
                   </span>
@@ -141,7 +146,7 @@ export function UserMenu({ side, align = 'end' }: UserMenuProps = {}) {
             </>
           )}
 
-          {isOpenAgentsDomain && user && (
+          {!IS_LOCAL_AUTH && isOpenAgentsDomain && user && (
             <>
               <DropdownMenuItem onClick={() => router.push('/')}>
                 <LayoutGrid />
@@ -175,7 +180,7 @@ export function UserMenu({ side, align = 'end' }: UserMenuProps = {}) {
 
           <LanguageMenuSub />
 
-          {token && (
+          {!IS_LOCAL_AUTH && token && (
             <DropdownMenuItem onSelect={(e) => { e.preventDefault(); handleCopyToken(); }}>
               {tokenCopied ? <Check /> : <KeyRound />}
               {tokenCopied ? t('userMenu.tokenCopied') : t('userMenu.copyToken')}
@@ -184,7 +189,7 @@ export function UserMenu({ side, align = 'end' }: UserMenuProps = {}) {
 
           {/* Straight to the Members section's invite box — the most common
               admin action gets its own entry. */}
-          <DropdownMenuItem
+          {!IS_LOCAL_AUTH && <DropdownMenuItem
             onClick={() => {
               if (!workspace) return;
               router.push(`/${workspace.slug}/settings/members${window.location.search}`);
@@ -192,7 +197,7 @@ export function UserMenu({ side, align = 'end' }: UserMenuProps = {}) {
           >
             <UserPlus />
             {t('userMenu.inviteMembers')}
-          </DropdownMenuItem>
+          </DropdownMenuItem>}
 
           {/* Feedback goes to POST /v1/feedback (stored + forwarded to the
               team) — the cheapest possible path from an annoyed user to us. */}
@@ -204,7 +209,7 @@ export function UserMenu({ side, align = 'end' }: UserMenuProps = {}) {
           {/* Full-page admin dashboard (general / members / security / devices /
               integrations / preferences). window.location.search carries an
               incoming ?token= through so token-link visitors keep access. */}
-          <DropdownMenuItem
+          {!IS_LOCAL_AUTH && <DropdownMenuItem
             onClick={() => {
               if (!workspace) return;
               router.push(`/${workspace.slug}/settings${window.location.search}`);
@@ -212,7 +217,7 @@ export function UserMenu({ side, align = 'end' }: UserMenuProps = {}) {
           >
             <Settings />
             {t('userMenu.workspaceSettings')}
-          </DropdownMenuItem>
+          </DropdownMenuItem>}
 
           {isOpenAgentsDomain && (
             <>

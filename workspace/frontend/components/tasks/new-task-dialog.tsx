@@ -24,7 +24,8 @@ import {
 import { AgentAvatar } from '@/components/agents/agent-avatar';
 import { agentLabel } from '@/lib/helpers';
 import { useWorkspace } from '@/lib/workspace-context';
-import { workspaceApi } from '@/lib/api';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
+import { AuthenticatedFileImage } from '@/components/files/authenticated-file-image';
 import { cn } from '@/lib/utils';
 import { BookOpen, Check, FileIcon, Loader2, Paperclip, X } from 'lucide-react';
 import type { KanbanTask, WorkspaceFile } from '@/lib/types';
@@ -112,6 +113,7 @@ export function AttachmentPicker({
   value: string[];
   onChange: (ids: string[]) => void;
 }) {
+  const workspaceApi = useWorkspaceApi();
   const t = useT();
   const { files } = useWorkspace();
   const inputRef = useRef<HTMLInputElement>(null);
@@ -163,7 +165,7 @@ export function AttachmentPicker({
             return (
               <div key={id} className="group relative overflow-hidden rounded-lg border bg-muted">
                 {isImage && f ? (
-                  <img src={workspaceApi.getFileUrl(f.id)} alt={f.filename} className="h-16 w-auto max-w-[140px] object-cover" />
+                  <AuthenticatedFileImage fileId={f.id} contentType={f.contentType} alt={f.filename} className="h-16 w-auto max-w-[140px] object-cover" />
                 ) : (
                   <div className="flex h-16 w-24 flex-col items-center justify-center gap-1 px-2">
                     <FileIcon className="size-4 text-muted-foreground" />
