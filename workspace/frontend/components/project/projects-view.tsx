@@ -5,6 +5,7 @@ import { MoreVertical, Pencil, Plus, Search, Trash2, Waypoints, X } from 'lucide
 import { useT } from '@/lib/i18n';
 import { useConfirm, usePrompt } from '@/components/ui/dialogs-provider';
 import { ProjectInternalPage } from './project-internal-page';
+import { clearProjectLink, readCurrentProjectLink, type ProjectLink } from '@/lib/project-channels';
 import {
   DropdownMenu, DropdownMenuContent, DropdownMenuItem,
   DropdownMenuSeparator, DropdownMenuTrigger,
@@ -51,9 +52,11 @@ export function ProjectsView({ storageKey = PREVIEW_STORAGE_KEY }: { storageKey?
   const [loadedKey, setLoadedKey] = useState<string | null>(null);
   const [query, setQuery] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [linkedProject, setLinkedProject] = useState<ProjectLink | null>(null);
   const [error, setError] = useState('');
   const ready = loadedKey === storageKey;
-  const selected = projects.find((project) => project.id === selectedId);
+  const selected = projects.find((project) => project.id === selectedId)
+    ?? (linkedProject?.projectId === selectedId ? { id: linkedProject.projectId, name: linkedProject.projectName } : undefined);
 
   useEffect(() => {
     setQuery('');
@@ -78,10 +81,27 @@ export function ProjectsView({ storageKey = PREVIEW_STORAGE_KEY }: { storageKey?
       setError(t('projects.loadFailed'));
     }
     setProjects(next);
+    const link = readCurrentProjectLink();
+    setLinkedProject(link);
+    if (link) setSelectedId(link.projectId);
     setLoadedKey(storageKey);
     // Locale changes update labels, not persisted project names or edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [storageKey]);
+
+  useEffect(() => {
+    const openLink = () => {
+      const link = readCurrentProjectLink();
+      setLinkedProject(link);
+      setSelectedId(link?.projectId ?? null);
+    };
+    window.addEventListener('popstate', openLink);
+    window.addEventListener('hashchange', openLink);
+    return () => {
+      window.removeEventListener('popstate', openLink);
+      window.removeEventListener('hashchange', openLink);
+    };
+  }, []);
 
   const save = (next: Project[]) => {
     setProjects(next);
@@ -146,7 +166,9 @@ export function ProjectsView({ storageKey = PREVIEW_STORAGE_KEY }: { storageKey?
   const filtered = projects.filter((project) => project.name.toLocaleLowerCase().includes(normalizedQuery));
 
   if (selected && ready) {
-    return <ProjectInternalPage projectId={selected.id} projectName={selected.name} onBack={() => setSelectedId(null)} workspaceModulesAvailable={storageKey !== PREVIEW_STORAGE_KEY} planStorageKey={`${storageKey}:plan:${selected.id}:v1`} />;
+    return <ProjectInternalPage key={`${selected.id}:${linkedProject?.sessionId ?? ''}`} projectId={selected.id} projectName={selected.name} onBack={() => {
+      setSelectedId(null); setLinkedProject(null); clearProjectLink();
+    }} initialSessionId={linkedProject?.projectId === selected.id ? linkedProject.sessionId : undefined} workspaceModulesAvailable={storageKey !== PREVIEW_STORAGE_KEY} planStorageKey={`${storageKey}:plan:${selected.id}:v1`} />;
   }
 
   return (

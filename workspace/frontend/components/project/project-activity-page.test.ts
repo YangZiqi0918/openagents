@@ -1,0 +1,632 @@
+// @vitest-environment jsdom
+import React, { act } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { I18nProvider } from '@/lib/i18n';
+import type { ChatInput, PendingFile } from '@/components/chat/chat-input';
+import type { ChatMessages } from '@/components/chat/chat-messages';
+import type {
+  NetworkChannel,
+  WorkspaceAgent,
+  WorkspaceMessage,
+} from '@/lib/types';
+import { ProjectActivityPage } from './project-activity-page';
+import { activityStorageKey } from './project-activity-model';
+
+const mock = vi.hoisted(() => ({
+  mobile: false,
+  workspaceId: 'workspace',
+  userId: 'user',
+  channels: [] as NetworkChannel[],
+  messages: {} as Record<string, WorkspaceMessage[]>,
+  input: null as React.ComponentProps<typeof ChatInput> | null,
+  files: [] as PendingFile[],
+  polling: vi.fn(),
+  loadOlder: vi.fn(),
+  refresh: vi.fn(),
+  confirm: vi.fn(),
+  personalSelection: vi.fn(),
+  personalCreate: vi.fn(),
+  api: {
+    discover: vi.fn(),
+    sendEvent: vi.fn(),
+    updateChannel: vi.fn(),
+    uploadFile: vi.fn(),
+    sendMessage: vi.fn(),
+    addChannelParticipant: vi.fn(),
+    removeChannelParticipant: vi.fn(),
+    getFileUrl: vi.fn(),
+  },
+}));
+
+vi.mock('@/hooks/use-mobile', () => ({ useIsMobile: () => mock.mobile }));
+vi.mock('@/lib/workspace-context', () => ({
+  useWorkspace: () => ({
+    workspace: { workspaceId: mock.workspaceId },
+    currentUser: { id: mock.userId, name: 'User', isAuthenticated: true },
+    agents: [
+      {
+        agentName: 'helper',
+        displayName: 'Helper',
+        status: 'online',
+      } as WorkspaceAgent,
+    ],
+    setCurrentSessionId: mock.personalSelection,
+    createSession: mock.personalCreate,
+  }),
+}));
+vi.mock('@/lib/api', () => ({ workspaceApi: mock.api }));
+vi.mock('@/lib/share-origin', () => ({
+  shareOrigin: () => 'https://workspace.test',
+}));
+vi.mock('@/components/ui/dialogs-provider', () => ({
+  useConfirm: () => mock.confirm,
+}));
+vi.mock('@/hooks/use-composing-signal', () => ({
+  useComposingSignal: () => ({
+    notifyFocus: vi.fn(),
+    notifyBlur: vi.fn(),
+    notifyTyping: vi.fn(),
+  }),
+}));
+vi.mock('@/hooks/use-polling', () => ({
+  useMessagePolling: (options: { sessionId: string }) => {
+    mock.polling(options);
+    return {
+      messages: mock.messages[options.sessionId] || [],
+      loading: false,
+      forceRefresh: mock.refresh,
+      generation: 0,
+      loadOlder: mock.loadOlder,
+      hasOlder: true,
+      loadingOlder: false,
+    };
+  },
+}));
+vi.mock('@/components/chat/chat-input', () => ({
+  ChatInput: (props: React.ComponentProps<typeof ChatInput>) => {
+    mock.input = props;
+    return React.createElement(
+      'div',
+      null,
+      React.createElement('input', {
+        'data-testid': 'draft',
+        value: props.draft,
+        disabled: props.disabled,
+        onChange: (event: React.ChangeEvent<HTMLInputElement>) =>
+          props.onDraftChange?.(event.target.value),
+      }),
+      React.createElement(
+        'button',
+        {
+          'data-testid': 'send',
+          disabled: props.disabled,
+          onClick: () => {
+            props.onSend(props.draft || '', ['helper'], mock.files);
+            props.onDraftChange?.('');
+          },
+        },
+        'Send',
+      ),
+    );
+  },
+}));
+vi.mock('@/components/chat/chat-messages', () => ({
+  ChatMessages: (props: React.ComponentProps<typeof ChatMessages>) =>
+    React.createElement(
+      'div',
+      { 'data-testid': 'messages' },
+      ...props.messages.map((message) =>
+        React.createElement('p', { key: message.messageId }, message.content),
+      ),
+      React.createElement(
+        'button',
+        { 'data-testid': 'history', onClick: props.loadOlder },
+        'History',
+      ),
+    ),
+}));
+
+const channel = (id: string, title: string, extra = {}): NetworkChannel => ({
+  address: `channel/${id}`,
+  title,
+  participants: [],
+  master: null,
+  status: 'active',
+  starred: false,
+  created_at: 1,
+  last_event_at: 10,
+  ...extra,
+});
+const message = (
+  id: string,
+  content: string,
+  extra = {},
+): WorkspaceMessage => ({
+  messageId: `${id}-${content}`,
+  sessionId: id,
+  senderType: 'human',
+  senderName: 'User',
+  content,
+  mentions: [],
+  targetAgents: null,
+  messageType: 'chat',
+  metadata: {},
+  createdAt: new Date().toISOString(),
+  ...extra,
+});
+
+let root: Root;
+let container: HTMLDivElement;
+async function render(projectId = 'one', initialSessionId?: string) {
+  await act(async () =>
+    root.render(
+      React.createElement(I18nProvider, {
+        initialLocale: 'zh-CN',
+        hasStoredLocale: true,
+        children: React.createElement(ProjectActivityPage, {
+          projectId,
+          projectName: `Project ${projectId}`,
+          initialSessionId,
+        }),
+      }),
+    ),
+  );
+}
+const labelled = (label: string) =>
+  Array.from(document.querySelectorAll<HTMLButtonElement>('[aria-label]')).find(
+    (element) => element.getAttribute('aria-label') === label,
+  )!;
+const textButton = (text: string) =>
+  Array.from(
+    document.querySelectorAll<HTMLElement>('button, [role="menuitem"]'),
+  ).find((element) => element.textContent === text)!;
+async function click(element: HTMLElement) {
+  expect(element).toBeDefined();
+  await act(async () => element.click());
+}
+async function fill(element: HTMLInputElement, value: string) {
+  await act(() => {
+    Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      'value',
+    )!.set!.call(element, value);
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+}
+async function select(title = 'One') {
+  const row = Array.from(
+    container.querySelectorAll('[data-testid="project-activity-row"]'),
+  ).find(
+    (element) =>
+      element.querySelector('button span span')?.textContent === title,
+  );
+  await click(row?.querySelector('button')!);
+}
+async function openMenu() {
+  const trigger = container.querySelector<HTMLButtonElement>(
+    '[data-testid="project-activity-row"] [data-slot="dropdown-menu-trigger"]',
+  )!;
+  await act(() =>
+    trigger.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }),
+    ),
+  );
+}
+
+beforeEach(() => {
+  vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+  localStorage.clear();
+  mock.mobile = false;
+  mock.workspaceId = 'workspace';
+  mock.userId = 'user';
+  mock.messages = {};
+  mock.files = [];
+  mock.channels = [
+    channel('personal', 'Personal'),
+    channel('project:one:a', 'One'),
+    channel('project:two:a', 'Two'),
+    channel('project:one-other:a', 'Similar'),
+  ];
+  for (const method of Object.values(mock.api)) method.mockReset();
+  mock.polling.mockClear();
+  mock.refresh.mockClear();
+  mock.loadOlder.mockReset();
+  mock.personalSelection.mockClear();
+  mock.personalCreate.mockClear();
+  mock.confirm.mockReset().mockResolvedValue(true);
+  mock.api.discover.mockImplementation(async () => ({
+    channels: mock.channels,
+  }));
+  mock.api.sendEvent.mockImplementation(async (event) => {
+    mock.channels.push(channel(event.payload.name, event.payload.title));
+    return { metadata: { channel_name: event.payload.name } };
+  });
+  mock.api.updateChannel.mockImplementation(async (id, updates) => {
+    mock.channels = mock.channels.map((item) =>
+      item.address === `channel/${id}` ? { ...item, ...updates } : item,
+    );
+  });
+  mock.api.addChannelParticipant.mockImplementation(async (id, name) => {
+    mock.channels = mock.channels.map((item) =>
+      item.address === `channel/${id}`
+        ? { ...item, participants: [...item.participants, name] }
+        : item,
+    );
+  });
+  mock.api.removeChannelParticipant.mockImplementation(async (id, name) => {
+    mock.channels = mock.channels.map((item) =>
+      item.address === `channel/${id}`
+        ? {
+            ...item,
+            participants: item.participants.filter((agent) => agent !== name),
+          }
+        : item,
+    );
+  });
+  mock.api.getFileUrl.mockImplementation((id) => `/file/${id}`);
+  mock.api.uploadFile.mockResolvedValue({
+    id: 'file-one',
+    filename: 'notes.txt',
+    contentType: 'text/plain',
+  });
+  mock.api.sendMessage.mockImplementation(async (id, content) => ({
+    id: 'sent',
+    target: `channel/${id}`,
+    source: 'human:user',
+    timestamp: Date.now(),
+    payload: { content },
+    metadata: {},
+  }));
+  container = document.createElement('div');
+  document.body.appendChild(container);
+  root = createRoot(container);
+});
+afterEach(async () => {
+  await act(async () => root.unmount());
+  container.remove();
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
+
+describe('project activity', () => {
+  it('renders only this project, without creating a channel or touching personal selection', async () => {
+    await render();
+    expect(
+      container.querySelectorAll('[data-testid="project-activity-row"]'),
+    ).toHaveLength(1);
+    expect(container.textContent).not.toContain('Personal');
+    expect(container.textContent).not.toContain('Two');
+    expect(
+      container.querySelector('[data-testid="project-activity-list"]')
+        ?.className,
+    ).toContain('lg:w-[320px]');
+    expect(mock.api.sendEvent).not.toHaveBeenCalled();
+    await select();
+    expect(mock.polling).toHaveBeenLastCalledWith({
+      sessionId: 'project:one:a',
+    });
+    expect(mock.personalSelection).not.toHaveBeenCalled();
+    expect(mock.personalCreate).not.toHaveBeenCalled();
+  });
+
+  it('supports human-only creation and preserves a failed creation form for retry', async () => {
+    await render();
+    await click(labelled('新建会话'));
+    await fill(
+      document.querySelector<HTMLInputElement>('#activity-conversation-name')!,
+      'Discussion',
+    );
+    mock.api.sendEvent.mockRejectedValueOnce(new Error('Access denied'));
+    await click(textButton('创建'));
+    expect(
+      document.querySelector<HTMLInputElement>('#activity-conversation-name')
+        ?.value,
+    ).toBe('Discussion');
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain(
+      'Access denied',
+    );
+    await click(textButton('创建'));
+    expect(mock.api.sendEvent).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          title: 'Discussion',
+          participants: [],
+          name: expect.stringMatching(/^project:one:/),
+        }),
+      }),
+    );
+    expect(
+      container.querySelectorAll('[data-testid="project-activity-row"]'),
+    ).toHaveLength(2);
+    expect(
+      container.querySelector('[data-testid="project-activity-conversation"]'),
+    ).not.toBeNull();
+  });
+
+  it('renames and confirms deletion, preserving a session after a failed delete', async () => {
+    await render();
+    await openMenu();
+    await click(textButton('重命名会话'));
+    await fill(
+      document.querySelector<HTMLInputElement>('#activity-conversation-name')!,
+      'Renamed',
+    );
+    await click(textButton('保存'));
+    expect(mock.api.updateChannel).toHaveBeenCalledWith('project:one:a', {
+      title: 'Renamed',
+    });
+    await openMenu();
+    mock.api.updateChannel.mockRejectedValueOnce(new Error('Delete denied'));
+    await click(textButton('删除会话'));
+    expect(mock.confirm).toHaveBeenCalledWith(
+      expect.objectContaining({ destructive: true }),
+    );
+    expect(
+      container.querySelectorAll('[data-testid="project-activity-row"]'),
+    ).toHaveLength(1);
+    await openMenu();
+    await click(textButton('删除会话'));
+    expect(
+      container.querySelectorAll('[data-testid="project-activity-row"]'),
+    ).toHaveLength(0);
+  });
+
+  it('stores drafts and selection independently across projects, workspaces and users', async () => {
+    await render();
+    await select();
+    await fill(
+      container.querySelector<HTMLInputElement>('[data-testid="draft"]')!,
+      'One draft',
+    );
+    await render('two');
+    await select('Two');
+    expect(
+      container.querySelector<HTMLInputElement>('[data-testid="draft"]')?.value,
+    ).toBe('');
+    await fill(
+      container.querySelector<HTMLInputElement>('[data-testid="draft"]')!,
+      'Two draft',
+    );
+    await render('one');
+    expect(
+      container.querySelector<HTMLInputElement>('[data-testid="draft"]')?.value,
+    ).toBe('One draft');
+    mock.workspaceId = 'other';
+    await render();
+    await select();
+    expect(
+      container.querySelector<HTMLInputElement>('[data-testid="draft"]')?.value,
+    ).toBe('');
+    mock.workspaceId = 'workspace';
+    mock.userId = 'other-user';
+    await render();
+    await select();
+    expect(
+      container.querySelector<HTMLInputElement>('[data-testid="draft"]')?.value,
+    ).toBe('');
+    expect(
+      JSON.parse(
+        localStorage.getItem(activityStorageKey('workspace', 'one', 'user'))!,
+      ).readAt['project:one:a'],
+    ).toBeGreaterThan(0);
+  });
+
+  it('scopes messages and history to the current conversation and persists new read markers', async () => {
+    mock.messages['project:one:a'] = [
+      message('project:one:a', 'Shared message'),
+      message('personal', 'Foreign message'),
+    ];
+    await render('one', 'project:one:a');
+    expect(container.textContent).toContain('Shared message');
+    expect(container.textContent).not.toContain('Foreign message');
+    await click(
+      container.querySelector<HTMLButtonElement>('[data-testid="history"]')!,
+    );
+    expect(mock.loadOlder).toHaveBeenCalledOnce();
+    expect(
+      JSON.parse(
+        localStorage.getItem(activityStorageKey('workspace', 'one', 'user'))!,
+      ).readAt['project:one:a'],
+    ).toBeGreaterThan(0);
+  });
+
+  it('preserves failed text and attachments, retrying without duplicate uploads', async () => {
+    await render();
+    await select();
+    await fill(
+      container.querySelector<HTMLInputElement>('[data-testid="draft"]')!,
+      'Hello @helper',
+    );
+    mock.files = [
+      { file: new File(['notes'], 'notes.txt', { type: 'text/plain' }) },
+    ];
+    mock.api.sendMessage.mockRejectedValueOnce(
+      new Error('Network unavailable'),
+    );
+    await click(
+      container.querySelector<HTMLButtonElement>('[data-testid="send"]')!,
+    );
+    expect(
+      container.querySelector<HTMLInputElement>('[data-testid="draft"]')?.value,
+    ).toBe('Hello @helper');
+    expect(container.textContent).toContain('notes.txt');
+    expect(mock.api.uploadFile).toHaveBeenCalledWith(
+      mock.files[0].file,
+      'project:one:a',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    await click(labelled('重新发送'));
+    expect(mock.api.uploadFile).toHaveBeenCalledOnce();
+    expect(mock.api.sendMessage).toHaveBeenLastCalledWith(
+      'project:one:a',
+      'Hello @helper',
+      'User',
+      ['helper'],
+      [expect.objectContaining({ fileId: 'file-one' })],
+      'user',
+    );
+    expect(
+      container.querySelector<HTMLInputElement>('[data-testid="draft"]')?.value,
+    ).toBe('');
+    expect(labelled('重新发送')).toBeUndefined();
+  });
+
+  it('adds and removes agents without modifying global session state', async () => {
+    await render();
+    await select();
+    await click(labelled('参与 Agent'));
+    await click(
+      document.querySelector<HTMLInputElement>(
+        '[data-slot="popover-content"] input',
+      )!,
+    );
+    expect(mock.api.addChannelParticipant).toHaveBeenCalledWith(
+      'project:one:a',
+      'helper',
+    );
+    expect(
+      document.querySelector<HTMLInputElement>(
+        '[data-slot="popover-content"] input',
+      )?.checked,
+    ).toBe(true);
+    await click(
+      document.querySelector<HTMLInputElement>(
+        '[data-slot="popover-content"] input',
+      )!,
+    );
+    expect(mock.api.removeChannelParticipant).toHaveBeenCalledWith(
+      'project:one:a',
+      'helper',
+    );
+    expect(mock.personalSelection).not.toHaveBeenCalled();
+  });
+
+  it('uses local mobile pane navigation and supports shared links in a second user session', async () => {
+    mock.mobile = true;
+    await render();
+    expect(
+      container.querySelector('[data-testid="project-activity-detail"]'),
+    ).toBeNull();
+    await select();
+    expect(
+      container.querySelector('[data-testid="project-activity-list"]'),
+    ).toBeNull();
+    await click(labelled('返回会话列表'));
+    expect(
+      container.querySelector('[data-testid="project-activity-list"]'),
+    ).not.toBeNull();
+    mock.userId = 'second-user';
+    await render('one', 'project:one:a');
+    expect(
+      container
+        .querySelector('[data-testid="project-activity-conversation"]')
+        ?.getAttribute('data-session-id'),
+    ).toBe('project:one:a');
+    await click(labelled('复制项目链接'));
+    const link = new URL(
+      document.querySelector<HTMLInputElement>('[role="dialog"] input')!.value,
+    );
+    expect(link.searchParams.get('projectId')).toBe('one');
+    expect(link.searchParams.get('projectSessionId')).toBe('project:one:a');
+    expect(link.searchParams.get('token')).toBeNull();
+  });
+
+  it('ignores late discovery results after changing projects and reports storage failures', async () => {
+    let resolve!: (value: unknown) => void;
+    mock.api.discover.mockReturnValueOnce(
+      new Promise((yes) => {
+        resolve = yes;
+      }),
+    );
+    await render('one');
+    await render('two');
+    await act(async () =>
+      resolve({ channels: [channel('project:one:late', 'Late')] }),
+    );
+    expect(container.textContent).not.toContain('Late');
+    expect(container.textContent).toContain('Two');
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new Error('Storage full');
+    });
+    await select('Two');
+    expect(container.textContent).toContain('无法保存本地草稿');
+  });
+
+  it('recovers from discovery permission errors without creating a channel', async () => {
+    mock.api.discover.mockRejectedValueOnce(new Error('Access denied'));
+    await render();
+    expect(container.textContent).toContain('无法加载项目会话');
+    expect(
+      container.querySelectorAll('[data-testid="project-activity-row"]'),
+    ).toHaveLength(0);
+    await click(labelled('重试'));
+    expect(
+      container.querySelectorAll('[data-testid="project-activity-row"]'),
+    ).toHaveLength(1);
+    expect(mock.api.sendEvent).not.toHaveBeenCalled();
+  });
+
+  it('does not restore a foreign session from a link', async () => {
+    await render('one', 'project:two:a');
+    expect(
+      container.querySelector('[data-testid="project-activity-conversation"]'),
+    ).toBeNull();
+    expect(mock.polling).not.toHaveBeenCalled();
+  });
+
+  it('ignores a late send response after changing projects and preserves the original draft', async () => {
+    let resolve!: (value: unknown) => void;
+    mock.api.sendMessage.mockReturnValueOnce(
+      new Promise((yes) => {
+        resolve = yes;
+      }),
+    );
+    await render();
+    await select();
+    await fill(
+      container.querySelector<HTMLInputElement>('[data-testid="draft"]')!,
+      'Pending one',
+    );
+    await click(
+      container.querySelector<HTMLButtonElement>('[data-testid="send"]')!,
+    );
+    await render('two');
+    await select('Two');
+    await fill(
+      container.querySelector<HTMLInputElement>('[data-testid="draft"]')!,
+      'Draft two',
+    );
+    await act(async () =>
+      resolve({
+        id: 'late-send',
+        target: 'channel/project:one:a',
+        source: 'human:user',
+        timestamp: Date.now(),
+        payload: { content: 'Pending one' },
+      }),
+    );
+    expect(
+      container.querySelector<HTMLInputElement>('[data-testid="draft"]')?.value,
+    ).toBe('Draft two');
+    expect(container.textContent).not.toContain('Pending one');
+    expect(
+      JSON.parse(
+        localStorage.getItem(activityStorageKey('workspace', 'one', 'user'))!,
+      ).drafts['project:one:a'],
+    ).toBe('Pending one');
+  });
+
+  it('refreshes every 15 seconds and stops refreshing when unmounted', async () => {
+    vi.useFakeTimers();
+    await render();
+    const calls = mock.api.discover.mock.calls.length;
+    await act(async () => vi.advanceTimersByTime(15_000));
+    expect(mock.api.discover).toHaveBeenCalledTimes(calls + 1);
+    await act(async () => root.unmount());
+    const afterUnmount = mock.api.discover.mock.calls.length;
+    await act(async () => vi.advanceTimersByTime(30_000));
+    expect(mock.api.discover).toHaveBeenCalledTimes(afterUnmount);
+  });
+});

@@ -8,6 +8,7 @@ import { DialogsProvider } from '@/components/ui/dialogs-provider';
 import { ProjectsView } from './projects-view';
 
 vi.mock('@/hooks/use-mobile', () => ({ useIsMobile: () => false }));
+vi.mock('./project-activity-page', () => ({ ProjectActivityPage: () => React.createElement('div', { 'data-testid': 'activity-module' }) }));
 
 const STORAGE_KEY = 'test:projects';
 let root: Root;
@@ -61,6 +62,7 @@ async function menuItem(text: string) {
 
 describe('Projects interactions', () => {
   beforeEach(() => {
+    window.history.replaceState(null, '', '/');
     localStorage.clear();
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     container = document.createElement('div');
@@ -136,13 +138,41 @@ describe('Projects interactions', () => {
     const page = container.querySelector('[data-testid="project-internal-page"]');
     expect(page?.getAttribute('data-project-id')).toBe('getting-started');
     expect(page?.querySelector('header')?.textContent).toContain('项目新手指引');
-    expect(page?.querySelector('[data-testid="project-tab-content"]')?.textContent).toBe('');
+    expect(page?.querySelector('[data-testid="activity-module"]')).not.toBeNull();
     expect(container.querySelector('[role="dialog"]')).toBeNull();
 
     await click(button('项目'));
     await click(container.querySelectorAll<HTMLButtonElement>('[data-testid="project-card"] > button:first-child')[1]);
     expect(container.querySelector('[data-testid="project-internal-page"]')?.getAttribute('data-project-id')).toBe('example-1');
     expect(container.querySelector('header')?.textContent).toContain('项目/1');
+  });
+
+  it('opens a linked project temporarily, without changing the local project list', async () => {
+    localStorage.setItem(STORAGE_KEY, '[]');
+    window.history.replaceState(null, '', '/workspace?projectId=shared&projectName=Shared&projectSessionId=project:shared:abc');
+    await render();
+    expect(container.querySelector('[data-testid="project-internal-page"]')?.getAttribute('data-project-id')).toBe('shared');
+    expect(container.querySelector('header')?.textContent).toBe('项目/Shared');
+    expect(localStorage.getItem(STORAGE_KEY)).toBe('[]');
+    await click(button('项目'));
+    expect(container.querySelector('[data-testid="projects-view"]')).not.toBeNull();
+    expect(window.location.search).toBe('');
+    expect(localStorage.getItem(STORAGE_KEY)).toBe('[]');
+  });
+
+  it('handles navigation between project links in the same workspace', async () => {
+    await render();
+    await act(() => {
+      window.history.pushState(null, '', '/workspace?projectId=shared&projectName=Shared');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    });
+    expect(container.querySelector('[data-testid="project-internal-page"]')?.getAttribute('data-project-id')).toBe('shared');
+    await act(() => {
+      window.history.pushState(null, '', '/workspace?projectId=other&projectName=Other');
+      window.dispatchEvent(new PopStateEvent('popstate'));
+    });
+    expect(container.querySelector('[data-testid="project-internal-page"]')?.getAttribute('data-project-id')).toBe('other');
+    expect(localStorage.getItem(STORAGE_KEY)).toBeNull();
   });
 
   it('renames a project from its menu', async () => {

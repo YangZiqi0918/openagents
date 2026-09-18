@@ -7,6 +7,7 @@ import { useOpenAgentsAuth } from './openagents-auth-context';
 import { generateUserId, getStoredIdentity, storeIdentity } from './identity';
 import { networkAgentToWorkspaceAgent, networkChannelToSession } from './types';
 import { useUploadQueue } from '@/hooks/use-upload-queue';
+import { isProjectChannel, withoutProjectChannels } from './project-channels';
 import type { PendingUpload } from '@/hooks/use-upload-queue';
 import type { BrowserPersistentContext, BrowserTab, DMConversation, KanbanTask, Workflow, WorkflowStep, KnowledgeEntry, NotificationItem, OnlineUser, RoutineItem, TodoItem, TrashEntry, Workspace, WorkspaceAgent, WorkspaceFile, WorkspaceIdentity, WorkspaceSession } from './types';
 
@@ -618,7 +619,7 @@ export function WorkspaceProvider({
       if (pendingFirstSendsRef.current > 0) return;
       setAgents(discovery.agents.map(networkAgentToWorkspaceAgent));
 
-      const updated = discovery.channels.map((ch) =>
+      const updated = discovery.channels.filter((ch) => !isProjectChannel(ch.address)).map((ch) =>
         networkChannelToSession(ch, workspaceId)
       );
 
@@ -1237,7 +1238,7 @@ export function WorkspaceProvider({
           agent_types: wsAgents.map((a) => a.agentName),
         });
 
-        const channelSessions = discovery.channels.map((ch) =>
+        const channelSessions = discovery.channels.filter((ch) => !isProjectChannel(ch.address)).map((ch) =>
           networkChannelToSession(ch, workspaceId)
         );
         setSessions(channelSessions);
@@ -1283,7 +1284,7 @@ export function WorkspaceProvider({
         try {
           const cached = localStorage.getItem(cacheKey);
           if (cached && !cancelled) {
-            setLastMessageBySession((prev) => ({ ...JSON.parse(cached), ...prev }));
+            setLastMessageBySession((prev) => ({ ...withoutProjectChannels(JSON.parse(cached)), ...prev }));
           }
         } catch { /* ignore corrupt cache */ }
 
@@ -1309,6 +1310,7 @@ export function WorkspaceProvider({
         loadOptional(workspaceApi.latestPerChannel(), (bulk) => {
           const batch: Record<string, LastMessageInfo> = {};
           for (const [channelName, event] of Object.entries(bulk.channels)) {
+            if (isProjectChannel(channelName)) continue;
             const payload = event.payload as Record<string, string>;
             const sender = payload?.sender_name || event.source.replace(/^(openagents:|human:)/, '');
             const content = payload?.content || '';

@@ -11,6 +11,7 @@ const mobile = vi.hoisted(() => ({ value: false }));
 vi.mock('@/hooks/use-mobile', () => ({ useIsMobile: () => mobile.value }));
 vi.mock('@/lib/workspace-context', () => ({ useWorkspace: () => ({ workspace: { workspaceId: 'test' }, agents: [] }) }));
 vi.mock('@/lib/api', () => ({ workspaceApi: { getTeam: vi.fn().mockResolvedValue([]) } }));
+vi.mock('./project-activity-page', () => ({ ProjectActivityPage: () => React.createElement('div', { 'data-testid': 'activity-module' }) }));
 vi.mock('@/components/tasks/tasks-view', () => ({ TasksView: () => React.createElement('div', { 'data-testid': 'tasks-module' }) }));
 vi.mock('@/components/workflows/workflows-view', () => ({ WorkflowsView: () => React.createElement('div', { 'data-testid': 'workflows-module' }) }));
 vi.mock('@/components/files/file-list', () => ({ FileList: () => React.createElement(MockList, { name: 'files' }) }));
@@ -70,13 +71,13 @@ describe('Project internal page', () => {
     vi.unstubAllGlobals();
   });
 
-  it('shows eight tabs, the plan table and blank activity/members panels', async () => {
+  it('shows eight tabs, the activity module, the plan table and a blank members panel', async () => {
     const onBack = await render();
     expect(container.querySelector('header')?.textContent).toBe('项目/测试项目');
     expect(Array.from(container.querySelectorAll('nav button'), (item) => item.textContent))
       .toEqual(['动态', '计划', '任务', '文件', '工作流', '浏览器', '知识库', '成员管理']);
     expect(tab('动态').getAttribute('aria-current')).toBe('page');
-    expect(container.querySelector('[data-testid="project-tab-content"]')?.childElementCount).toBe(0);
+    expect(container.querySelector('[data-testid="activity-module"]')).not.toBeNull();
     await click(tab('计划'));
     expect(tab('计划').getAttribute('aria-current')).toBe('page');
     expect(container.querySelector('[data-testid="project-plan-page"]')).not.toBeNull();

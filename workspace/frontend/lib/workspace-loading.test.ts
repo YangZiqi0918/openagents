@@ -79,6 +79,25 @@ afterEach(async () => {
 });
 
 describe('workspace initial loading', () => {
+  it('excludes project channels from personal selection, refreshes and preview caches', async () => {
+    essentials();
+    const personal = { address: 'channel/general', title: 'General', participants: ['helper'], last_event_at: 1 };
+    const project = { address: 'channel/project:one:abc', title: 'Project', participants: [], last_event_at: 999999 };
+    api.discover.mockResolvedValue({ agents: [], channels: [project, personal] });
+    localStorage.setItem('previews:one', JSON.stringify({ general: { content: 'Personal' }, 'project:one:abc': { content: 'Project secret' } }));
+    api.latestPerChannel.mockResolvedValue({ channels: {
+      general: { source: 'human:user', payload: { content: 'Personal latest' } },
+      'project:one:abc': { source: 'human:user', payload: { content: 'Project latest', message_type: 'thinking' } },
+    } });
+    await render();
+    expect(state!.sessions.map((session) => session.sessionId)).toEqual(['general']);
+    expect(state!.currentSessionId).toBe('general');
+    expect(Object.keys(state!.lastMessageBySession)).toEqual(['general']);
+    expect(localStorage.getItem('previews:one')).not.toContain('project:');
+    await act(async () => state!.refreshAgents());
+    expect(state!.sessions.map((session) => session.sessionId)).toEqual(['general']);
+    expect(state!.activeSessionIds.size).toBe(0);
+  });
   it('shows the workspace, agents and threads while optional requests and previews are still pending', async () => {
     essentials();
     const tabs = deferred<{ tabs: unknown[] }>();

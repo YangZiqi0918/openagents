@@ -5,6 +5,7 @@ import { FolderKanban } from 'lucide-react';
 import { useI18n, useT } from '@/lib/i18n';
 import { ProjectWorkspaceContent, type ProjectWorkspaceTab } from './project-workspace-content';
 import { ProjectPlanPage } from './project-plan-page';
+import { ProjectActivityPage } from './project-activity-page';
 
 type ProjectTab = 'activity' | 'plan' | 'members' | ProjectWorkspaceTab;
 
@@ -16,9 +17,10 @@ interface ProjectInternalPageProps {
   onBack: () => void;
   workspaceModulesAvailable?: boolean;
   planStorageKey?: string;
+  initialSessionId?: string;
 }
 
-export function ProjectInternalPage({ projectId, projectName, onBack, workspaceModulesAvailable = true, planStorageKey }: ProjectInternalPageProps) {
+export function ProjectInternalPage({ projectId, projectName, onBack, workspaceModulesAvailable = true, planStorageKey, initialSessionId }: ProjectInternalPageProps) {
   const t = useT();
   const { locale } = useI18n();
   const [activeTab, setActiveTab] = useState<ProjectTab>('activity');
@@ -55,6 +57,7 @@ export function ProjectInternalPage({ projectId, projectName, onBack, workspaceM
       </nav>
 
       <div data-testid="project-tab-content" data-active-tab={activeTab} className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {activeTab === 'activity' && workspaceModulesAvailable && <ProjectActivityPage projectId={projectId} projectName={projectName} initialSessionId={initialSessionId} />}
         {activeTab === 'plan' && <ProjectPlanPage projectId={projectId} storageKey={planStorageKey} workspaceModulesAvailable={workspaceModulesAvailable} />}
         {activeTab !== 'activity' && activeTab !== 'plan' && activeTab !== 'members' && workspaceModulesAvailable && (
           <ProjectWorkspaceContent key={activeTab} tab={activeTab} />

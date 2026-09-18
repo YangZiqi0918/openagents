@@ -31,6 +31,7 @@ import { useT } from '@/lib/i18n';
 import { NewThreadDialogHost } from '@/components/threads/new-thread-dialog-host';
 import { DraftChatView } from '@/components/chat/draft-chat-view';
 import { ProjectsView } from '@/components/project/projects-view';
+import { readCurrentProjectLink } from '@/lib/project-channels';
 
 function WorkspaceLoadingScreen() {
   const t = useT();
@@ -72,10 +73,25 @@ export function Wrapper() {
   const {
     isMobile, viewMode, draftThreadOpen, isAgentPanelOpen, isSidebarOpen, setSidebarOpen,
     hasListPanel, mobilePane, splitBrowser, showBrowserPreview, isRailExpanded,
-    railDragWidth, filesSection, selectedAgentName, setSelectedAgentName,
+    railDragWidth, filesSection, selectedAgentName, setSelectedAgentName, openView,
   } = useLayout();
   const { workspace, monitorMode, agents, loading, sessions, currentSessionId } = useWorkspace();
   const projectsStorageKey = `oa:projects:workspace:${workspace?.workspaceId ?? 'local'}:v1`;
+  const openViewRef = useRef(openView);
+  openViewRef.current = openView;
+  useEffect(() => {
+    if (loading || !workspace) return;
+    const openProjectLink = () => {
+      if (readCurrentProjectLink()) openViewRef.current('projects');
+    };
+    openProjectLink();
+    window.addEventListener('popstate', openProjectLink);
+    window.addEventListener('hashchange', openProjectLink);
+    return () => {
+      window.removeEventListener('popstate', openProjectLink);
+      window.removeEventListener('hashchange', openProjectLink);
+    };
+  }, [loading, workspace?.workspaceId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Auto-dismiss the docked agent-profile panel when the user navigates away:
   // switching to another thread (incl. starting a new chat) or to another view
