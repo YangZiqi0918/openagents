@@ -22,6 +22,8 @@ interface TaskChatPopupProps {
   /** The task's hidden working thread (channel name). */
   sessionId: string;
   taskTitle: string;
+  description?: string | null;
+  acceptanceCriteria?: string | null;
   assignee: string | null;
   /** Optional status line under the title, e.g. workflow step progress. */
   subtitle?: string;
@@ -37,7 +39,7 @@ interface TaskChatPopupProps {
  * (hard-coupled to the global `currentSessionId`), we compose the same two
  * children it uses — `ChatMessages` + `ChatInput` — against a `sessionId` prop.
  */
-export function TaskChatPopup({ open, onOpenChange, sessionId, taskTitle, assignee, subtitle, submittedSummary, submissionHistory }: TaskChatPopupProps) {
+export function TaskChatPopup({ open, onOpenChange, sessionId, taskTitle, description, acceptanceCriteria, assignee, subtitle, submittedSummary, submissionHistory }: TaskChatPopupProps) {
   const { locale } = useI18n();
   const workspaceApi = useWorkspaceApi();
   const { agents, currentUser, canWrite = true } = useWorkspace();
@@ -86,11 +88,16 @@ export function TaskChatPopup({ open, onOpenChange, sessionId, taskTitle, assign
         <DialogHeader className="px-5 py-3 border-b border-border">
           <DialogTitle className="flex items-center gap-2 text-sm font-semibold">
             {assignee && <AgentAvatar name={assignee} size={20} />}
-            <span className="truncate">{taskTitle}</span>
+            <span className="truncate" title={taskTitle}>{taskTitle}</span>
           </DialogTitle>
           {subtitle && (
             <p className="text-[11px] text-muted-foreground truncate">{subtitle}</p>
           )}
+          {(description || acceptanceCriteria) && <details className="mt-2 max-h-[28vh] overflow-y-auto text-left text-xs font-normal text-muted-foreground">
+            <summary className="cursor-pointer font-medium text-foreground">{locale === 'zh-CN' ? '任务要求' : 'Task requirements'}</summary>
+            {description && <p className="mt-2 whitespace-pre-wrap break-words">{description}</p>}
+            {acceptanceCriteria && <p className="mt-2 whitespace-pre-wrap break-words"><span className="font-medium text-foreground">{locale === 'zh-CN' ? '验收标准：' : 'Acceptance criteria: '}</span>{acceptanceCriteria}</p>}
+          </details>}
           {submittedSummary && <p className="mt-2 rounded border border-border bg-muted/40 px-2 py-1.5 text-xs font-normal whitespace-pre-wrap">{submittedSummary}</p>}
           {submissionHistory && submissionHistory.length > 1 && <details className="mt-1 text-xs font-normal text-muted-foreground"><summary className="cursor-pointer">{locale === 'zh-CN' ? '提交历史' : 'Submission history'} ({submissionHistory.length})</summary><ol className="max-h-28 overflow-auto pt-1">{submissionHistory.map((entry, index) => <li key={index} className="border-t py-1 whitespace-pre-wrap">{entry.summary}</li>)}</ol></details>}
         </DialogHeader>

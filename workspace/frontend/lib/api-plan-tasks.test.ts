@@ -3,6 +3,7 @@ import { workspaceApi } from './api';
 
 const task = {
   id: 'task-1', title: '检查部署', description: '部署验收', status: 'backlog',
+  priority: 'urgent',
   plan_item_id: 'plan-1', responsible_user_id: 'member-1', channel_name: 'task:task-1',
   execution_status: 'idle', submission_history: [],
 };
@@ -21,7 +22,7 @@ describe('plan dispatch and member task actions', () => {
     const dispatched = await workspaceApi.dispatchPlanItem('plan-1', ['member-1'], 3);
     const accepted = await workspaceApi.acceptTask(dispatched.tasks[0].id);
 
-    expect(dispatched.tasks[0]).toMatchObject({ responsibleUserId: 'member-1', planItemId: 'plan-1', channelName: 'task:task-1' });
+    expect(dispatched.tasks[0]).toMatchObject({ responsibleUserId: 'member-1', planItemId: 'plan-1', channelName: 'task:task-1', priority: 'urgent' });
     expect(accepted.status).toBe('backlog'); // The mock does not advance state; the client never infers it.
     expect(requests.map(({ url }) => new URL(url).pathname)).toEqual([
       '/v1/workspaces/project-1/plan-items/plan-1/dispatch', '/v1/tasks/task-1/accept',

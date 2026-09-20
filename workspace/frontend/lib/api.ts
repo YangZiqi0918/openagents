@@ -1634,6 +1634,7 @@ export class WorkspaceApi {
       title: (t.title || '') as string,
       description: (t.description || '') as string,
       status: (t.status || 'backlog') as KanbanTask['status'],
+      priority: (t.priority || null) as KanbanTask['priority'],
       assignee: (t.assignee || null) as string | null,
       workflowId: (t.workflow_id || null) as string | null,
       knowledgeIds: (t.knowledge_ids || []) as string[],

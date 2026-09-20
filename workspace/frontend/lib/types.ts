@@ -459,6 +459,7 @@ export interface KanbanTask {
   title: string;
   description: string;
   status: TaskStatus;
+  priority?: 'low' | 'normal' | 'medium' | 'high' | 'urgent' | null;
   assignee: string | null;      // bare agent name; null = unassigned
   workflowId: string | null;    // run via a workflow instead of a single agent
   /** Knowledge-base entries attached as context; kickoff cites them as @knowledge:<slug>. */

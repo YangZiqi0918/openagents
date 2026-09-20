@@ -20,6 +20,14 @@ import {
   Send,
   Settings2,
   X,
+  CalendarDays,
+  CircleDashed,
+  CircleCheck,
+  CircleAlert,
+  CirclePlay,
+  Flag,
+  Tag,
+  UserRound,
 } from 'lucide-react';
 import { useWorkspace } from '@/lib/workspace-context';
 import { useWorkspaceApi } from '@/lib/workspace-api-context';
@@ -36,7 +44,7 @@ import {
   DropdownMenuLabel,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import type { KanbanTask } from '@/lib/types';
+import type { KanbanTask, TeamMember } from '@/lib/types';
 import { useFormatters, useI18n, useT } from '@/lib/i18n';
 import { AttachmentPicker, NewTaskDialog } from './new-task-dialog';
 import { TaskChatPopup } from './task-chat-popup';
@@ -45,8 +53,30 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 
 // ── Card ──────────────────────────────────────────────────────────────────
 
+const chipClass = 'inline-flex min-h-6 max-w-full items-center gap-1 rounded-md border border-border px-1.5 py-0.5 text-[11px] leading-tight text-muted-foreground';
+
+function dateRangeLabel(start: string | null | undefined, due: string | null | undefined, locale: string) {
+  const format = (value: string, year: boolean) => {
+    const date = new Date(`${value}T00:00:00Z`);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value) || Number.isNaN(date.getTime())) return value;
+    return new Intl.DateTimeFormat(locale, { day: 'numeric', month: 'short', ...(year ? { year: 'numeric' } : {}), timeZone: 'UTC' }).format(date);
+  };
+  if (start && due) return `${format(start, true)} – ${format(due, start.slice(0, 4) !== due.slice(0, 4))}`;
+  if (due) return `${locale === 'zh-CN' ? '截止' : 'Due'} ${format(due, true)}`;
+  if (start) return `${locale === 'zh-CN' ? '开始' : 'Start'} ${format(start, true)}`;
+  return null;
+}
+
+function isOverdue(due: string | null | undefined, status: KanbanTask['status']) {
+  if (!due || status === 'done') return false;
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  return /^\d{4}-\d{2}-\d{2}$/.test(due) && due < today;
+}
+
 function TaskCard({
   task,
+  responsibleName,
   onSetAssignee,
   onRun,
   onStop,
@@ -62,6 +92,7 @@ function TaskCard({
   busy,
 }: {
   task: KanbanTask;
+  responsibleName?: string;
   onSetAssignee: (agent: string) => void;
   onRun: () => void;
   onStop: () => void;
@@ -97,6 +128,18 @@ function TaskCard({
   const workflowName = task.workflowId
     ? (workflows.find((w) => w.id === task.workflowId)?.name || t('views.workflows'))
     : '';
+  const dateLabel = dateRangeLabel(task.startDate, task.dueDate, locale);
+  const overdue = isOverdue(task.dueDate, task.status);
+  const priorityLabel = task.priority ? (zh
+    ? { low: '低', normal: '普通', medium: '中', high: '高', urgent: '紧急' }[task.priority]
+    : { low: 'Low', normal: 'Normal', medium: 'Medium', high: 'High', urgent: 'Urgent' }[task.priority]) : null;
+  const statusLabel = task.status === 'done' ? t('tasks.col.done')
+    : needsInput ? (dispatched ? (zh ? '待审核' : 'Awaiting review') : t('tasks.needsInput'))
+      : isRunning ? t('tasks.col.in_progress')
+        : dispatched ? (zh ? '待接收' : 'To accept') : t('tasks.col.backlog');
+  const StatusIcon = task.status === 'done' ? CircleCheck : needsInput ? CircleAlert : isRunning ? CirclePlay : CircleDashed;
+  const visibleTags = (task.tags ?? []).slice(0, 2);
+  const extraTags = Math.max(0, (task.tags?.length ?? 0) - visibleTags.length);
 
   return (
     <div
@@ -119,7 +162,7 @@ function TaskCard({
       )}
 
       <div className="flex items-start justify-between gap-2">
-        <p className="text-sm font-medium leading-snug break-words min-w-0">{task.title}</p>
+        <p className="min-w-0 break-words text-sm font-semibold leading-snug line-clamp-2" title={task.title}>{task.title}</p>
         {canWrite && !dispatched && <div className="flex items-center gap-1.5 shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
           {isBacklog && (
             <button
@@ -140,11 +183,16 @@ function TaskCard({
         </div>}
       </div>
 
-      {needsInput && (
-        <span className="mt-1.5 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-semibold text-rose-600 dark:text-rose-400 bg-rose-500/10">
-          {dispatched ? (zh ? '待管理员审核' : 'Awaiting review') : t('tasks.needsInput')}
-        </span>
-      )}
+      <div className="mt-2 flex flex-wrap items-center gap-1.5" aria-label={zh ? '任务概览' : 'Task overview'}>
+        <span className={chipClass}><StatusIcon className="size-3.5 shrink-0" /><span>{statusLabel}</span></span>
+        {priorityLabel && <span className={chipClass}><Flag className="size-3.5 shrink-0" /><span>{priorityLabel}</span></span>}
+        {dateLabel && <span className={cn(chipClass, overdue && 'border-rose-300 text-rose-700 dark:text-rose-400')} title={dateLabel}><CalendarDays className="size-3.5 shrink-0" /><span className="min-w-0 break-words">{dateLabel}</span></span>}
+        {dispatched && <span className={chipClass} title={responsibleName}><UserRound className="size-3.5 shrink-0" /><span className="max-w-28 truncate">{responsibleName || (zh ? '项目成员' : 'Project member')}</span></span>}
+        {visibleTags.map((tag) => <span key={tag} className={chipClass} title={tag}><Tag className="size-3.5 shrink-0" /><span className="max-w-28 truncate">{tag}</span></span>)}
+        {extraTags > 0 && <span className={chipClass} title={(task.tags ?? []).slice(2).join(', ')}>+{extraTags}</span>}
+        {task.fileIds.length > 0 && <span className={chipClass} title={t('tasks.attachedCount', { count: task.fileIds.length })}><Paperclip className="size-3.5 shrink-0" />{task.fileIds.length}</span>}
+      </div>
+
       {aiNeedsInput && <span className="mt-1.5 ml-1 inline-flex rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">{zh ? '智能体等待输入' : 'AI needs input'}</span>}
       {pendingTransfer && <span className="mt-1.5 inline-flex rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">{zh ? '待接收交接' : 'Transfer pending'}</span>}
       {task.declineReason && <p className="mt-1.5 text-xs text-muted-foreground">{zh ? '拒绝原因：' : 'Declined: '}{task.declineReason}</p>}
@@ -158,12 +206,12 @@ function TaskCard({
       )}
 
       {task.description && (
-        <p className="mt-1 text-xs text-muted-foreground leading-snug line-clamp-3 whitespace-pre-wrap">
+        <p className="mt-1.5 text-xs text-muted-foreground leading-snug line-clamp-2 whitespace-pre-wrap">
           {task.description}
         </p>
       )}
-      {dispatched && task.acceptanceCriteria && <p className="mt-1 text-xs text-muted-foreground">{zh ? '验收标准：' : 'Acceptance: '}{task.acceptanceCriteria}</p>}
-      {dispatched && task.submittedSummary && <p className="mt-2 rounded border border-border bg-muted/40 px-2 py-1.5 text-xs whitespace-pre-wrap">{zh ? '提交结果：' : 'Submission: '}{task.submittedSummary}</p>}
+      {dispatched && task.acceptanceCriteria && <p className="mt-1 line-clamp-2 break-words text-xs text-muted-foreground" title={task.acceptanceCriteria}>{zh ? '验收标准：' : 'Acceptance: '}{task.acceptanceCriteria}</p>}
+      {dispatched && task.submittedSummary && <p className="mt-2 line-clamp-2 break-words rounded border border-border bg-muted/40 px-2 py-1.5 text-xs whitespace-pre-wrap" title={task.submittedSummary}>{zh ? '提交结果：' : 'Submission: '}{task.submittedSummary}</p>}
 
       {/* Workflow progress: “Step 2/3 · Review” + step dots. */}
       {task.workflowId && task.run && task.run.stepCount > 0 && (isRunning || needsInput || task.run.status === 'paused') && (
@@ -175,7 +223,7 @@ function TaskCard({
                 className={cn(
                   'size-1.5 rounded-full',
                   i < task.run!.stepIndex ? 'bg-emerald-500'
-                    : i === task.run!.stepIndex ? (needsInput ? 'bg-rose-500' : 'bg-amber-500 animate-pulse')
+                    : i === task.run!.stepIndex ? (aiNeedsInput ? 'bg-rose-500' : 'bg-amber-500 animate-pulse')
                     : 'bg-muted-foreground/25',
                 )}
               />
@@ -219,14 +267,9 @@ function TaskCard({
             · <BookOpen className="size-3" /> {task.knowledgeIds.length}
           </span>
         )}
-        {task.fileIds.length > 0 && (
-          <span className="inline-flex items-center gap-0.5" title={t('tasks.attachedCount', { count: task.fileIds.length })}>
-            · <Paperclip className="size-3" /> {task.fileIds.length}
-          </span>
-        )}
       </p>
 
-      <div className="mt-1.5 flex items-center gap-2">
+      <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
         {dispatched && pendingTransfer && <button disabled={busy} type="button" onClick={(event) => { event.stopPropagation(); onAcceptTransfer(); }} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-500/10"><Check className="size-3.5" />{zh ? '接收交接' : 'Accept transfer'}</button>}
         {dispatched && isBacklog && canManage && !task.transferUserId && !task.declineReason && <>
           <button disabled={busy} type="button" onClick={(event) => { event.stopPropagation(); onConfigure(); }} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted"><Settings2 className="size-3.5" />{zh ? '配置' : 'Configure'}</button>
@@ -357,8 +400,8 @@ function BoardColumn({
   children: React.ReactNode;
 }) {
   return (
-    <div className={cn('flex flex-col rounded-xl border border-border/60 bg-muted/30 min-h-0', className)}>
-      <div className="flex items-center gap-2 px-3 py-2.5">
+    <div className={cn('flex flex-col rounded-lg border border-border/60 bg-muted/30 xl:h-full xl:min-h-0', className)}>
+      <div className="flex shrink-0 items-center gap-2 px-3 py-2.5">
         <span className={cn('size-2 rounded-full', dotClass)} />
         <h3 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">{title}</h3>
         <span className="text-xs text-muted-foreground/60">{count}</span>
@@ -369,7 +412,16 @@ function BoardColumn({
           </button>
         )}
       </div>
-      <div className="flex-1 overflow-y-auto px-2 pb-2 space-y-2">{children}</div>
+      <div
+        role="region"
+        aria-label={title}
+        tabIndex={count > 0 ? 0 : -1}
+        className={cn(
+          'space-y-2 px-2 pb-2 outline-none focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring',
+          'xl:min-h-0 xl:flex-1 xl:overflow-y-auto xl:[scrollbar-width:thin] xl:[&::-webkit-scrollbar]:w-2 xl:[&::-webkit-scrollbar-thumb]:rounded-full xl:[&::-webkit-scrollbar-thumb]:bg-border',
+          count > 0 && 'xl:[scrollbar-gutter:stable]',
+        )}
+      >{children}</div>
     </div>
   );
 }
@@ -377,12 +429,13 @@ function BoardColumn({
 // ── Board ─────────────────────────────────────────────────────────────────
 
 export function TasksView() {
-  const { tasks, refreshTasks, createTask, updateTask, runTask, stopTask, deleteTask, canWrite = true, workspace } = useWorkspace();
+  const { tasks, refreshTasks, createTask, updateTask, runTask, stopTask, deleteTask, canWrite = true, workspace, me } = useWorkspace();
   const api = useWorkspaceApi();
   const t = useT();
   const { locale } = useI18n();
   const zh = locale === 'zh-CN';
   const projectTaskPool = workspace?.kind === 'project';
+  const [team, setTeam] = useState<TeamMember[]>([]);
 
   const [newTaskOpen, setNewTaskOpen] = useState(false);
   const [editTask, setEditTask] = useState<KanbanTask | null>(null);
@@ -401,6 +454,16 @@ export function TasksView() {
   useEffect(() => {
     refreshTasks();
   }, [refreshTasks]);
+
+  useEffect(() => {
+    if (!projectTaskPool) return;
+    let cancelled = false;
+    setTeam([]);
+    void api.getTeam().then((members) => { if (!cancelled) setTeam(members); }).catch(() => { if (!cancelled) setTeam([]); });
+    return () => { cancelled = true; };
+  }, [api, projectTaskPool, workspace?.workspaceId]);
+
+  const teamById = useMemo(() => new Map(team.map((member) => [member.userId ?? member.id, member])), [team]);
 
   // Deep-link from the Inbox: open the chat popup for the requested task
   // thread once the board has it.
@@ -471,6 +534,10 @@ export function TasksView() {
       <TaskCard
         key={task.id}
         task={task}
+        responsibleName={task.responsibleUserId
+          ? (teamById.get(task.responsibleUserId)?.username || teamById.get(task.responsibleUserId)?.displayName
+            || (task.responsibleUserId === me?.userId ? me.username || me.displayName || me.email : null) || undefined)
+          : undefined}
         onSetAssignee={(agent) => updateTask(task.id, { assignee: agent })}
         onRun={() => { if (task.responsibleUserId) void actOnTask(task, () => runTask(task.id)); else void runTask(task.id); }}
         onStop={() => { if (task.responsibleUserId) void actOnTask(task, () => stopTask(task.id)); else void stopTask(task.id); }}
@@ -510,18 +577,16 @@ export function TasksView() {
       <FeatureTourBanner feature="tasks" />
       {actionError && <p role="alert" className="mx-4 mt-2 rounded border border-destructive/30 px-3 py-2 text-xs text-destructive">{actionError}</p>}
 
-      {/* Board — four equal columns in lifecycle order (Backlog → In Progress →
-          Needs attention → Done). Stacks vertically on mobile with whole-board
-          scroll; on ≥sm each column scrolls within a fixed height. */}
-      <div className="flex-1 min-h-0 overflow-y-auto p-3 sm:overflow-hidden sm:p-4">
-        <div className="flex flex-col gap-3 sm:h-full sm:min-h-0 sm:flex-row">
+      {/* Narrow screens scroll the whole board; desktop columns scroll independently. */}
+      <div className="flex-1 min-h-0 overflow-y-auto p-3 xl:overflow-hidden xl:p-4">
+        <div className="flex flex-col gap-3 xl:h-full xl:min-h-0 xl:flex-row">
           <BoardColumn
             dotClass="bg-zinc-400"
             title={t('tasks.col.backlog')}
             count={backlog.length}
             canAdd={canWrite && !projectTaskPool}
             onAdd={() => setNewTaskOpen(true)}
-            className="sm:flex-1 sm:min-w-0"
+            className="xl:flex-1 xl:min-w-0"
           >
             {/* The primary add affordance: a big, unmissable button that opens
                 the full create dialog (title/description/context/run-with). */}
@@ -542,7 +607,7 @@ export function TasksView() {
             dotClass="bg-amber-500"
             title={t('tasks.col.in_progress')}
             count={inProgress.length}
-            className="sm:flex-1 sm:min-w-0"
+            className="xl:flex-1 xl:min-w-0"
           >
             {inProgress.length === 0 ? (
               <p className="px-1 py-6 text-center text-xs text-muted-foreground/50">{t('tasks.emptyInProgress')}</p>
@@ -551,9 +616,11 @@ export function TasksView() {
 
           <BoardColumn
             dotClass="bg-rose-500"
-            title={projectTaskPool ? (zh ? '需要关注 · 待审核' : 'Attention · awaiting review') : t('tasks.col.need_input')}
+            title={projectTaskPool && !needsAttention.some((task) => !task.responsibleUserId)
+              ? (zh ? '需要关注 · 待审核' : 'Attention · awaiting review')
+              : t('tasks.col.need_input')}
             count={needsAttention.length}
-            className="sm:flex-1 sm:min-w-0"
+            className="xl:flex-1 xl:min-w-0"
           >
             {needsAttention.length === 0 ? (
               <p className="px-1 py-6 text-center text-xs text-muted-foreground/50">{t('tasks.emptyNeedsAttention')}</p>
@@ -564,7 +631,7 @@ export function TasksView() {
             dotClass="bg-emerald-500"
             title={t('tasks.col.done')}
             count={done.length}
-            className="sm:flex-1 sm:min-w-0"
+            className="xl:flex-1 xl:min-w-0"
           >
             {done.length === 0 ? (
               <p className="px-1 py-6 text-center text-xs text-muted-foreground/50">{t('tasks.emptyDone')}</p>
@@ -614,6 +681,8 @@ export function TasksView() {
           onOpenChange={(o) => !o && setChatTask(null)}
           sessionId={liveChatTask.channelName}
           taskTitle={liveChatTask.title}
+          description={liveChatTask.description}
+          acceptanceCriteria={liveChatTask.acceptanceCriteria}
           submissionHistory={liveChatTask.submissionHistory}
           submittedSummary={liveChatTask.submittedSummary}
           assignee={liveChatTask.assignee}
