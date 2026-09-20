@@ -35,7 +35,10 @@ def _state(task: KanbanTask):
         return None
     if task.status == "need_input" and not task.transfer_user_id and not submission.get("review_decision"):
         return "pending"
-    if submission.get("review_decision") in {"approved", "returned"}:
+    if task.transfer_user_id:
+        return None
+    if (submission.get("review_decision") == "approved" and task.status == "done"
+            or submission.get("review_decision") == "returned" and task.status == "in_progress"):
         return "processed"
     return None
 
@@ -45,7 +48,7 @@ def _reviews(db: Session, workspace_id: str, tasks: list[KanbanTask]):
     user_ids = {task.responsible_user_id for task in tasks if task.responsible_user_id}
     user_ids.update(entry.get("reviewed_by_user_id") for task in tasks
                     for entry in (task.submission_history or []) if entry.get("reviewed_by_user_id"))
-    file_ids = {file_id for task in tasks for file_id in (_latest(task) or {}).get("file_ids", [])}
+    file_ids = {file_id for task in tasks for file_id in ((_latest(task) or {}).get("file_ids") or [])}
     plans = {p.id: p for p in db.execute(select(PlanItem).where(
         PlanItem.workspace_id == workspace_id, PlanItem.id.in_(plan_ids),
     )).scalars()} if plan_ids else {}
@@ -76,7 +79,7 @@ def _reviews(db: Session, workspace_id: str, tasks: list[KanbanTask]):
             "channel_name": task.channel_name, "submission_version": len(task.submission_history or []),
             "submission": submission,
             "files": [{"id": f.id, "filename": f.filename, "size": f.size, "content_type": f.content_type}
-                      for file_id in submission.get("file_ids", []) if (f := files.get(file_id))],
+                      for file_id in (submission.get("file_ids") or []) if (f := files.get(file_id))],
             "submission_history": history,
             "activity_history": task.activity_history or [],
         })
@@ -142,12 +145,21 @@ def decide_task_review(workspace_id: str, task_id: str, body: ReviewDecision,
     task.position = _next_position(db, workspace.id, task.status)
     task.execution_status = "done" if body.decision == "approved" else "idle"
     task.active_run_id = None
-    _log_activity(task, "review_approved" if body.decision == "approved" else "review_returned",
-                  actor, submission_version=body.submission_version, comment=comment)
+    event = _log_activity(
+        task, "review_approved" if body.decision == "approved" else "review_returned",
+        actor, db=db, event_category="transition", event_categories=["activity", "transition"],
+        content=comment or None, from_value="need_input", to_value=task.status,
+        submission_version=body.submission_version, comment=comment,
+    )
+    history = list(task.submission_history)
+    history[-1] = {**history[-1], "review_event_id": event.id}
+    task.submission_history = history
     notify(db, workspace.id, source=f"human:{actor.email}",
            title="Task approved" if body.decision == "approved" else "Task returned for changes",
            message=task.title if body.decision == "approved" else f"{task.title}: {comment}",
            channel_name=task.channel_name, recipient_user_id=task.responsible_user_id,
-           reason=REASON_TASK_COMPLETED if body.decision == "approved" else REASON_APPROVAL)
+           reason=REASON_TASK_COMPLETED if body.decision == "approved" else REASON_APPROVAL,
+           link_url=(f"/projects/{workspace.id}?tab=plan&item={task.plan_item_id}"
+                     f"&task={task.id}&view=transition"))
     db.commit()
     return success_response(_reviews(db, workspace.id, [task])[0])

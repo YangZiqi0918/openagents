@@ -368,7 +368,15 @@ def _deliver_step(db, workspace, run: WorkflowRun, step: dict, prev_output: str,
             _ensure_member(db, channel, agent)
         if task is not None:
             if task.responsible_user_id:
+                previous_execution_status = task.execution_status
                 task.execution_status = "running"
+                if previous_execution_status != "running":
+                    from app.routers.tasks import _record_task_event
+                    _record_task_event(
+                        db, str(workspace.id), task, "transition", "execution_status_changed",
+                        source=f"openagents:{agent}", categories=["activity", "transition"],
+                        from_value=previous_execution_status, to_value="running",
+                    )
             else:
                 task.status = "in_progress"
             task.assignee = agent
@@ -385,7 +393,15 @@ def _deliver_step(db, workspace, run: WorkflowRun, step: dict, prev_output: str,
         mention = f"@{human} " if human else ""
         if task is not None:
             if task.responsible_user_id:
+                previous_execution_status = task.execution_status
                 task.execution_status = "need_input"
+                if previous_execution_status != "need_input":
+                    from app.routers.tasks import _record_task_event
+                    _record_task_event(
+                        db, str(workspace.id), task, "transition", "execution_status_changed",
+                        source=WORKFLOW_SOURCE, categories=["activity", "transition"],
+                        from_value=previous_execution_status, to_value="need_input",
+                    )
             else:
                 task.status = "need_input"
         db.flush()
@@ -414,8 +430,16 @@ def _complete(db, workspace, run: WorkflowRun) -> None:
     task = _linked_task(db, str(workspace.id), run.channel_name)
     if task is not None:
         if task.responsible_user_id:
+            previous_execution_status = task.execution_status
             task.execution_status = "done"
             task.active_run_id = None
+            if previous_execution_status != "done":
+                from app.routers.tasks import _record_task_event
+                _record_task_event(
+                    db, str(workspace.id), task, "transition", "execution_status_changed",
+                    source=WORKFLOW_SOURCE, categories=["activity", "transition"],
+                    from_value=previous_execution_status, to_value="done",
+                )
         else:
             task.status = "done"
     db.flush()
@@ -441,7 +465,15 @@ def _stall(db, workspace, run: WorkflowRun) -> None:
     task = _linked_task(db, str(workspace.id), run.channel_name)
     if task is not None:
         if task.responsible_user_id:
+            previous_execution_status = task.execution_status
             task.execution_status = "need_input"
+            if previous_execution_status != "need_input":
+                from app.routers.tasks import _record_task_event
+                _record_task_event(
+                    db, str(workspace.id), task, "transition", "execution_status_changed",
+                    source=WORKFLOW_SOURCE, categories=["activity", "transition"],
+                    from_value=previous_execution_status, to_value="need_input",
+                )
         else:
             task.status = "need_input"
     notify(

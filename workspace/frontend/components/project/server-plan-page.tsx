@@ -10,6 +10,7 @@ import { Input } from '@/components/ui/input';
 import { Dialog, DialogBody, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/responsive-dialog';
 import { PlanRecordDialog } from './plan-record-dialog';
 import { newPlanRecord, readPlanRecords, uniqueTags, type Assignee, type PlanRecord } from './plan-record-model';
+import { TaskDetailSheet, type TaskTimelineView } from './task-detail-sheet';
 
 const humanId = (member: TeamMember) => member.userId ?? member.id ?? '';
 const canReceive = (member: TeamMember) => member.role !== 'viewer' && Boolean(humanId(member));
@@ -48,7 +49,29 @@ function ReadOnlyPlanDetail({ item, onClose, zh }: { item: ProjectPlanItem; onCl
   </Dialog>;
 }
 
-export function ServerPlanPage({ storageKey, focusItemId, canManage }: { storageKey: string; focusItemId?: string; canManage: boolean }) {
+const TIMELINE_VIEWS = new Set<TaskTimelineView>(['all', 'activity', 'comments', 'transition', 'history']);
+
+export function ServerPlanPage({
+  storageKey,
+  focusItemId,
+  focusTaskId,
+  taskView,
+  canManage,
+  canOpenTasks = false,
+  onOpenTask,
+  onCloseTask,
+  onTaskViewChange,
+}: {
+  storageKey: string;
+  focusItemId?: string;
+  focusTaskId?: string;
+  taskView?: string;
+  canManage: boolean;
+  canOpenTasks?: boolean;
+  onOpenTask?: (itemId: string, taskId: string, view?: string) => void;
+  onCloseTask?: () => void;
+  onTaskViewChange?: (view: string) => void;
+}) {
   const api = useWorkspaceApi();
   const { locale } = useI18n();
   const zh = locale === 'zh-CN';
@@ -65,6 +88,8 @@ export function ServerPlanPage({ storageKey, focusItemId, canManage }: { storage
   const [transferReason, setTransferReason] = useState('');
   const [forceTransfer, setForceTransfer] = useState(false);
   const [dispatching, setDispatching] = useState<ProjectPlanItem | null>(null);
+  const [localTask, setLocalTask] = useState<{ itemId: string; taskId: string } | null>(null);
+  const [localTaskView, setLocalTaskView] = useState<TaskTimelineView>('all');
 
   useEffect(() => {
     if (!canManage) {
@@ -206,6 +231,27 @@ export function ServerPlanPage({ storageKey, focusItemId, canManage }: { storage
     catch (reason) { setError(reason instanceof Error ? reason.message : zh ? '操作失败' : 'Action failed'); return false; }
     finally { setBusy(false); }
   };
+  const selectedTaskId = focusTaskId ?? localTask?.taskId;
+  const selectedPlanId = focusTaskId ? focusItemId : localTask?.itemId;
+  const selectedPlan = selectedTaskId && selectedPlanId
+    ? items.find((item) => item.id === selectedPlanId) ?? null
+    : null;
+  const selectedView = TIMELINE_VIEWS.has(taskView as TaskTimelineView)
+    ? taskView as TaskTimelineView
+    : localTaskView;
+  const openTask = (itemId: string, taskId: string) => {
+    if (!canOpenTasks) return;
+    if (onOpenTask) onOpenTask(itemId, taskId, 'all');
+    else { setLocalTaskView('all'); setLocalTask({ itemId, taskId }); }
+  };
+  const closeTask = () => {
+    if (onCloseTask) onCloseTask();
+    else setLocalTask(null);
+  };
+  const changeTaskView = (view: TaskTimelineView) => {
+    if (onTaskViewChange) onTaskViewChange(view);
+    else setLocalTaskView(view);
+  };
 
   return (
     <div data-testid="project-plan-page" className="flex min-h-0 flex-1 flex-col bg-background px-5 pb-8 pt-5 sm:px-8 lg:px-10">
@@ -228,7 +274,10 @@ export function ServerPlanPage({ storageKey, focusItemId, canManage }: { storage
                 const changed = item.tasks.filter((task) => task.sourceVersion < item.version && (task.status === 'backlog' || task.status === 'in_progress'));
                 return <tr key={item.id} id={`plan-${item.id}`} data-testid="server-plan-item" className={`border-b border-border align-top last:border-0 ${focusItemId === item.id ? 'bg-amber-500/10' : ''}`}>
                   <td className="px-4 py-3"><button type="button" className="text-left font-medium hover:underline focus-visible:outline-2 focus-visible:outline-ring" onClick={() => canManage ? setEditing(item) : setViewing(item)}>{item.title}</button>{item.tasks.length > 0 && <span className="ml-2 text-xs text-muted-foreground">{item.tasks.filter((task) => task.status === 'done').length}/{item.tasks.length} · {item.tasks.some((task) => task.status === 'need_input') ? (zh ? '待审核' : 'Awaiting review') : item.status === 'doing' ? (zh ? '进行中' : 'In progress') : item.status === 'done' ? (zh ? '已完成' : 'Done') : (zh ? '待接收' : 'To accept')}</span>}<p className="mt-1 line-clamp-2 max-w-xl text-xs text-muted-foreground">{item.description}</p>{item.acceptanceCriteria && <p className="mt-1 text-xs text-muted-foreground">{zh ? '验收：' : 'Acceptance: '}{item.acceptanceCriteria}</p>}</td>
-                  <td className="px-4 py-3"><div className="space-y-1.5">{item.tasks.map((task) => <div key={task.id} className="flex items-center justify-between gap-2 text-xs"><span className="truncate">{task.responsibleName || team.find((member) => humanId(member) === task.responsibleUserId)?.displayName || task.responsibleUserId}</span><div className="flex shrink-0 items-center gap-1"><span className={task.status === 'need_input' ? 'font-semibold text-rose-600' : 'text-muted-foreground'}>{task.transferUserId ? (zh ? '交接中' : 'Transfer pending') : task.declineReason ? (zh ? '已拒绝' : 'Declined') : planTaskStatus(task.status, zh)}</span>{canManage && task.status !== 'done' && !task.transferUserId && <button type="button" className="rounded p-1 text-muted-foreground hover:text-foreground" title={zh ? '交接' : 'Transfer'} aria-label={`${zh ? '交接' : 'Transfer'} ${task.responsibleName || task.id}`} onClick={() => { setTransfer({ taskId: task.id, ownerId: task.responsibleUserId ?? '' }); setTransferUserId(''); setTransferReason(''); setForceTransfer(false); }}><ArrowRightLeft className="size-3.5" /></button>}</div></div>)}{!item.tasks.length && <span className="text-xs text-muted-foreground">{zh ? '尚未派发' : 'Not dispatched'}</span>}</div></td>
+                  <td className="px-4 py-3"><div className="space-y-1.5">{item.tasks.map((task) => {
+                    const responsible = task.responsibleName || team.find((member) => humanId(member) === task.responsibleUserId)?.displayName || task.responsibleUserId || '—';
+                    return <div key={task.id} className="flex items-center justify-between gap-2 text-xs">{canOpenTasks ? <button type="button" className="min-w-0 truncate rounded-sm text-left font-medium hover:underline focus-visible:outline-2 focus-visible:outline-ring" title={zh ? `查看 ${responsible} 的任务详情` : `View ${responsible}'s task details`} onClick={() => openTask(item.id, task.id)}>{responsible}</button> : <span className="min-w-0 truncate">{responsible}</span>}<div className="flex shrink-0 items-center gap-1"><span className={task.status === 'need_input' ? 'font-semibold text-rose-600' : 'text-muted-foreground'}>{task.transferUserId ? (zh ? '交接中' : 'Transfer pending') : task.declineReason ? (zh ? '已拒绝' : 'Declined') : planTaskStatus(task.status, zh)}</span>{canManage && task.status !== 'done' && !task.transferUserId && <button type="button" className="rounded p-1 text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring" title={zh ? '交接' : 'Transfer'} aria-label={`${zh ? '交接' : 'Transfer'} ${task.responsibleName || task.id}`} onClick={() => { setTransfer({ taskId: task.id, ownerId: task.responsibleUserId ?? '' }); setTransferUserId(''); setTransferReason(''); setForceTransfer(false); }}><ArrowRightLeft className="size-3.5" /></button>}</div></div>;
+                  })}{!item.tasks.length && <span className="text-xs text-muted-foreground">{zh ? '尚未派发' : 'Not dispatched'}</span>}</div></td>
                   {canManage && <td className="space-y-1 px-4 py-3 text-right"><div className="flex flex-wrap justify-end gap-1"><Button size="sm" variant="outline" disabled={busy || !pendingMembers.length} onClick={() => setDispatching(item)}><Send className="size-3.5" />{zh ? '派发' : 'Dispatch'}{pendingMembers.length ? ` (${pendingMembers.length})` : ''}</Button><Button size="sm" variant="ghost" disabled={busy || !changed.length} title={zh ? '向执行中的任务发布更改' : 'Publish changes to active tasks'} onClick={() => void change(() => api.publishPlanItem(item.id, changed.map((task) => task.id), item.version))}><Check className="size-3.5" />{zh ? '发布变更' : 'Publish changes'}</Button>{!item.tasks.length && <Button size="sm" variant="ghost" mode="icon" disabled={busy} title={zh ? '删除计划项' : 'Delete plan item'} aria-label={`${zh ? '删除' : 'Delete'} ${item.title}`} onClick={() => { if (window.confirm(zh ? `删除“${item.title}”？` : `Delete “${item.title}”?`)) void change(() => api.deletePlanItem(item.id)); }}><Trash2 className="size-3.5" /></Button>}</div></td>}
                 </tr>;
               })}
@@ -241,6 +290,7 @@ export function ServerPlanPage({ storageKey, focusItemId, canManage }: { storage
       {canManage && <><Dialog open={Boolean(dispatching)} onOpenChange={(open) => !open && setDispatching(null)}><DialogContent><DialogHeader><DialogTitle>{zh ? '派发任务' : 'Dispatch tasks'}</DialogTitle><DialogDescription>{zh ? '按计划中的处理人为每名成员创建独立任务；派发不会启动智能体。' : 'Create one independent task per assignee. AI will not start automatically.'}</DialogDescription></DialogHeader><DialogFooter><Button variant="outline" onClick={() => setDispatching(null)}>{zh ? '取消' : 'Cancel'}</Button><Button disabled={busy} onClick={() => dispatching && void dispatch(dispatching)}>{zh ? '确认派发' : 'Dispatch'}</Button></DialogFooter></DialogContent></Dialog>
       <Dialog open={Boolean(importPreview)} onOpenChange={(open) => !open && setImportPreview(null)}><DialogContent><DialogHeader><DialogTitle>{zh ? '导入本地计划草稿' : 'Import local plan drafts'}</DialogTitle><DialogDescription>{zh ? `找到 ${importPreview?.length ?? 0} 条尚未导入的记录。请确认后导入；旧记录保留，智能体处理人不自动派发。` : `Found ${importPreview?.length ?? 0} records not imported yet. Original data remains; agent assignees are not dispatched.`}</DialogDescription></DialogHeader><div className="max-h-48 overflow-auto text-sm">{importPreview?.map((record) => <p key={record.id} className="border-b px-1 py-1.5">{record.title}</p>)}</div><DialogFooter><Button variant="outline" onClick={() => setImportPreview(null)}>{zh ? '取消' : 'Cancel'}</Button><Button disabled={busy || !importPreview?.length} onClick={() => void importOldPlan()}>{zh ? '导入为草稿' : 'Import as drafts'}</Button></DialogFooter></DialogContent></Dialog>
       <Dialog open={Boolean(transfer)} onOpenChange={(open) => !open && setTransfer(null)}><DialogContent><DialogHeader><DialogTitle>{zh ? '交接任务' : 'Transfer task'}</DialogTitle><DialogDescription>{zh ? '接手人确认后，原任务及历史进入其待办池。' : 'After acceptance, the existing task and history move to the new owner’s pool.'}</DialogDescription></DialogHeader><div className="space-y-3"><label className="block space-y-1 text-xs font-medium">{zh ? '接手成员' : 'New owner'}<select className="block h-9 w-full rounded-md border border-input bg-background px-2 text-sm" value={transferUserId} onChange={(event) => setTransferUserId(event.target.value)}><option value="">{zh ? '选择成员' : 'Select member'}</option>{team.filter((member) => canReceive(member) && humanId(member) !== transfer?.ownerId).map((member) => <option key={humanId(member)} value={humanId(member)}>{member.username || member.displayName || member.email}</option>)}</select></label><label className="block space-y-1 text-xs font-medium">{zh ? '交接原因' : 'Reason'}<Input value={transferReason} onChange={(event) => setTransferReason(event.target.value)} /></label>{transfer && !team.some((member) => humanId(member) === transfer.ownerId) && <label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={forceTransfer} onChange={(event) => setForceTransfer(event.target.checked)} />{zh ? '原负责人已离组，强制交接' : 'Original owner left; force transfer'}</label>}</div><DialogFooter><Button variant="outline" onClick={() => setTransfer(null)}>{zh ? '取消' : 'Cancel'}</Button><Button disabled={busy || !transferUserId || !transferReason.trim()} onClick={() => { if (!transfer) return; void change(() => api.transferTask(transfer.taskId, transferUserId, transferReason.trim(), forceTransfer)).then((saved) => { if (saved) setTransfer(null); }); }}>{zh ? '发起交接' : 'Start transfer'}</Button></DialogFooter></DialogContent></Dialog></>}
+      {canOpenTasks && selectedTaskId && selectedPlan && <TaskDetailSheet taskId={selectedTaskId} planItem={selectedPlan} open canManage={canManage} initialView={selectedView} onViewChange={changeTaskView} onOpenChange={(open) => { if (!open) closeTask(); }} onChanged={() => void reload()} />}
     </div>
   );
 }

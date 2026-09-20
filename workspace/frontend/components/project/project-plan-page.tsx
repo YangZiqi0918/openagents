@@ -57,21 +57,27 @@ interface ProjectPlanPageProps {
   storageKey?: string;
   workspaceModulesAvailable?: boolean;
   focusItemId?: string;
+  focusTaskId?: string;
+  taskView?: string;
+  onOpenTask?: (itemId: string, taskId: string, view?: string) => void;
+  onCloseTask?: () => void;
+  onTaskViewChange?: (view: string) => void;
 }
 
-export function ProjectPlanPage({ projectId, storageKey, workspaceModulesAvailable = true, focusItemId }: ProjectPlanPageProps) {
+export function ProjectPlanPage({ projectId, storageKey, workspaceModulesAvailable = true, focusItemId, focusTaskId, taskView, onOpenTask, onCloseTask, onTaskViewChange }: ProjectPlanPageProps) {
   if (workspaceModulesAvailable)
-    return <ConnectedPlan key={storageKey ?? projectId} projectId={projectId} storageKey={storageKey} focusItemId={focusItemId} />;
+    return <ConnectedPlan key={storageKey ?? projectId} projectId={projectId} storageKey={storageKey} focusItemId={focusItemId} focusTaskId={focusTaskId} taskView={taskView} onOpenTask={onOpenTask} onCloseTask={onCloseTask} onTaskViewChange={onTaskViewChange} />;
   const key = storageKey ?? `oa:projects:preview:plan:${projectId}:v1`;
   return <PlanTable key={key} storageKey={key} members={EMPTY_MEMBERS} />;
 }
 
-function ConnectedPlan({ projectId, storageKey, focusItemId }: ProjectPlanPageProps) {
+function ConnectedPlan({ projectId, storageKey, focusItemId, focusTaskId, taskView, onOpenTask, onCloseTask, onTaskViewChange }: ProjectPlanPageProps) {
   const { workspace, me } = useWorkspace();
   const workspaceId = workspace?.workspaceId;
   const key = storageKey ?? `oa:projects:workspace:${workspaceId ?? 'local'}:plan:${projectId}:v1`;
   const canManage = me?.role === 'owner' || me?.role === 'admin';
-  return <ServerPlanPage key={key} storageKey={key} focusItemId={focusItemId} canManage={canManage} />;
+  const canOpenTasks = Boolean(me && me.role !== 'viewer');
+  return <ServerPlanPage key={key} storageKey={key} focusItemId={focusItemId} focusTaskId={focusTaskId} taskView={taskView} canManage={canManage} canOpenTasks={canOpenTasks} onOpenTask={onOpenTask} onCloseTask={onCloseTask} onTaskViewChange={onTaskViewChange} />;
 }
 
 function EditableText({

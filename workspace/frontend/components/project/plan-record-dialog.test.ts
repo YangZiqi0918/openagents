@@ -57,6 +57,13 @@ async function fill(name: string, value: string) {
     element.dispatchEvent(new Event('input', { bubbles: true }));
   });
 }
+async function fillTextarea(name: string, value: string) {
+  await act(() => {
+    const element = label<HTMLTextAreaElement>(name);
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(element, value);
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+}
 async function files(...names: string[]) {
   await act(() => {
     const input = label<HTMLInputElement>('添加附件');
@@ -121,6 +128,63 @@ describe('Plan record dialog', () => {
     await click(button('取消'));
     await click(button('放弃修改'));
     expect(close).toHaveBeenCalledOnce();
+    expect(save).not.toHaveBeenCalled();
+  });
+  it('formats both Markdown fields, restores their selections and saves the controlled draft', async () => {
+    await render();
+    await fill('标题', '发布计划');
+    await fillTextarea('描述', '发布版本');
+    const description = label<HTMLTextAreaElement>('描述');
+    await act(() => {
+      description.focus();
+      description.setSelectionRange(0, 2);
+    });
+    await click(label('描述：加粗'));
+    expect(description.value).toBe('**发布**版本');
+    expect(document.activeElement).toBe(description);
+    expect([description.selectionStart, description.selectionEnd]).toEqual([2, 4]);
+
+    await fillTextarea('验收标准', '完成测试\n发布报告');
+    const acceptanceCriteria = label<HTMLTextAreaElement>('验收标准');
+    await act(() => {
+      acceptanceCriteria.focus();
+      acceptanceCriteria.setSelectionRange(0, acceptanceCriteria.value.length);
+    });
+    await click(label('验收标准：任务列表'));
+    expect(acceptanceCriteria.value).toBe('- [ ] 完成测试\n- [ ] 发布报告');
+    expect(document.activeElement).toBe(acceptanceCriteria);
+    expect(save).not.toHaveBeenCalled();
+
+    await click(button('创建'));
+    expect(save).toHaveBeenCalledWith(
+      expect.objectContaining({
+        description: '**发布**版本',
+        acceptanceCriteria: '- [ ] 完成测试\n- [ ] 发布报告',
+      }),
+    );
+  });
+  it('offers every supported Markdown action and inserts link and code syntax without submitting', async () => {
+    await render();
+    const description = label<HTMLTextAreaElement>('描述');
+    const toolbar = label<HTMLElement>('描述 Markdown 工具栏');
+    expect(toolbar.getAttribute('aria-controls')).toBe(description.id);
+    for (const action of ['加粗', '斜体', '删除线', '无序列表', '有序列表', '任务列表', '引用', '行内代码', '代码块', '链接']) {
+      expect(label(`描述：${action}`)).toBeDefined();
+    }
+
+    await fillTextarea('描述', 'API');
+    await act(() => {
+      description.focus();
+      description.setSelectionRange(0, description.value.length);
+    });
+    const linkButton = label('描述：链接');
+    await act(() => linkButton.focus());
+    expect(document.activeElement).toBe(linkButton);
+    await click(linkButton);
+    expect(description.value).toBe('[API](https://)');
+    expect(description.value).not.toContain('<');
+    expect(description.value.slice(description.selectionStart, description.selectionEnd)).toBe('https://');
+    expect(document.activeElement).toBe(description);
     expect(save).not.toHaveBeenCalled();
   });
   it('confirms dirty Escape and does not close when the overlay is clicked', async () => {

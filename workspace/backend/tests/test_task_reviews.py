@@ -55,6 +55,10 @@ def test_approve_is_admin_only_and_closes_the_task(client, db):
     assert pending[0]["submission_version"] == 1
     assert pending[0]["acceptance_criteria"] == "Provide test report"
     assert pending[0]["plan_title"] == "Release"
+    submitted_notice = db.execute(select(NotificationRecord).where(
+        NotificationRecord.workspace_id == project, NotificationRecord.title == "Task awaiting review",
+    )).scalar_one()
+    assert submitted_notice.link_url == f"/projects/{project}?tab=review&task={task_id}"
     assert review(client, project, task_id, admin_headers, 2, "approved").status_code == 409
     accepted = review(client, project, task_id, admin_headers, 1, "approved", "Matches criteria")
     assert accepted.status_code == 200, accepted.text
@@ -70,6 +74,27 @@ def test_approve_is_admin_only_and_closes_the_task(client, db):
                                                         NotificationRecord.title == "Task approved")).scalar_one()
     plan = client.get(f"/v1/workspaces/{project}/plan-items", headers=admin_headers).json()["data"]["items"][0]
     assert plan["status"] == "done"
+
+
+def test_admin_can_review_own_task_and_legacy_cards_are_excluded(client, db):
+    project, _, (admin, admin_headers), _, _ = setup_task(client, db)
+    plan = client.get(f"/v1/workspaces/{project}/plan-items", headers=admin_headers).json()["data"]["items"][0]
+    own = client.post(f"/v1/workspaces/{project}/plan-items/{plan['id']}/dispatch", headers=admin_headers,
+                      json={"version": plan["version"], "userIds": [admin["id"]]}).json()["data"]["tasks"][0]
+    path = f"/v1/tasks/{own['id']}"
+    assert client.post(f"{path}/accept", headers=admin_headers, json={"network": project}).status_code == 200
+    assert client.post(f"{path}/submit", headers=admin_headers,
+                       json={"network": project, "summary": "Ready"}).status_code == 200
+    legacy = client.post("/v1/tasks", headers=admin_headers,
+                         json={"network": project, "title": "Unassigned task", "status": "need_input"})
+    assert legacy.status_code == 200
+    pending = client.get(f"/v1/workspaces/{project}/task-reviews", headers=admin_headers).json()["data"]["items"]
+    assert own["id"] in {entry["task_id"] for entry in pending}
+    assert legacy.json()["data"]["id"] not in {entry["task_id"] for entry in pending}
+    result = review(client, project, own["id"], admin_headers, 1, "approved")
+    assert result.status_code == 200
+    submission = result.json()["data"]["submission"]
+    assert submission["user_id"] == submission["reviewed_by_user_id"] == admin["id"]
 
 
 def test_return_requires_reason_then_new_submission_and_new_review(client, db):
@@ -101,6 +126,7 @@ def test_handoff_blocks_review_and_preserves_unreviewed_submission(client, db):
                        json={"network": project}).status_code == 200
     assert db.get(KanbanTask, task_id).submission_history[0]["summary"] == "Test report ready"
     assert review(client, project, task_id, admin_headers, 1, "approved").status_code == 409
+    assert client.get(f"/v1/workspaces/{project}/task-reviews?state=processed", headers=admin_headers).json()["data"]["items"] == []
     assert client.get(f"/v1/tasks/{task_id}", headers=member_headers, params={"network": project}).status_code == 200
 
 

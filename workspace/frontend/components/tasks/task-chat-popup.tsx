@@ -16,7 +16,7 @@ import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { toast } from 'sonner';
 import { AgentAvatar } from '@/components/agents/agent-avatar';
 import { useI18n } from '@/lib/i18n';
-import type { KanbanTask, WorkspaceMessage } from '@/lib/types';
+import type { KanbanTask, TaskSubmissionHistoryEntry, WorkspaceMessage } from '@/lib/types';
 import { eventToMessage } from '@/lib/types';
 import { mergeMessages } from '@/lib/message-merge';
 import { projectWaitingState, visibleProjectMessages } from '@/components/project/project-waiting-state';
@@ -35,7 +35,7 @@ interface TaskChatPopupProps {
   /** Optional status line under the title, e.g. workflow step progress. */
   subtitle?: string;
   submittedSummary?: string | null;
-  submissionHistory?: Array<{ summary: string; submittedAt?: string; submittedBy?: string }>;
+  submissionHistory?: TaskSubmissionHistoryEntry[];
 }
 
 type TaskChannelDetail = { participants: string[]; workflowRunning: boolean; activeWorkflowStepAgent: string | null };

@@ -50,4 +50,46 @@ describe('plan dispatch and member task actions', () => {
     expect(requests[1].body).toMatchObject({ summary: '完成部署验证' });
     expect(submitted).toMatchObject({ status: 'need_input', submittedSummary: '完成部署验证' });
   });
+
+  it('maps task detail history and uses the dedicated timeline and comment endpoints', async () => {
+    const requests: Array<{ url: string; method: string; body?: Record<string, unknown> }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      requests.push({ url, method: init?.method || 'GET', body: init?.body ? JSON.parse(init.body as string) : undefined });
+      if (url.includes('/timeline')) return { ok: true, json: async () => ({ data: { items: [{
+        id: 'event-1', categories: ['transition'], kind: 'workspace.task.transition',
+        actor: { type: 'system', id: null, name: 'System' }, content: null, attachments: [], changes: [],
+        from: 'backlog', to: 'in_progress', createdAt: '2026-09-20T08:00:00Z',
+      }], nextCursor: 'next-page' } }) };
+      if (url.endsWith('/comments')) return { ok: true, json: async () => ({ data: {
+        id: 'comment-1', categories: ['comments'], kind: 'comment', actor: { type: 'human', id: 'member-1', name: 'Member' },
+        content: '请复查', attachments: [{ id: 'file-1', filename: 'proof.png', contentType: 'image/png', size: 12 }], changes: [], from: null, to: null, createdAt: '2026-09-20T08:01:00Z',
+      } }) };
+      return { ok: true, json: async () => ({ data: {
+        ...task,
+        attachments: [{ id: 'file-1', filename: 'proof.png', content_type: 'image/png', size: 12 }],
+        submission_history: [{ summary: '完成', file_ids: ['file-1'], submitted_at: '2026-09-20T08:00:00Z', user_id: 'member-1' }],
+        activity_history: [{ action: 'accepted', actor_user_id: 'member-1', at: '2026-09-20T07:00:00Z' }],
+      } }) };
+    }));
+    workspaceApi.configure('project-1', 'test-token');
+
+    const detail = await workspaceApi.getTask('task-1');
+    const timeline = await workspaceApi.getTaskTimeline('task-1', { category: 'transition', actorType: 'system', sort: 'asc', limit: 25 });
+    const comment = await workspaceApi.addTaskComment('task-1', '请复查', ['file-1']);
+    await workspaceApi.reviewTask('task-1', 2, 'request_changes', '补充截图');
+
+    expect(detail).toMatchObject({
+      attachments: [{ id: 'file-1', contentType: 'image/png' }],
+      submissionHistory: [{ fileIds: ['file-1'], submittedAt: '2026-09-20T08:00:00Z', submittedBy: 'member-1' }],
+      activityHistory: [{ action: 'accepted', actorUserId: 'member-1' }],
+    });
+    expect(timeline).toMatchObject({ items: [{ id: 'event-1', from: 'backlog', to: 'in_progress' }], nextCursor: 'next-page' });
+    expect(comment).toMatchObject({ id: 'comment-1', attachments: [{ contentType: 'image/png' }] });
+    const timelineUrl = new URL(requests[1].url);
+    expect(Object.fromEntries(timelineUrl.searchParams)).toMatchObject({ network: 'project-1', category: 'transition', actorType: 'system', sort: 'asc', limit: '25' });
+    expect(requests[2]).toMatchObject({ method: 'POST', body: { network: 'project-1', content: '请复查', fileIds: ['file-1'] } });
+    expect(requests[3]).toMatchObject({ method: 'POST', body: {
+      network: 'project-1', submissionVersion: 2, decision: 'request_changes', note: '补充截图',
+    } });
+  });
 });

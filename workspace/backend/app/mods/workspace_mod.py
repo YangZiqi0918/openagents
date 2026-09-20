@@ -1405,9 +1405,16 @@ def _handle_task_thread_progress(event: Event, channel, content: str, db, worksp
             new_status = _classify_task_progress(task, content, db, workspace)
             execution_status = "running" if new_status == "in_progress" else new_status
             if execution_status != task.execution_status:
+                previous_execution_status = task.execution_status
                 task.execution_status = execution_status
                 if new_status == "done":
                     task.active_run_id = None
+                from app.routers.tasks import _record_task_event
+                _record_task_event(
+                    db, str(workspace.id), task, "transition", "execution_status_changed",
+                    source=source, categories=["activity", "transition"],
+                    from_value=previous_execution_status, to_value=execution_status,
+                )
                 if new_status in ("need_input", "done"):
                     from app.services.notify import REASON_APPROVAL, REASON_TASK_COMPLETED, notify
                     notify(
@@ -1422,7 +1429,14 @@ def _handle_task_thread_progress(event: Event, channel, content: str, db, worksp
             from app.models import User
             owner_email = db.execute(select(User.email).where(User.id == task.responsible_user_id)).scalar_one_or_none()
             if owner_email and source[len("human:"):].lower() == owner_email.lower():
+                previous_execution_status = task.execution_status
                 task.execution_status = "running"
+                from app.routers.tasks import _record_task_event
+                _record_task_event(
+                    db, str(workspace.id), task, "transition", "execution_status_changed",
+                    source=source, categories=["activity", "transition"],
+                    from_value=previous_execution_status, to_value="running",
+                )
         return
 
     if source.startswith("openagents:"):

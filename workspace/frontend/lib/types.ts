@@ -454,6 +454,66 @@ export interface TaskRunInfo {
   maxIterations: number;
 }
 
+export interface TaskAttachment {
+  id: string;
+  filename: string;
+  contentType: string;
+  size: number;
+}
+
+export interface TaskSubmissionHistoryEntry {
+  summary: string;
+  fileIds: string[];
+  submittedAt: string | null;
+  submittedBy: string | null;
+  reviewDecision?: 'approved' | 'returned' | null;
+  reviewComment?: string | null;
+  reviewedAt?: string | null;
+  reviewedByUserId?: string | null;
+}
+
+export interface TaskActivityHistoryEntry {
+  action: string;
+  actorUserId: string | null;
+  at: string | null;
+  reason?: string | null;
+  comment?: string | null;
+  [key: string]: unknown;
+}
+
+export type TaskTimelineView = 'all' | 'activity' | 'comments' | 'transition' | 'history';
+export type TaskTimelineActorType = 'human' | 'agent' | 'system';
+
+export interface TaskTimelineActor {
+  type: TaskTimelineActorType;
+  id: string | null;
+  name: string;
+}
+
+export interface TaskTimelineChange {
+  field: string;
+  from: unknown;
+  to: unknown;
+}
+
+export interface TaskTimelineItem {
+  id: string;
+  categories: Exclude<TaskTimelineView, 'all'>[];
+  kind: string;
+  actor: TaskTimelineActor;
+  content: string | null;
+  attachments: TaskAttachment[];
+  changes: TaskTimelineChange[];
+  from: unknown;
+  to: unknown;
+  createdAt: string;
+}
+
+export interface TaskTimelinePage {
+  items: TaskTimelineItem[];
+  nextCursor: string | null;
+}
+
 export interface KanbanTask {
   id: string;
   title: string;
@@ -466,6 +526,8 @@ export interface KanbanTask {
   knowledgeIds: string[];
   /** Workspace files attached; delivered as attachments on the kickoff. */
   fileIds: string[];
+  /** Resolved metadata for `fileIds`, available on project task detail reads. */
+  attachments?: TaskAttachment[];
   createdBy: string;
   channelName: string | null;   // the hidden `task:<id>` working thread, once assigned
   position: number;
@@ -482,7 +544,8 @@ export interface KanbanTask {
   executionStatus?: string | null;
   activeRunId?: string | null;
   submittedSummary?: string | null;
-  submissionHistory?: Array<{ summary: string; fileIds?: string[]; submittedAt?: string; submittedBy?: string }>;
+  submissionHistory?: TaskSubmissionHistoryEntry[];
+  activityHistory?: TaskActivityHistoryEntry[];
   transferUserId?: string | null;
   transferReason?: string | null;
   declineReason?: string | null;

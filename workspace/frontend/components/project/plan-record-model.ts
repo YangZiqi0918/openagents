@@ -65,6 +65,7 @@ function normalizeRecord(value: unknown): PlanRecord {
   const row = value as Record<string, unknown>;
   const assignees = 'assignees' in row ? row.assignees : row.assignee === null ? [] : [row.assignee];
   const description = row.description === undefined ? '' : row.description;
+  const acceptanceCriteria = row.acceptanceCriteria === undefined ? '' : row.acceptanceCriteria;
   const startDate = row.startDate === undefined ? null : row.startDate;
   const dueDate = row.dueDate === undefined ? null : row.dueDate;
   const attachments = row.attachments === undefined ? [] : row.attachments;
@@ -74,6 +75,7 @@ function normalizeRecord(value: unknown): PlanRecord {
     typeof row.title !== 'string' ||
     !row.title.trim() ||
     typeof description !== 'string' ||
+    typeof acceptanceCriteria !== 'string' ||
     !STATUSES.includes(row.status as Status) ||
     !PRIORITIES.includes(row.priority as Priority) ||
     !Array.isArray(row.tags) ||
@@ -102,6 +104,7 @@ function normalizeRecord(value: unknown): PlanRecord {
     id: row.id,
     title: row.title,
     description,
+    acceptanceCriteria,
     status: row.status as Status,
     assignees: assignees.filter((member, index) => assignees.findIndex((other) => other.id === member.id) === index),
     priority: row.priority as Priority,

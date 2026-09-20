@@ -1686,6 +1686,24 @@ export class WorkspaceApi {
   }
 
   private mapTask(t: Record<string, unknown>): KanbanTask {
+    const submissionHistory = ((t.submission_history || []) as Array<Record<string, unknown>>).map((entry) => ({
+      summary: String(entry.summary || ''),
+      fileIds: (entry.file_ids || entry.fileIds || []) as string[],
+      submittedAt: (entry.submitted_at || entry.submittedAt || null) as string | null,
+      submittedBy: (entry.user_id || entry.submitted_by || entry.submittedBy || null) as string | null,
+      reviewDecision: (entry.review_decision || entry.reviewDecision || null) as 'approved' | 'returned' | null,
+      reviewComment: (entry.review_comment || entry.reviewComment || null) as string | null,
+      reviewedAt: (entry.reviewed_at || entry.reviewedAt || null) as string | null,
+      reviewedByUserId: (entry.reviewed_by_user_id || entry.reviewedByUserId || null) as string | null,
+    }));
+    const activityHistory = ((t.activity_history || []) as Array<Record<string, unknown>>).map((entry) => ({
+      ...entry,
+      action: String(entry.action || ''),
+      actorUserId: (entry.actor_user_id || entry.actorUserId || null) as string | null,
+      at: (entry.at || null) as string | null,
+      reason: (entry.reason || null) as string | null,
+      comment: (entry.comment || null) as string | null,
+    }));
     return {
       id: t.id as string,
       title: (t.title || '') as string,
@@ -1696,6 +1714,12 @@ export class WorkspaceApi {
       workflowId: (t.workflow_id || null) as string | null,
       knowledgeIds: (t.knowledge_ids || []) as string[],
       fileIds: (t.file_ids || []) as string[],
+      attachments: ((t.attachments || []) as Array<Record<string, unknown>>).map((file) => ({
+        id: file.id as string,
+        filename: (file.filename || '') as string,
+        contentType: (file.content_type || file.contentType || 'application/octet-stream') as string,
+        size: (file.size || 0) as number,
+      })),
       createdBy: (t.created_by || '') as string,
       channelName: (t.channel_name || null) as string | null,
       position: (t.position || 0) as number,
@@ -1709,7 +1733,8 @@ export class WorkspaceApi {
       executionStatus: (t.execution_status || null) as string | null,
       activeRunId: (t.active_run_id || null) as string | null,
       submittedSummary: (t.submitted_summary || null) as string | null,
-      submissionHistory: (t.submission_history || []) as KanbanTask['submissionHistory'],
+      submissionHistory,
+      activityHistory,
       transferUserId: (t.transfer_user_id || null) as string | null,
       transferReason: (t.transfer_reason || null) as string | null,
       declineReason: (t.decline_reason || null) as string | null,
@@ -1729,6 +1754,75 @@ export class WorkspaceApi {
   async getTask(id: string): Promise<KanbanTask> {
     const params = new URLSearchParams({ network: this.workspaceId });
     return this.mapTask(await this.request<Record<string, unknown>>(`/v1/tasks/${encodeURIComponent(id)}?${params}`));
+  }
+
+  private mapTaskTimelineItem(raw: Record<string, unknown>): import('./types').TaskTimelineItem {
+    const actor = (raw.actor || {}) as Record<string, unknown>;
+    return {
+      id: String(raw.id || ''),
+      categories: (raw.categories || []) as import('./types').TaskTimelineItem['categories'],
+      kind: String(raw.kind || 'activity'),
+      actor: {
+        type: (actor.type || 'system') as import('./types').TaskTimelineActorType,
+        id: (actor.id || null) as string | null,
+        name: String(actor.name || (actor.type === 'human' ? 'Member' : actor.type === 'agent' ? 'Agent' : 'System')),
+      },
+      content: (raw.content ?? null) as string | null,
+      attachments: ((raw.attachments || []) as Array<Record<string, unknown>>).map((file) => ({
+        id: file.id as string,
+        filename: String(file.filename || ''),
+        contentType: String(file.contentType || file.content_type || 'application/octet-stream'),
+        size: Number(file.size || 0),
+      })),
+      changes: ((raw.changes || []) as Array<Record<string, unknown>>).map((change) => ({
+        field: String(change.field || ''),
+        from: change.from ?? null,
+        to: change.to ?? null,
+      })),
+      from: raw.from ?? null,
+      to: raw.to ?? null,
+      createdAt: String(raw.createdAt || raw.created_at || ''),
+    };
+  }
+
+  async getTaskTimeline(id: string, options: {
+    category?: import('./types').TaskTimelineView;
+    actorType?: import('./types').TaskTimelineActorType;
+    sort?: 'asc' | 'desc';
+    cursor?: string;
+    limit?: number;
+  } = {}): Promise<import('./types').TaskTimelinePage> {
+    const params = new URLSearchParams({
+      network: this.requireWorkspace(),
+      category: options.category ?? 'all',
+      sort: options.sort ?? 'desc',
+      limit: String(options.limit ?? 50),
+    });
+    if (options.actorType) params.set('actorType', options.actorType);
+    if (options.cursor) params.set('cursor', options.cursor);
+    const raw = await this.request<{ items: Array<Record<string, unknown>>; nextCursor?: string | null; next_cursor?: string | null }>(
+      `/v1/tasks/${encodeURIComponent(id)}/timeline?${params}`,
+    );
+    return {
+      items: (raw.items || []).map((item) => this.mapTaskTimelineItem(item)),
+      nextCursor: raw.nextCursor ?? raw.next_cursor ?? null,
+    };
+  }
+
+  async addTaskComment(id: string, content: string, fileIds: string[] = []): Promise<import('./types').TaskTimelineItem> {
+    const raw = await this.request<Record<string, unknown>>(`/v1/tasks/${encodeURIComponent(id)}/comments`, {
+      method: 'POST',
+      body: JSON.stringify({ network: this.requireWorkspace(), content, fileIds }),
+    });
+    return this.mapTaskTimelineItem(raw);
+  }
+
+  async reviewTask(id: string, submissionVersion: number, decision: 'approve' | 'request_changes', note = ''): Promise<KanbanTask> {
+    const raw = await this.request<Record<string, unknown>>(`/v1/tasks/${encodeURIComponent(id)}/review`, {
+      method: 'POST',
+      body: JSON.stringify({ network: this.requireWorkspace(), submissionVersion, decision, note }),
+    });
+    return this.mapTask(raw);
   }
 
   private async taskAction(id: string, action: string, input: Record<string, unknown> = {}): Promise<KanbanTask> {

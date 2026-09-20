@@ -1,11 +1,12 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { FileIcon, Loader2, Maximize2, Minimize2, Paperclip, RotateCcw, X } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
 import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { IS_LOCAL_AUTH } from '@/lib/api-config';
 import { Button } from '@/components/ui/button';
+import { MarkdownToolbar } from '@/components/ui/markdown-toolbar';
 import {
   Dialog,
   DialogContent,
@@ -65,6 +66,10 @@ export function PlanRecordDialog({
   const busyRef = useRef(false);
   const controllerRef = useRef<AbortController | null>(null);
   const pickerRef = useRef<HTMLInputElement>(null);
+  const descriptionRef = useRef<HTMLTextAreaElement>(null);
+  const acceptanceCriteriaRef = useRef<HTMLTextAreaElement>(null);
+  const descriptionId = useId();
+  const acceptanceCriteriaId = useId();
   useEffect(
     () => () => {
       runRef.current += 1;
@@ -220,25 +225,52 @@ export function PlanRecordDialog({
                 onChange={(event) => change({ title: event.target.value })}
                 className="w-full min-w-0 rounded-sm border-0 bg-transparent py-2 text-xl font-semibold outline-none placeholder:text-muted-foreground/50 focus-visible:outline-2 focus-visible:outline-ring"
               />
-              <textarea
-                aria-label={l.description}
-                placeholder={l.descriptionPlaceholder}
-                value={draft.description}
-                disabled={busy}
-                onChange={(event) => change({ description: event.target.value })}
-                className="min-h-32 w-full min-w-0 flex-1 resize-none rounded-sm border-0 bg-transparent text-sm leading-6 outline-none placeholder:text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring"
-              />
-              <label className="space-y-1 text-xs font-medium text-muted-foreground">
-                <span>{l.acceptanceCriteria}</span>
+              <div className="flex min-h-32 min-w-0 flex-1 flex-col rounded-md border border-input bg-background focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/30">
+                <label htmlFor={descriptionId} className="sr-only">
+                  {l.description}
+                </label>
                 <textarea
-                  aria-label={l.acceptanceCriteria}
-                  value={draft.acceptanceCriteria ?? ''}
+                  ref={descriptionRef}
+                  id={descriptionId}
+                  aria-label={l.description}
+                  placeholder={l.descriptionPlaceholder}
+                  value={draft.description}
                   disabled={busy}
-                  onChange={(event) => change({ acceptanceCriteria: event.target.value })}
-                  rows={2}
-                  className="block w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm font-normal text-foreground focus-visible:outline-2 focus-visible:outline-ring"
+                  onChange={(event) => change({ description: event.target.value })}
+                  className="min-h-24 w-full min-w-0 flex-1 resize-none rounded-t-md border-0 bg-transparent px-3 py-2 text-sm leading-6 outline-none placeholder:text-muted-foreground"
                 />
-              </label>
+                <MarkdownToolbar
+                  textareaRef={descriptionRef}
+                  textareaId={descriptionId}
+                  label={l.description}
+                  value={draft.description}
+                  disabled={busy}
+                  onChange={(description) => change({ description })}
+                />
+              </div>
+              <div className="space-y-1 text-xs font-medium text-muted-foreground">
+                <label htmlFor={acceptanceCriteriaId}>{l.acceptanceCriteria}</label>
+                <div className="overflow-hidden rounded-md border border-input bg-background focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/30">
+                  <textarea
+                    ref={acceptanceCriteriaRef}
+                    id={acceptanceCriteriaId}
+                    aria-label={l.acceptanceCriteria}
+                    value={draft.acceptanceCriteria ?? ''}
+                    disabled={busy}
+                    onChange={(event) => change({ acceptanceCriteria: event.target.value })}
+                    rows={2}
+                    className="block min-h-16 w-full resize-y border-0 bg-transparent px-3 py-2 text-sm font-normal text-foreground outline-none"
+                  />
+                  <MarkdownToolbar
+                    textareaRef={acceptanceCriteriaRef}
+                    textareaId={acceptanceCriteriaId}
+                    label={l.acceptanceCriteria}
+                    value={draft.acceptanceCriteria ?? ''}
+                    disabled={busy}
+                    onChange={(acceptanceCriteria) => change({ acceptanceCriteria })}
+                  />
+                </div>
+              </div>
               <div className="mt-auto flex flex-wrap items-center gap-2 pb-2">
                 <StatusPicker
                   value={draft.status}

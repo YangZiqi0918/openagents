@@ -44,10 +44,15 @@ interface ProjectInternalPageProps {
   projectScoped?: boolean;
   initialTab?: 'plan' | 'review';
   initialPlanItemId?: string;
+  initialPlanTaskId?: string;
+  initialPlanTaskView?: string;
+  onOpenPlanTask?: (itemId: string, taskId: string, view?: string) => void;
+  onClosePlanTask?: () => void;
+  onPlanTaskViewChange?: (view: string) => void;
   initialReviewTaskId?: string;
 }
 
-export function ProjectInternalPage({ projectId, projectName, onBack, workspaceModulesAvailable = true, planStorageKey, initialSessionId, projectScoped = false, initialTab, initialPlanItemId, initialReviewTaskId }: ProjectInternalPageProps) {
+export function ProjectInternalPage({ projectId, projectName, onBack, workspaceModulesAvailable = true, planStorageKey, initialSessionId, projectScoped = false, initialTab, initialPlanItemId, initialPlanTaskId, initialPlanTaskView, onOpenPlanTask, onClosePlanTask, onPlanTaskViewChange, initialReviewTaskId }: ProjectInternalPageProps) {
   const t = useT();
   const { locale } = useI18n();
   const [activeTab, setActiveTab] = useState<ProjectTab>(initialTab ?? 'activity');
@@ -61,7 +66,7 @@ export function ProjectInternalPage({ projectId, projectName, onBack, workspaceM
   useEffect(() => {
     if (initialTab === 'plan') setActiveTab('plan');
     if (initialTab === 'review' && admin) setActiveTab('review');
-  }, [initialTab, initialPlanItemId, initialReviewTaskId, admin]);
+  }, [initialTab, initialPlanItemId, initialPlanTaskId, initialReviewTaskId, admin]);
   const labels: Record<ProjectTab, string> = {
     activity: locale === 'zh-CN' ? '动态' : 'Activity',
     plan: locale === 'zh-CN' ? '计划' : 'Plan',
@@ -100,7 +105,7 @@ export function ProjectInternalPage({ projectId, projectName, onBack, workspaceM
       <div data-testid="project-tab-content" data-active-tab={activeTab} className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {connecting ? <><div className="flex h-11 shrink-0 items-center justify-end border-b px-5"><Button variant="ghost" mode="icon" size="sm" onClick={() => setConnecting(false)} title={t('common.close')} aria-label={t('common.close')}><X className="size-4" /></Button></div><div className="min-h-0 flex-1"><ConnectAgentView onConnected={() => setConnecting(false)} /></div></> : <>
         {activeTab === 'activity' && workspaceModulesAvailable && <ProjectActivityPage projectId={projectId} projectName={projectName} initialSessionId={initialSessionId} />}
-        {activeTab === 'plan' && <ProjectPlanPage projectId={projectId} storageKey={planStorageKey} workspaceModulesAvailable={workspaceModulesAvailable} focusItemId={initialPlanItemId} />}
+        {activeTab === 'plan' && <ProjectPlanPage projectId={projectId} storageKey={planStorageKey} workspaceModulesAvailable={workspaceModulesAvailable} focusItemId={initialPlanItemId} focusTaskId={initialPlanTaskId} taskView={initialPlanTaskView} onOpenTask={onOpenPlanTask} onCloseTask={onClosePlanTask} onTaskViewChange={onPlanTaskViewChange} />}
         {activeTab !== 'activity' && activeTab !== 'plan' && activeTab !== 'members' && activeTab !== 'review' && workspaceModulesAvailable && (
           <ProjectWorkspaceContent key={activeTab} tab={activeTab} />
         )}

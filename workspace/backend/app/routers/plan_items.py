@@ -272,7 +272,7 @@ def dispatch_plan_item(workspace_id: str, item_id: str, body: DispatchRequest, d
     )).scalars())
     if current_owners:
         return json_response(ResponseCode.CONFLICT, "Member already owns a task from this plan")
-    from app.routers.tasks import _next_position, _serialize_task
+    from app.routers.tasks import _next_position, _record_task_event, _serialize_task
     result = []
     for user_id in recipients:
         task = existing.get(user_id)
@@ -293,6 +293,14 @@ def dispatch_plan_item(workspace_id: str, item_id: str, body: DispatchRequest, d
             task.channel_name = f"task:{task.id}"
             db.add(Channel(workspace_id=workspace.id, name=task.channel_name, title=task.title,
                            created_by=f"human:{actor.email}"))
+            _record_task_event(
+                db, str(workspace.id), task, "history", "dispatched", actor=actor,
+                categories=["activity", "history"], content=item.title,
+                changes=[
+                    {"field": "sourceVersion", "from": None, "to": item.version},
+                    {"field": "responsibleUserId", "from": None, "to": user_id},
+                ],
+            )
             notify(db, workspace.id, source=f"human:{actor.email}", title="New task assigned",
                    message=item.title, channel_name=task.channel_name,
                    recipient_user_id=user_id, reason="approval")
@@ -326,8 +334,15 @@ def publish_plan_changes(workspace_id: str, item_id: str, body: PublishRequest, 
         )).first()
         if conflicting:
             return json_response(ResponseCode.CONFLICT, "Another task was already dispatched for this version")
-    from app.routers.tasks import _serialize_task
+    from app.routers.tasks import _record_task_event, _serialize_task
     for task in tasks:
+        before = {
+            "title": task.title, "description": task.description,
+            "priority": task.priority, "tags": task.tags or [],
+            "startDate": task.start_date, "dueDate": task.due_date,
+            "acceptanceCriteria": task.acceptance_criteria or "",
+            "fileIds": task.file_ids or [], "sourceVersion": task.source_version,
+        }
         task.title = item.title
         task.description = item.description
         task.priority = item.priority or "normal"
@@ -336,6 +351,19 @@ def publish_plan_changes(workspace_id: str, item_id: str, body: PublishRequest, 
         task.acceptance_criteria = item.acceptance_criteria
         task.file_ids = [a["id"] for a in (item.attachments or [])]
         task.source_version = item.version
+        after = {
+            "title": task.title, "description": task.description,
+            "priority": task.priority, "tags": task.tags or [],
+            "startDate": task.start_date, "dueDate": task.due_date,
+            "acceptanceCriteria": task.acceptance_criteria or "",
+            "fileIds": task.file_ids or [], "sourceVersion": task.source_version,
+        }
+        _record_task_event(
+            db, str(workspace.id), task, "history", "requirements_published", actor=actor,
+            categories=["activity", "history"], content=item.title,
+            changes=[{"field": key, "from": before[key], "to": value}
+                     for key, value in after.items() if before[key] != value],
+        )
         notify(db, workspace.id, source=f"human:{actor.email}", title="Task requirements updated",
                message=item.title, channel_name=task.channel_name,
                recipient_user_id=task.responsible_user_id, reason="approval")

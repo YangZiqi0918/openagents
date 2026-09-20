@@ -13,14 +13,17 @@ long-running work; a fast-model classifier in `workspace_mod` moves the card
 between columns as the agent reports progress.
 """
 
+import base64
+import binascii
+import json
 import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, Path, Query
-from pydantic import BaseModel
-from sqlalchemy import or_, select
+from pydantic import BaseModel, Field
+from sqlalchemy import and_, false, or_, select
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -159,6 +162,17 @@ class CompleteStepRequest(TaskActionRequest):
     content: str
 
 
+class TaskCommentRequest(TaskActionRequest):
+    content: str = ""
+    fileIds: List[str] = Field(default_factory=list)
+
+
+class ReviewTaskRequest(TaskActionRequest):
+    submissionVersion: int = Field(ge=1)
+    decision: str  # approve | request_changes
+    note: str = ""
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -225,14 +239,18 @@ def _reference_error(db: Session, workspace, *, assignee=None, workflow_id=None,
 def _task_attachments(db: Session, workspace_id: str, task: KanbanTask) -> list:
     """Attachment dicts for the task's files, in the shape chat messages use
     (see cloud_agent._post_response), so agents/clients render them the same."""
+    return _file_attachments(db, workspace_id, task.file_ids)
+
+
+def _file_attachments(db: Session, workspace_id: str, file_ids: Optional[list]) -> list:
     from app.models import FileRecord
 
-    if not task.file_ids:
+    if not file_ids:
         return []
     rows = db.execute(
         select(FileRecord).where(
             FileRecord.workspace_id == workspace_id,
-            FileRecord.id.in_(task.file_ids),
+            FileRecord.id.in_(file_ids),
             FileRecord.status == "active",
         )
     ).scalars().all()
@@ -244,8 +262,127 @@ def _task_attachments(db: Session, workspace_id: str, task: KanbanTask) -> list:
             "content_type": r.content_type,
             "size": r.size,
         }
-        for r in (by_id[i] for i in task.file_ids if i in by_id)
+        for r in (by_id[i] for i in file_ids if i in by_id)
     ]
+
+
+def _task_attachment_metadata(db: Session, workspace_id: str, file_ids: Optional[list]) -> list:
+    """Return stable, camelCase file metadata for task detail/timeline APIs."""
+    from app.models import FileRecord
+
+    ordered_ids = [file_id for file_id in (file_ids or []) if isinstance(file_id, str)]
+    if not ordered_ids:
+        return []
+    rows = db.execute(select(FileRecord).where(
+        FileRecord.workspace_id == workspace_id,
+        FileRecord.id.in_(ordered_ids),
+        FileRecord.status == "active",
+    )).scalars().all()
+    by_id = {row.id: row for row in rows}
+    return [{
+        "id": row.id,
+        "filename": row.filename,
+        "contentType": row.content_type,
+        "size": row.size,
+    } for file_id in ordered_ids if (row := by_id.get(file_id)) is not None]
+
+
+def _actor_data(actor: Optional[User] = None, source: Optional[str] = None) -> tuple[str, dict]:
+    if actor is not None:
+        return f"human:{actor.email}", {
+            "type": "human", "id": actor.id,
+            "name": actor.display_name or actor.username or actor.email,
+        }
+    source = source or "system:task"
+    if source.startswith("human:"):
+        identity = source.removeprefix("human:")
+        return source, {"type": "human", "id": identity, "name": identity}
+    if source.startswith("openagents:"):
+        name = source.removeprefix("openagents:")
+        return source, {"type": "agent", "id": name, "name": name}
+    return source, {"type": "system", "id": source, "name": source.split(":", 1)[-1] or "System"}
+
+
+def _to_millis(value=None) -> int:
+    if value is None:
+        value = datetime.now(timezone.utc)
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            value = datetime.now(timezone.utc)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return int(value.timestamp() * 1000)
+
+
+def _record_task_event(
+    db: Session,
+    workspace_id: str,
+    task: KanbanTask,
+    category: str,
+    kind: str,
+    *,
+    actor: Optional[User] = None,
+    source: Optional[str] = None,
+    categories: Optional[list[str]] = None,
+    content: Optional[str] = None,
+    attachments: Optional[list] = None,
+    changes: Optional[list] = None,
+    from_value=None,
+    to_value=None,
+    at=None,
+):
+    """Append one task event in the same transaction as its state change."""
+    from app.models import EventRecord
+
+    source, actor_payload = _actor_data(actor, source)
+    timestamp = _to_millis(at)
+    record = EventRecord(
+        id=str(uuid4()),
+        network_id=str(workspace_id),
+        type=f"workspace.task.{category}",
+        source=source,
+        target=f"task/{task.id}",
+        payload={
+            "taskId": task.id,
+            "categories": categories or [category],
+            "kind": kind,
+            "actor": actor_payload,
+            "content": content,
+            "attachments": attachments or [],
+            "changes": changes or [],
+            "from": from_value,
+            "to": to_value,
+        },
+        metadata_={"task_id": task.id},
+        timestamp=timestamp,
+        visibility="channel",
+    )
+    db.add(record)
+    return record
+
+
+def _iso_from_millis(value: int) -> str:
+    return datetime.fromtimestamp(value / 1000, tz=timezone.utc).isoformat()
+
+
+def _cursor_encode(timestamp: int, event_id: str) -> str:
+    raw = json.dumps([timestamp, event_id], separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _cursor_decode(value: str) -> Optional[tuple[int, str]]:
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        timestamp, event_id = json.loads(base64.urlsafe_b64decode(padded.encode()))
+        if not isinstance(timestamp, int) or not isinstance(event_id, str):
+            return None
+        return timestamp, event_id
+    except (ValueError, TypeError, UnicodeDecodeError, binascii.Error, json.JSONDecodeError):
+        return None
 
 
 def _context_block(db: Session, workspace_id: str, task: KanbanTask) -> str:
@@ -276,7 +413,12 @@ def _context_block(db: Session, workspace_id: str, task: KanbanTask) -> str:
     )
 
 
-def _serialize_task(t: KanbanTask, run: Optional[dict] = None, last_message: Optional[str] = None) -> dict:
+def _serialize_task(
+    t: KanbanTask,
+    run: Optional[dict] = None,
+    last_message: Optional[str] = None,
+    attachments: Optional[list] = None,
+) -> dict:
     return {
         "id": t.id,
         "title": t.title,
@@ -286,6 +428,7 @@ def _serialize_task(t: KanbanTask, run: Optional[dict] = None, last_message: Opt
         "workflow_id": t.workflow_id,
         "knowledge_ids": t.knowledge_ids or [],
         "file_ids": t.file_ids or [],
+        "attachments": attachments or [],
         "plan_item_id": t.plan_item_id,
         "responsible_user_id": t.responsible_user_id,
         "dispatched_user_id": t.dispatched_user_id,
@@ -364,14 +507,264 @@ def _enrich(db: Session, workspace_id: str, tasks_list: list) -> list:
             elif channel in activity_channels and msg_type in ("chat", "status", "thinking"):
                 last_by_channel[channel] = content[:280]
 
+    file_ids = list(dict.fromkeys(
+        file_id for task in tasks_list for file_id in (task.file_ids or [])
+    ))
+    attachment_rows = _task_attachment_metadata(db, workspace_id, file_ids)
+    attachments_by_id = {attachment["id"]: attachment for attachment in attachment_rows}
+
     return [
         _serialize_task(
             t,
             run=run_info(runs_by_channel.get(t.channel_name)) if t.channel_name else None,
             last_message=last_by_channel.get(t.channel_name) if t.channel_name else None,
+            attachments=[attachments_by_id[file_id] for file_id in (t.file_ids or [])
+                         if file_id in attachments_by_id],
         )
         for t in tasks_list
     ]
+
+
+def _timeline_actor(source: str, payload: dict, users_by_email: dict, users_by_id: dict) -> dict:
+    stored = payload.get("actor")
+    if isinstance(stored, dict) and stored.get("type") in {"human", "agent", "system"}:
+        return {
+            "type": stored["type"],
+            "id": stored.get("id"),
+            "name": stored.get("name") or stored.get("id") or "System",
+        }
+    if source.startswith("human:"):
+        identity = source.removeprefix("human:")
+        user = users_by_email.get(identity.lower()) or users_by_id.get(identity)
+        return {
+            "type": "human",
+            "id": user.id if user else identity,
+            "name": ((user.display_name or user.username or user.email) if user else
+                     payload.get("sender_display_name") or payload.get("sender_name") or identity),
+        }
+    if source.startswith("openagents:"):
+        name = source.removeprefix("openagents:")
+        return {"type": "agent", "id": name, "name": name}
+    name = source.split(":", 1)[-1] if source else "System"
+    return {"type": "system", "id": source or None, "name": name or "System"}
+
+
+def _timeline_categories(kind: str) -> list[str]:
+    if kind in {"configured", "requirements_published", "dispatched"}:
+        return ["activity", "history"]
+    if kind in {
+        "accepted", "submitted", "execution_started", "execution_stopped",
+        "transfer_requested", "transfer_forced", "transfer_accepted",
+        "review_approved", "review_returned", "execution_status_changed",
+    }:
+        return ["activity", "transition"]
+    return ["activity"]
+
+
+def _legacy_actor(user_id: Optional[str], users_by_id: dict) -> dict:
+    user = users_by_id.get(user_id)
+    return {
+        "type": "human",
+        "id": user_id,
+        "name": (user.display_name or user.username or user.email) if user else (user_id or "Unknown member"),
+    }
+
+
+def _timeline_users(db: Session, workspace_id: str) -> tuple[dict, dict]:
+    users = db.execute(select(User).join(
+        WorkspaceMembership, WorkspaceMembership.user_id == User.id,
+    ).where(WorkspaceMembership.workspace_id == workspace_id)).scalars().all()
+    return ({user.id: user for user in users},
+            {user.email.lower(): user for user in users if user.email})
+
+
+def _timeline_event_item(event, users_by_id: dict, users_by_email: dict) -> Optional[dict]:
+    payload = event.payload or {}
+    if event.type.startswith("workspace.task."):
+        category = event.type.removeprefix("workspace.task.")
+        if category not in {"activity", "transition", "history"}:
+            return None
+        categories = [value for value in (payload.get("categories") or [category])
+                      if value in {"activity", "comments", "transition", "history"}]
+        return {
+            "id": event.id, "categories": categories or [category],
+            "kind": payload.get("kind") or category,
+            "actor": _timeline_actor(event.source or "", payload, users_by_email, users_by_id),
+            "content": payload.get("content"), "attachments": payload.get("attachments") or [],
+            "changes": payload.get("changes") or [], "from": payload.get("from"),
+            "to": payload.get("to"), "createdAt": _iso_from_millis(event.timestamp),
+            "_timestamp": event.timestamp,
+        }
+    if event.type != "workspace.message.posted":
+        return None
+    metadata = event.metadata_ or {}
+    is_comment = metadata.get("task_comment") is True
+    message_type = payload.get("message_type") or "chat"
+    return {
+        "id": event.id, "categories": ["comments"] if is_comment else ["activity"],
+        "kind": "comment" if is_comment else (f"agent_{message_type}" if message_type != "chat" else "message"),
+        "actor": _timeline_actor(event.source or "", payload, users_by_email, users_by_id),
+        "content": payload.get("content"), "attachments": payload.get("attachments") or [],
+        "changes": [], "from": None, "to": None,
+        "createdAt": _iso_from_millis(event.timestamp), "_timestamp": event.timestamp,
+    }
+
+
+def _legacy_timeline_items(task: KanbanTask, users_by_id: dict) -> list[dict]:
+    items: list[dict] = []
+    base_timestamp = _to_millis(task.created_at)
+    submissions = task.submission_history or []
+    for index, submission in enumerate(submissions):
+        submitted_at = submission.get("submitted_at")
+        if not submission.get("event_id"):
+            timestamp = _to_millis(submitted_at) if submitted_at else base_timestamp + index
+            items.append({
+                "id": f"legacy-submission:{task.id}:{index}",
+                "categories": ["activity", "transition"],
+                "kind": "submitted",
+                "actor": _legacy_actor(submission.get("user_id"), users_by_id),
+                "content": submission.get("summary"),
+                "attachments": [{"id": file_id} for file_id in (submission.get("file_ids") or [])],
+                "changes": [], "from": "in_progress", "to": "need_input",
+                "createdAt": _iso_from_millis(timestamp), "_timestamp": timestamp,
+            })
+        decision = submission.get("review_decision")
+        if decision in {"approved", "returned"} and not submission.get("review_event_id"):
+            timestamp = _to_millis(submission.get("reviewed_at") or submitted_at) + 1
+            items.append({
+                "id": f"legacy-review:{task.id}:{index}",
+                "categories": ["activity", "transition"],
+                "kind": "review_approved" if decision == "approved" else "review_returned",
+                "actor": _legacy_actor(submission.get("reviewed_by_user_id"), users_by_id),
+                "content": submission.get("review_comment") or None,
+                "attachments": [], "changes": [], "from": "need_input",
+                "to": "done" if decision == "approved" else "in_progress",
+                "createdAt": _iso_from_millis(timestamp), "_timestamp": timestamp,
+            })
+
+    submission_actions = {"submitted"} if submissions else set()
+    if any(entry.get("review_decision") for entry in submissions):
+        submission_actions.update({"review_approved", "review_returned"})
+    for index, entry in enumerate(task.activity_history or []):
+        kind = entry.get("action") or "activity"
+        if entry.get("event_id") or kind in submission_actions:
+            continue
+        timestamp = _to_millis(entry.get("at")) if entry.get("at") else base_timestamp + index
+        details = {key: value for key, value in entry.items()
+                   if key not in {"action", "actor_user_id", "at", "event_id"}}
+        items.append({
+            "id": f"legacy-activity:{task.id}:{index}",
+            "categories": _timeline_categories(kind),
+            "kind": kind,
+            "actor": _legacy_actor(entry.get("actor_user_id"), users_by_id),
+            "content": details.get("reason") or details.get("comment"),
+            "attachments": [],
+            "changes": [{"field": key, "from": None, "to": value} for key, value in details.items()],
+            "from": details.get("from") or details.get("from_user_id"),
+            "to": details.get("to") or details.get("to_user_id"),
+            "createdAt": _iso_from_millis(timestamp), "_timestamp": timestamp,
+        })
+
+    return items
+
+
+def _hydrate_timeline_attachments(db: Session, workspace_id: str, items: list[dict]) -> None:
+    from app.models import FileRecord
+
+    file_ids = {
+        attachment.get("id") or attachment.get("fileId") or attachment.get("file_id")
+        for item in items for attachment in item["attachments"] if isinstance(attachment, dict)
+    }
+    file_ids.discard(None)
+    files = {row.id: row for row in db.execute(select(FileRecord).where(
+        FileRecord.workspace_id == workspace_id,
+        FileRecord.id.in_(file_ids),
+        FileRecord.status == "active",
+    )).scalars()} if file_ids else {}
+    for item in items:
+        hydrated = []
+        for attachment in item["attachments"]:
+            if not isinstance(attachment, dict):
+                continue
+            file_id = attachment.get("id") or attachment.get("fileId") or attachment.get("file_id")
+            file = files.get(file_id)
+            if file is not None:
+                hydrated.append({"id": file.id, "filename": file.filename,
+                                 "contentType": file.content_type, "size": file.size})
+            elif file_id:
+                hydrated.append({
+                    "id": file_id,
+                    "filename": attachment.get("filename") or attachment.get("name") or file_id,
+                    "contentType": attachment.get("contentType") or attachment.get("content_type"),
+                    "size": attachment.get("size"),
+                })
+        item["attachments"] = hydrated
+
+
+def _timeline_event_query(
+    workspace_id: str,
+    task: KanbanTask,
+    category: str,
+    actor_type: Optional[str],
+    sort: str,
+    cursor: Optional[tuple[int, str]],
+    limit: int,
+):
+    """Build the bounded event-store query for one timeline page."""
+    from app.models import EventRecord
+
+    structured_types = {
+        "activity": ("workspace.task.activity", "workspace.task.transition", "workspace.task.history"),
+        "transition": ("workspace.task.transition",),
+        "history": ("workspace.task.history",),
+        "all": ("workspace.task.activity", "workspace.task.transition", "workspace.task.history"),
+    }
+    sources = []
+    if category != "comments":
+        sources.append(and_(
+            EventRecord.target == f"task/{task.id}",
+            EventRecord.type.in_(structured_types[category]),
+        ))
+    if task.channel_name and category in {"all", "activity", "comments"}:
+        comment_flag = EventRecord.metadata_["task_comment"].as_boolean()
+        message_filters = [
+            EventRecord.target == f"channel/{task.channel_name}",
+            EventRecord.type == "workspace.message.posted",
+        ]
+        if category == "comments":
+            message_filters.append(comment_flag.is_(True))
+        elif category == "activity":
+            message_filters.append(comment_flag.is_not(True))
+        sources.append(and_(*message_filters))
+
+    query = select(EventRecord).where(
+        EventRecord.network_id == workspace_id,
+        or_(*sources) if sources else false(),
+    )
+    if actor_type == "human":
+        query = query.where(EventRecord.source.like("human:%"))
+    elif actor_type == "agent":
+        query = query.where(EventRecord.source.like("openagents:%"))
+    elif actor_type == "system":
+        query = query.where(
+            EventRecord.source.not_like("human:%"),
+            EventRecord.source.not_like("openagents:%"),
+        )
+    if cursor:
+        timestamp, event_id = cursor
+        if sort == "desc":
+            query = query.where(or_(
+                EventRecord.timestamp < timestamp,
+                and_(EventRecord.timestamp == timestamp, EventRecord.id < event_id),
+            ))
+        else:
+            query = query.where(or_(
+                EventRecord.timestamp > timestamp,
+                and_(EventRecord.timestamp == timestamp, EventRecord.id > event_id),
+            ))
+    ordering = ((EventRecord.timestamp.desc(), EventRecord.id.desc()) if sort == "desc"
+                else (EventRecord.timestamp.asc(), EventRecord.id.asc()))
+    return query.order_by(*ordering).limit(limit + 1)
 
 
 def _next_position(db: Session, workspace_id: str, status: str) -> int:
@@ -470,12 +863,196 @@ def get_task(task_id: str, network: str = Query(...), db: Session = Depends(get_
         return json_response(ResponseCode.NOT_FOUND, "Network not found")
     if not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+    if workspace.kind == "project" and not verify_human_project_access(
+        db, workspace, authorization, "member"
+    ):
+        return json_response(ResponseCode.FORBIDDEN, "Project member access required")
     task = db.execute(select(KanbanTask).where(
         KanbanTask.workspace_id == workspace.id, KanbanTask.id == task_id,
     )).scalar_one_or_none()
     if not task:
         return json_response(ResponseCode.NOT_FOUND, "Task not found")
     return success_response(_enrich(db, str(workspace.id), [task])[0])
+
+
+def _detail_task(db: Session, network: str, task_id: str, authorization: Optional[str], *, lock: bool = False):
+    workspace = _resolve_workspace(db, network)
+    if workspace is None or workspace.kind != "project" or workspace.status == "deleted":
+        return None, None, None, json_response(ResponseCode.NOT_FOUND, "Project not found")
+    if not verify_human_project_access(db, workspace, authorization, "member"):
+        return None, None, None, json_response(ResponseCode.FORBIDDEN, "Project member access required")
+    actor = resolve_current_user(db, authorization)
+    if actor is None:
+        return None, None, None, json_response(ResponseCode.UNAUTHORIZED, "Identity required")
+    query = select(KanbanTask).where(
+        KanbanTask.workspace_id == workspace.id,
+        KanbanTask.id == task_id,
+        KanbanTask.plan_item_id.is_not(None),
+        KanbanTask.responsible_user_id.is_not(None),
+    )
+    if lock:
+        query = query.with_for_update()
+    task = db.execute(query).scalar_one_or_none()
+    if task is None:
+        return None, None, None, json_response(ResponseCode.NOT_FOUND, "Task not found")
+    return workspace, task, actor, None
+
+
+@router.get("/tasks/{task_id}/timeline")
+def get_task_timeline(
+    task_id: str,
+    network: str = Query(...),
+    category: str = Query("all"),
+    actorType: Optional[str] = Query(None),
+    sort: str = Query("desc"),
+    cursor: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=100),
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+):
+    workspace, task, _, error = _detail_task(db, network, task_id, authorization)
+    if error:
+        return error
+    category = category.lower()
+    if category not in {"all", "activity", "comments", "transition", "history"}:
+        return json_response(ResponseCode.BAD_REQUEST, "Invalid timeline category")
+    actor_type = actorType.lower() if actorType else None
+    if actor_type not in {None, "human", "agent", "system"}:
+        return json_response(ResponseCode.BAD_REQUEST, "Invalid timeline actor type")
+    if sort not in {"asc", "desc"}:
+        return json_response(ResponseCode.BAD_REQUEST, "Invalid timeline sort")
+    decoded_cursor = _cursor_decode(cursor) if cursor else None
+    if cursor and decoded_cursor is None:
+        return json_response(ResponseCode.BAD_REQUEST, "Invalid timeline cursor")
+
+    workspace_id = str(workspace.id)
+    users_by_id, users_by_email = _timeline_users(db, workspace_id)
+    events = db.execute(_timeline_event_query(
+        workspace_id, task, category, actor_type, sort, decoded_cursor, limit,
+    )).scalars().all()
+    items = [item for event in events
+             if (item := _timeline_event_item(event, users_by_id, users_by_email)) is not None]
+    legacy_items = _legacy_timeline_items(task, users_by_id)
+    if category != "all":
+        legacy_items = [item for item in legacy_items if category in item["categories"]]
+    if actor_type:
+        legacy_items = [item for item in legacy_items if item["actor"]["type"] == actor_type]
+    reverse = sort == "desc"
+    if decoded_cursor:
+        if reverse:
+            legacy_items = [item for item in legacy_items
+                            if (item["_timestamp"], item["id"]) < decoded_cursor]
+        else:
+            legacy_items = [item for item in legacy_items
+                            if (item["_timestamp"], item["id"]) > decoded_cursor]
+    items.extend(legacy_items)
+    items.sort(key=lambda item: (item["_timestamp"], item["id"]), reverse=reverse)
+    page = items[:limit]
+    next_cursor = (_cursor_encode(page[-1]["_timestamp"], page[-1]["id"])
+                   if len(items) > limit and page else None)
+    _hydrate_timeline_attachments(db, workspace_id, page)
+    for item in page:
+        item.pop("_timestamp", None)
+    return success_response({"items": page, "nextCursor": next_cursor})
+
+
+@router.post("/tasks/{task_id}/comments")
+def create_task_comment(
+    body: TaskCommentRequest,
+    task_id: str,
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+):
+    from app.models import EventRecord
+    from app.services.notify import notify
+
+    workspace, task, actor, error = _detail_task(db, body.network, task_id, authorization, lock=True)
+    if error:
+        return error
+    content = body.content.strip()
+    file_ids = list(dict.fromkeys(file_id for file_id in body.fileIds if isinstance(file_id, str) and file_id))
+    if not content and not file_ids:
+        return json_response(ResponseCode.BAD_REQUEST, "A comment or attachment is required")
+    if len(file_ids) != len(body.fileIds) or set(file_ids) != set(_clean_file_ids(db, workspace.id, file_ids) or []):
+        return json_response(ResponseCode.BAD_REQUEST, "Attachment does not belong to this project")
+    attachments = _file_attachments(db, str(workspace.id), file_ids)
+    timestamp = _to_millis()
+    event = EventRecord(
+        id=str(uuid4()), network_id=str(workspace.id), type="workspace.message.posted",
+        source=f"human:{actor.email}", target=f"channel/{task.channel_name}",
+        payload={
+            "content": content, "message_type": "chat", "attachments": attachments,
+            "sender_type": "human", "sender_id": actor.id, "sender_email": actor.email,
+            "sender_name": actor.display_name or actor.username or actor.email,
+            "sender_display_name": actor.display_name or actor.username or actor.email,
+        },
+        metadata_={
+            "task_comment": True, "target_agents": ["__no_response__"],
+            "sender_email": actor.email, "sender_id": actor.id,
+        },
+        timestamp=timestamp, visibility="channel",
+    )
+    db.add(event)
+    channel = db.execute(select(Channel).where(
+        Channel.workspace_id == workspace.id, Channel.name == task.channel_name,
+    )).scalar_one_or_none()
+    if channel is not None:
+        channel.last_event_at = timestamp
+    if actor.id != task.responsible_user_id:
+        notify(
+            db, str(workspace.id), source=f"human:{actor.email}", title="Task comment",
+            message=f"New comment on “{task.title}” from {actor.display_name or actor.username or actor.email}.",
+            channel_name=task.channel_name, recipient_user_id=task.responsible_user_id, reason="chat",
+            link_url=(f"/projects/{workspace.id}?tab=plan&item={task.plan_item_id}"
+                      f"&task={task.id}&view=comments"),
+        )
+    db.commit()
+    try:
+        from app.routers.events import _invalidate_poll_cache
+        _invalidate_poll_cache(str(workspace.id), "workspace.message.posted")
+    except Exception:
+        logger.debug("Unable to invalidate event poll cache", exc_info=True)
+    users_by_id, users_by_email = _timeline_users(db, str(workspace.id))
+    item = _timeline_event_item(event, users_by_id, users_by_email)
+    _hydrate_timeline_attachments(db, str(workspace.id), [item])
+    item.pop("_timestamp", None)
+    return success_response(item)
+
+
+@router.post("/tasks/{task_id}/review")
+def review_task_from_detail(
+    body: ReviewTaskRequest,
+    task_id: str,
+    db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+):
+    if body.decision not in {"approve", "request_changes"}:
+        return json_response(ResponseCode.BAD_REQUEST, "Invalid review decision")
+    from app.routers.plan_items import _admin
+    workspace, _, access_error = _admin(db, body.network, authorization)
+    if access_error:
+        return access_error
+    task = db.execute(select(KanbanTask).where(
+        KanbanTask.workspace_id == workspace.id, KanbanTask.id == task_id,
+    )).scalar_one_or_none()
+    if task is None:
+        return json_response(ResponseCode.NOT_FOUND, "Review not found")
+    from app.routers.task_reviews import ReviewDecision, decide_task_review
+    result = decide_task_review(
+        str(workspace.id),
+        task_id,
+        ReviewDecision(
+            submission_version=body.submissionVersion,
+            decision="approved" if body.decision == "approve" else "returned",
+            comment=body.note,
+        ),
+        db,
+        authorization,
+    )
+    if not isinstance(result, dict) or result.get("code") != ResponseCode.SUCCESS:
+        return result
+    db.refresh(task)
+    return success_response(_enrich(db, str(task.workspace_id), [task])[0])
 
 
 # ---------------------------------------------------------------------------
@@ -675,10 +1252,16 @@ def _run_workflow_task(db, workspace, task, human_source: str, token: Optional[s
         if _emit_event_blocking(create_evt, workspace, db, token=token) is None:
             return json_response(ResponseCode.FORBIDDEN, "Unable to create the task execution channel")
 
+    previous_execution_status = task.execution_status
     task.channel_name = channel_name
     if task.responsible_user_id:
         task.active_run_id = str(uuid4())
         task.execution_status = "running"
+        _record_task_event(
+            db, str(workspace.id), task, "transition", "execution_started",
+            source=human_source, categories=["activity", "transition"],
+            from_value=previous_execution_status, to_value="running",
+        )
     else:
         task.status = "in_progress"
         task.position = _next_position(db, str(workspace.id), "in_progress")
@@ -815,6 +1398,7 @@ def assign_task(
         db.expire(existing_channel, ["participants"])
 
     # 2. Post the kickoff message (routes to the agent, starts the work).
+    previous_execution_status = task.execution_status
     if task.responsible_user_id:
         task.active_run_id = str(uuid4())
         task.execution_status = "running"
@@ -843,6 +1427,12 @@ def assign_task(
     if not task.responsible_user_id:
         task.status = "in_progress"
         task.position = _next_position(db, str(workspace.id), "in_progress")
+    else:
+        _record_task_event(
+            db, str(workspace.id), task, "transition", "execution_started",
+            actor=actor, categories=["activity", "transition"],
+            from_value=previous_execution_status, to_value="running",
+        )
 
     db.commit()
     if is_cloud_agent:
@@ -928,11 +1518,33 @@ def _owner(task: KanbanTask, user: User) -> bool:
     return task.responsible_user_id == user.id
 
 
-def _log_activity(task: KanbanTask, action: str, actor: User, **fields):
+def _log_activity(
+    task: KanbanTask,
+    action: str,
+    actor: User,
+    *,
+    db: Optional[Session] = None,
+    event_category: str = "activity",
+    event_categories: Optional[list[str]] = None,
+    content: Optional[str] = None,
+    changes: Optional[list] = None,
+    from_value=None,
+    to_value=None,
+    **fields,
+):
+    at = datetime.now(timezone.utc)
+    record = None
+    if db is not None:
+        record = _record_task_event(
+            db, str(task.workspace_id), task, event_category, action,
+            actor=actor, categories=event_categories, content=content,
+            changes=changes, from_value=from_value, to_value=to_value, at=at,
+        )
     task.activity_history = [*(task.activity_history or []), {
-        "action": action, "actor_user_id": actor.id,
-        "at": datetime.now(timezone.utc).isoformat(), **fields,
+        "action": action, "actor_user_id": actor.id, "at": at.isoformat(),
+        **({"event_id": record.id} if record is not None else {}), **fields,
     }]
+    return record
 
 
 def _workflow_allowed_for_owner(db: Session, workspace_id: str, workflow: Workflow, owner: User) -> bool:
@@ -994,6 +1606,11 @@ def configure_member_task(body: ConfigureTaskRequest, task_id: str,
         return json_response(ResponseCode.CONFLICT, "Task cannot be configured in its current state")
     if task.execution_status in {"running", "in_progress"}:
         return json_response(ResponseCode.CONFLICT, "Stop execution before changing its configuration")
+    before = {
+        "mode": "workflow" if task.workflow_id else "agent" if task.assignee else "manual",
+        "agent": task.assignee, "workflowId": task.workflow_id,
+        "knowledgeIds": task.knowledge_ids or [], "fileIds": task.file_ids or [],
+    }
     if body.mode == "manual":
         task.assignee = None
         task.workflow_id = None
@@ -1023,7 +1640,16 @@ def configure_member_task(body: ConfigureTaskRequest, task_id: str,
         if set(body.file_ids) != set(_clean_file_ids(db, workspace.id, body.file_ids) or []):
             return json_response(ResponseCode.BAD_REQUEST, "File does not belong to this project")
         task.file_ids = _clean_file_ids(db, workspace.id, body.file_ids)
-    _log_activity(task, "configured", actor, mode=body.mode)
+    after = {
+        "mode": body.mode, "agent": task.assignee, "workflowId": task.workflow_id,
+        "knowledgeIds": task.knowledge_ids or [], "fileIds": task.file_ids or [],
+    }
+    changes = [{"field": key, "from": before[key], "to": value}
+               for key, value in after.items() if before[key] != value]
+    _log_activity(
+        task, "configured", actor, db=db, event_category="history",
+        event_categories=["activity", "history"], changes=changes, mode=body.mode,
+    )
     db.commit()
     return success_response(_serialize_task(task))
 
@@ -1041,7 +1667,11 @@ def accept_member_task(body: TaskActionRequest, task_id: str,
     task.status = "in_progress"
     task.position = _next_position(db, workspace.id, "in_progress")
     task.execution_status = "idle"
-    _log_activity(task, "accepted", actor)
+    _log_activity(
+        task, "accepted", actor, db=db, event_category="transition",
+        event_categories=["activity", "transition"],
+        from_value="backlog", to_value="in_progress",
+    )
     db.commit()
     return success_response(_serialize_task(task))
 
@@ -1060,7 +1690,7 @@ def decline_member_task(body: DeclineTaskRequest, task_id: str,
     if not reason:
         return json_response(ResponseCode.BAD_REQUEST, "A reason is required")
     task.decline_reason = reason
-    _log_activity(task, "declined", actor, reason=reason)
+    _log_activity(task, "declined", actor, db=db, content=reason, reason=reason)
     from app.services.notify import notify
     for user_id in _task_admins(db, workspace.id):
         notify(db, workspace.id, source=f"human:{actor.email}", title="Task declined",
@@ -1088,13 +1718,19 @@ def submit_member_task(body: SubmitTaskRequest, task_id: str,
         return json_response(ResponseCode.BAD_REQUEST, "File does not belong to this project")
     run_id, agent = _pause_execution(db, workspace, task)
     task.submitted_summary = summary
-    task.submission_history = [*(task.submission_history or []), {
+    submission = {
         "summary": summary, "file_ids": files, "user_id": actor.id,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
-    }]
+    }
     task.status = "need_input"
     task.position = _next_position(db, workspace.id, "need_input")
-    _log_activity(task, "submitted", actor)
+    event = _log_activity(
+        task, "submitted", actor, db=db, event_category="transition",
+        event_categories=["activity", "transition"], content=summary,
+        from_value="in_progress", to_value="need_input",
+    )
+    submission["event_id"] = event.id
+    task.submission_history = [*(task.submission_history or []), submission]
     from app.services.notify import notify
     for user_id in _task_admins(db, workspace.id):
         notify(db, workspace.id, source=f"human:{actor.email}", title="Task awaiting review",
@@ -1116,8 +1752,14 @@ def stop_member_task(body: TaskActionRequest, task_id: str,
         return json_response(ResponseCode.FORBIDDEN, "Only the task owner or administrator may stop it")
     if task.status != "in_progress" or task.execution_status not in {"running", "in_progress", "need_input"}:
         return json_response(ResponseCode.CONFLICT, "Task is not in progress")
+    previous_execution_status = task.execution_status
     run_id, agent = _pause_execution(db, workspace, task)
-    _log_activity(task, "execution_stopped", actor)
+    if task.execution_status != previous_execution_status:
+        _log_activity(
+            task, "execution_stopped", actor, db=db, event_category="transition",
+            event_categories=["activity", "transition"],
+            from_value=previous_execution_status, to_value=task.execution_status,
+        )
     db.commit()
     _signal_stop(workspace, db, task, run_id, agent)
     return success_response(_serialize_task(task))
@@ -1163,8 +1805,12 @@ def request_task_transfer(body: TransferTaskRequest, task_id: str,
         task.decline_reason = None
     else:
         task.transfer_user_id = target_id
-    _log_activity(task, "transfer_forced" if body.force else "transfer_requested", actor,
-                  from_user_id=old_id, to_user_id=target_id, reason=reason)
+    _log_activity(
+        task, "transfer_forced" if body.force else "transfer_requested", actor,
+        db=db, event_category="transition", event_categories=["activity", "transition"],
+        content=reason, from_value=old_id, to_value=target_id,
+        from_user_id=old_id, to_user_id=target_id, reason=reason,
+    )
     from app.services.notify import notify
     notify(db, workspace.id, source=f"human:{actor.email}", title="Task handoff",
            message=f"{task.title}: {reason}", channel_name=task.channel_name,
@@ -1197,7 +1843,11 @@ def accept_task_transfer(body: TaskActionRequest, task_id: str,
     task.decline_reason = None
     task.status = "backlog"
     task.position = _next_position(db, workspace.id, "backlog")
-    _log_activity(task, "transfer_accepted", actor, from_user_id=old_id)
+    _log_activity(
+        task, "transfer_accepted", actor, db=db, event_category="transition",
+        event_categories=["activity", "transition"],
+        from_value=old_id, to_value=actor.id, from_user_id=old_id,
+    )
     db.commit()
     return success_response(_serialize_task(task))
 

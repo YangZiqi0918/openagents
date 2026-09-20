@@ -28,7 +28,7 @@ async function render(initialTaskId?: string) {
   await act(async () => root.render(React.createElement(ProjectTaskReviewPage, { initialTaskId })));
 }
 async function click(text: string) {
-  const target = [...element.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent?.includes(text));
+  const target = Array.from(element.querySelectorAll<HTMLButtonElement>('button')).find(button => button.textContent?.includes(text));
   expect(target).toBeDefined();
   await act(async () => target!.click());
 }
@@ -62,7 +62,7 @@ describe('project task review page', () => {
     await render();
     await click('退回修改');
     const textarea = document.querySelector('textarea')!;
-    const confirm = [...document.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === '确认')!;
+    const confirm = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find(button => button.textContent === '确认')!;
     expect(confirm.disabled).toBe(true);
     await act(async () => {
       const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!;
@@ -74,6 +74,21 @@ describe('project task review page', () => {
     expect(mock.refresh).toHaveBeenCalled();
   });
 
+  it('approves the selected version and surfaces a stale-decision conflict', async () => {
+    await render();
+    await click('通过审核');
+    const confirm = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find(button => button.textContent === '确认')!;
+    await act(async () => confirm.click());
+    expect(mock.decide).toHaveBeenCalledWith('task-1', 1, 'approved', '');
+
+    mock.decide.mockRejectedValueOnce(new Error('Submission changed; reload before reviewing'));
+    await click('通过审核');
+    const retry = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find(button => button.textContent === '确认')!;
+    await act(async () => retry.click());
+    expect(element.querySelector('[role="alert"]')?.textContent).toContain('Submission changed');
+    expect(mock.list).toHaveBeenCalledTimes(3);
+  });
+
   it('opens a deep-linked review and lets mobile return to the list', async () => {
     await render('task-1');
     expect(mock.get).toHaveBeenCalledWith('task-1');
@@ -81,5 +96,13 @@ describe('project task review page', () => {
     await click('返回列表');
     const list = element.querySelector('[aria-current="true"]');
     expect(list).not.toBeNull();
+  });
+
+  it('opens a processed deep link without stale pending results replacing it', async () => {
+    mock.get.mockResolvedValue(processed);
+    await render('task-1');
+    expect(mock.list).toHaveBeenCalledWith('processed');
+    expect(element.textContent).toContain('已通过');
+    expect(element.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain('已处理');
   });
 });

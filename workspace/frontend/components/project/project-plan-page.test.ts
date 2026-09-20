@@ -17,6 +17,7 @@ const mock = vi.hoisted(() => ({
   role: 'admin',
   workspaceId: 'workspace-1',
   agents: [{ agentName: 'codex', displayName: 'Codex' }],
+  taskDetailProps: null as Record<string, unknown> | null,
 }));
 vi.mock('@/hooks/use-mobile', () => ({ useIsMobile: () => false }));
 vi.mock('@/lib/workspace-context', () => ({
@@ -31,6 +32,12 @@ vi.mock('@/lib/api', () => ({ workspaceApi: {
   dispatchPlanItem: mock.dispatchPlanItem, updatePlanItem: mock.updatePlanItem, publishPlanItem: mock.publishPlanItem,
   downloadFile: mock.downloadFile,
 } }));
+vi.mock('./task-detail-sheet', () => ({
+  TaskDetailSheet: (props: Record<string, unknown>) => {
+    mock.taskDetailProps = props;
+    return React.createElement('div', { 'data-testid': 'task-detail-sheet' }, String(props.taskId));
+  },
+}));
 
 const STORAGE_KEY = 'oa:projects:workspace:workspace-1:v1:plan:project-1:v1';
 let root: Root;
@@ -162,6 +169,7 @@ describe('Project plan table', () => {
     mock.updatePlanItem.mockReset();
     mock.publishPlanItem.mockReset();
     mock.downloadFile.mockReset().mockResolvedValue(undefined);
+    mock.taskDetailProps = null;
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     container = document.createElement('div');
     document.body.appendChild(container);
@@ -313,6 +321,35 @@ describe('Project plan table', () => {
     await render(STORAGE_KEY, true);
     expect(button('派发').disabled).toBe(true);
     expect(mock.dispatchPlanItem).not.toHaveBeenCalled();
+  });
+
+  it.each(['admin', 'member'])('opens a dispatched task detail from the plan for %s', async (memberRole) => {
+    mock.role = memberRole;
+    const item = {
+      id: 'plan-1', title: '上线', description: '', status: 'doing',
+      assignees: [{ id: 'human:user-lin', name: '小林', kind: 'human' }], priority: null,
+      tags: [], startDate: null, dueDate: null, attachments: [], acceptanceCriteria: '', version: 3,
+      tasks: [{ id: 'task-1', dispatchedUserId: 'user-lin', responsibleUserId: 'user-lin',
+        responsibleName: '小林', status: 'in_progress', sourceVersion: 2, submittedSummary: null }],
+    };
+    mock.listPlanItems.mockResolvedValueOnce([item]);
+    await render(STORAGE_KEY, true);
+    await click(button('小林'));
+    expect(container.querySelector('[data-testid="task-detail-sheet"]')?.textContent).toBe('task-1');
+    expect(mock.taskDetailProps).toMatchObject({ taskId: 'task-1', planItem: item, canManage: memberRole === 'admin' });
+  });
+
+  it('keeps dispatched task summaries non-interactive for viewers', async () => {
+    mock.role = 'viewer';
+    mock.listPlanItems.mockResolvedValueOnce([{
+      id: 'plan-1', title: '上线', description: '', status: 'doing', assignees: [], priority: null,
+      tags: [], startDate: null, dueDate: null, attachments: [], acceptanceCriteria: '', version: 1,
+      tasks: [{ id: 'task-1', dispatchedUserId: 'user-lin', responsibleUserId: 'user-lin',
+        responsibleName: '小林', status: 'in_progress', sourceVersion: 1, submittedSummary: null }],
+    }]);
+    await render(STORAGE_KEY, true);
+    expect(Array.from(container.querySelectorAll('button')).some((entry) => entry.textContent?.trim() === '小林')).toBe(false);
+    expect(mock.taskDetailProps).toBeNull();
   });
 
   it.each(['member', 'viewer'])('shows complete read-only plan details to %s', async (memberRole) => {

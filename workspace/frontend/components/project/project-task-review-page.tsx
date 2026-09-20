@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, Check, FileText, MessageSquare, RefreshCw, RotateCcw, Search } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
 import { useWorkspaceApi } from '@/lib/workspace-api-context';
@@ -40,16 +40,22 @@ export function ProjectTaskReviewPage({ initialTaskId }: { initialTaskId?: strin
   const [decision, setDecision] = useState<'approved' | 'returned' | null>(null);
   const [comment, setComment] = useState('');
   const [chatTask, setChatTask] = useState<KanbanTask | null>(null);
+  const loadGeneration = useRef(0);
+  const filterRef = useRef(filter);
+  filterRef.current = filter;
 
   const reload = useCallback(async () => {
+    const generation = ++loadGeneration.current;
     try {
       const reviews = await api.listTaskReviews(filter);
+      if (generation !== loadGeneration.current) return;
       setItems(reviews);
       setSelected(current => reviews.find(item => item.taskId === current?.taskId) ?? reviews[0] ?? null);
       setError('');
     } catch (reason) {
+      if (generation !== loadGeneration.current) return;
       setError(reason instanceof Error ? reason.message : zh ? '审核记录加载失败' : 'Could not load reviews');
-    } finally { setLoading(false); }
+    } finally { if (generation === loadGeneration.current) setLoading(false); }
   }, [api, filter, zh]);
 
   useEffect(() => { void reload(); }, [reload]);
@@ -59,8 +65,12 @@ export function ProjectTaskReviewPage({ initialTaskId }: { initialTaskId?: strin
     void api.getTaskReview(initialTaskId).then(review => {
       if (!active) return;
       setSelected(review);
-      setFilter(review.reviewState);
       setMobileDetail(true);
+      if (review.reviewState !== filterRef.current) {
+        loadGeneration.current += 1;
+        setFilter(review.reviewState);
+        setLoading(true);
+      }
     }).catch(() => {
       if (active) setError(zh ? '无法打开该审核记录' : 'Could not open this review');
     });
@@ -77,11 +87,12 @@ export function ProjectTaskReviewPage({ initialTaskId }: { initialTaskId?: strin
     try {
       await api.decideTaskReview(selected.taskId, selected.submissionVersion, decision, comment.trim());
       setDecision(null); setComment(''); setMobileDetail(false);
-      await Promise.all([reload(), refreshTasks()]);
+      await reload();
+      void refreshTasks().catch(() => {});
     } catch (reason) {
       setDecision(null);
-      setError(reason instanceof Error ? reason.message : zh ? '审核失败，请刷新后重试' : 'Review failed; refresh and try again');
       await reload();
+      setError(reason instanceof Error ? reason.message : zh ? '审核失败，请刷新后重试' : 'Review failed; refresh and try again');
     } finally { setBusy(false); }
   };
 
