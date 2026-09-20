@@ -418,6 +418,10 @@ def _sender_email_for(event: dict) -> str | None:
 
 
 def _fanout_impl(workspace_id: str, event: dict) -> None:
+    # Task comments already create a single targeted inbox notification for
+    # the responsible member; channel chat fan-out would notify twice.
+    if (event.get("metadata") or {}).get("task_comment"):
+        return
     db = SessionLocal()
     try:
         workspace = db.get(Workspace, workspace_id)
@@ -556,6 +560,16 @@ def fanout_for_notification(notification: dict) -> None:
                 WorkspaceMembership, WorkspaceMembership.user_id == User.id,
             ).where(WorkspaceMembership.workspace_id == workspace_id)
             token_query = token_query.where(DeviceToken.user_email.in_(member_emails))
+        recipient_user_id = notification.get("recipient_user_id")
+        if recipient_user_id:
+            recipient_email = db.execute(
+                select(User.email)
+                .join(WorkspaceMembership, WorkspaceMembership.user_id == User.id)
+                .where(User.id == recipient_user_id, WorkspaceMembership.workspace_id == workspace_id)
+            ).scalar_one_or_none()
+            if not recipient_email:
+                return
+            token_query = token_query.where(DeviceToken.user_email == recipient_email)
         tokens: list[DeviceToken] = db.execute(token_query).scalars().all()
         if not tokens:
             return

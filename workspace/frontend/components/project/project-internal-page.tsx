@@ -8,14 +8,14 @@ import { ProjectPlanPage } from './project-plan-page';
 import { ProjectActivityPage } from './project-activity-page';
 import { ProjectMembersPage } from './project-members-page';
 import { ConnectAgentView } from '@/components/connect/connect-agent-view';
-import { useWorkspace } from '@/lib/workspace-context';
+import { useOptionalWorkspace } from '@/lib/workspace-context';
 import { Button } from '@/components/ui/button';
 import { useLayout, type ViewMode } from '@/components/layout/layout-context';
 
-type ProjectTab = 'activity' | 'plan' | 'members' | ProjectWorkspaceTab;
+type ProjectTab = 'activity' | 'plan' | 'members' | 'review' | ProjectWorkspaceTab;
 
 function ProjectConnectControl({ onOpen }: { onOpen: () => void }) {
-  const { me } = useWorkspace();
+  const me = useOptionalWorkspace()?.me;
   const t = useT();
   if (!['admin', 'owner'].includes(me?.role || '')) return null;
   return <Button variant="ghost" size="sm" onClick={onOpen} className="ml-auto"><PlusSquare className="size-4" /><span className="hidden sm:inline">{t('nav.connectAgent')}</span></Button>;
@@ -31,7 +31,7 @@ function ProjectModuleNavigation({ onSwitch }: { onSwitch: (tab: ProjectWorkspac
   return null;
 }
 
-const TABS: ProjectTab[] = ['activity', 'plan', 'tasks', 'files', 'workflows', 'browser', 'knowledge', 'members'];
+const TABS: ProjectTab[] = ['activity', 'plan', 'tasks', 'files', 'workflows', 'browser', 'knowledge', 'members', 'review'];
 
 interface ProjectInternalPageProps {
   projectId: string;
@@ -41,13 +41,24 @@ interface ProjectInternalPageProps {
   planStorageKey?: string;
   initialSessionId?: string;
   projectScoped?: boolean;
+  initialTab?: 'plan';
+  initialPlanItemId?: string;
 }
 
-export function ProjectInternalPage({ projectId, projectName, onBack, workspaceModulesAvailable = true, planStorageKey, initialSessionId, projectScoped = false }: ProjectInternalPageProps) {
+export function ProjectInternalPage({ projectId, projectName, onBack, workspaceModulesAvailable = true, planStorageKey, initialSessionId, projectScoped = false, initialTab, initialPlanItemId }: ProjectInternalPageProps) {
   const t = useT();
   const { locale } = useI18n();
-  const [activeTab, setActiveTab] = useState<ProjectTab>('activity');
+  const [activeTab, setActiveTab] = useState<ProjectTab>(initialTab ?? 'activity');
   const [connecting, setConnecting] = useState(false);
+  const me = useOptionalWorkspace()?.me;
+  const admin = me?.role === 'owner' || me?.role === 'admin';
+  const visibleTabs = TABS.filter((tab) => (tab === 'review' || (tab === 'plan' && workspaceModulesAvailable)) ? (workspaceModulesAvailable && admin) || (tab === 'plan' && !workspaceModulesAvailable) : true);
+  useEffect(() => {
+    if (me && !admin && (activeTab === 'plan' || activeTab === 'review')) setActiveTab('activity');
+  }, [me, admin, activeTab]);
+  useEffect(() => {
+    if (initialTab === 'plan' && admin) setActiveTab('plan');
+  }, [initialTab, initialPlanItemId, admin]);
   const labels: Record<ProjectTab, string> = {
     activity: locale === 'zh-CN' ? '动态' : 'Activity',
     plan: locale === 'zh-CN' ? '计划' : 'Plan',
@@ -57,6 +68,7 @@ export function ProjectInternalPage({ projectId, projectName, onBack, workspaceM
     browser: t('views.browser'),
     knowledge: t('views.knowledge'),
     members: locale === 'zh-CN' ? '成员管理' : 'Members',
+    review: locale === 'zh-CN' ? '审核' : 'Review',
   };
 
   return (
@@ -74,7 +86,7 @@ export function ProjectInternalPage({ projectId, projectName, onBack, workspaceM
 
       <nav aria-label={locale === 'zh-CN' ? '项目导航' : 'Project navigation'} className="shrink-0 overflow-x-auto border-b border-border px-5 sm:px-8 lg:px-10">
         <div className="flex min-w-max gap-7 sm:gap-9">
-          {TABS.map((tab) => (
+          {visibleTabs.map((tab) => (
             <button key={tab} type="button" onClick={() => setActiveTab(tab)} aria-current={activeTab === tab ? 'page' : undefined} className={`relative flex h-12 shrink-0 items-center whitespace-nowrap text-sm font-medium focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-ring ${activeTab === tab ? 'text-foreground after:absolute after:inset-x-0 after:bottom-0 after:h-0.5 after:rounded-full after:bg-foreground' : 'text-muted-foreground hover:text-foreground'}`}>
               {labels[tab]}
             </button>
@@ -85,8 +97,8 @@ export function ProjectInternalPage({ projectId, projectName, onBack, workspaceM
       <div data-testid="project-tab-content" data-active-tab={activeTab} className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {connecting ? <><div className="flex h-11 shrink-0 items-center justify-end border-b px-5"><Button variant="ghost" mode="icon" size="sm" onClick={() => setConnecting(false)} title={t('common.close')} aria-label={t('common.close')}><X className="size-4" /></Button></div><div className="min-h-0 flex-1"><ConnectAgentView onConnected={() => setConnecting(false)} /></div></> : <>
         {activeTab === 'activity' && workspaceModulesAvailable && <ProjectActivityPage projectId={projectId} projectName={projectName} initialSessionId={initialSessionId} />}
-        {activeTab === 'plan' && <ProjectPlanPage projectId={projectId} storageKey={planStorageKey} workspaceModulesAvailable={workspaceModulesAvailable} />}
-        {activeTab !== 'activity' && activeTab !== 'plan' && activeTab !== 'members' && workspaceModulesAvailable && (
+        {activeTab === 'plan' && (!workspaceModulesAvailable || admin) && <ProjectPlanPage projectId={projectId} storageKey={planStorageKey} workspaceModulesAvailable={workspaceModulesAvailable} focusItemId={initialPlanItemId} />}
+        {activeTab !== 'activity' && activeTab !== 'plan' && activeTab !== 'members' && activeTab !== 'review' && workspaceModulesAvailable && (
           <ProjectWorkspaceContent key={activeTab} tab={activeTab} />
         )}
         {activeTab === 'members' && workspaceModulesAvailable && projectScoped && <ProjectMembersPage />}

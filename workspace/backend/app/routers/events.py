@@ -244,6 +244,10 @@ def send_event(
     source = body.source
     payload = dict(body.payload or {})
     metadata = dict(body.metadata or {})
+    # These are stamped by the task pipeline/action endpoints, never by a
+    # caller posting a normal event directly.
+    metadata.pop("task_comment", None)
+    metadata.pop("task_workflow_step_complete", None)
     required_role = "member"
     if body.type.startswith("network.agent.") or body.type == "network.ping":
         required_role = "admin"
@@ -253,6 +257,7 @@ def send_event(
         code = ResponseCode.FORBIDDEN if resolve_user_role(db, workspace, authorization) is not None else ResponseCode.UNAUTHORIZED
         return json_response(code, "Project membership and sufficient role required")
     if authorization is not None:
+        metadata.pop("task_run_id", None)
         actor = resolve_current_user(db, authorization)
         if actor is None:
             return json_response(ResponseCode.UNAUTHORIZED, "Invalid identity token")

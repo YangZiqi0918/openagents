@@ -24,6 +24,7 @@ export interface PlanRecord {
   startDate: string | null;
   dueDate: string | null;
   attachments: PlanAttachment[];
+  acceptanceCriteria?: string;
 }
 export interface Members {
   options: Assignee[];
@@ -122,6 +123,7 @@ export function newPlanRecord(): PlanRecord {
     id: crypto.randomUUID(),
     title: '',
     description: '',
+    acceptanceCriteria: '',
     status: 'todo',
     assignees: [],
     priority: null,
@@ -139,6 +141,7 @@ const COPY = {
     addRow: '添加记录',
     title: '标题',
     description: '描述',
+    acceptanceCriteria: '验收标准',
     status: '状态',
     assignee: '处理人',
     priority: '优先级',
@@ -222,6 +225,7 @@ const COPY = {
     addRow: 'Add record',
     title: 'Title',
     description: 'Description',
+    acceptanceCriteria: 'Acceptance criteria',
     status: 'Status',
     assignee: 'Assignee',
     priority: 'Priority',

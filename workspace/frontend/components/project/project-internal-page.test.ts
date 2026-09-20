@@ -9,7 +9,11 @@ import { ProjectInternalPage } from './project-internal-page';
 
 const mobile = vi.hoisted(() => ({ value: false }));
 vi.mock('@/hooks/use-mobile', () => ({ useIsMobile: () => mobile.value }));
-vi.mock('@/lib/workspace-context', () => ({ useWorkspace: () => ({ workspace: { workspaceId: 'test' }, agents: [] }) }));
+const role = vi.hoisted(() => ({ value: 'admin' }));
+vi.mock('@/lib/workspace-context', () => ({
+  useWorkspace: () => ({ workspace: { workspaceId: 'test' }, agents: [], me: { role: role.value } }),
+  useOptionalWorkspace: () => ({ workspace: { workspaceId: 'test' }, agents: [], me: { role: role.value } }),
+}));
 vi.mock('@/lib/api', () => ({ workspaceApi: { getTeam: vi.fn().mockResolvedValue([]) } }));
 vi.mock('./project-activity-page', () => ({ ProjectActivityPage: () => React.createElement('div', { 'data-testid': 'activity-module' }) }));
 vi.mock('@/components/tasks/tasks-view', () => ({ TasksView: () => React.createElement('div', { 'data-testid': 'tasks-module' }) }));
@@ -59,6 +63,7 @@ describe('Project internal page', () => {
   beforeEach(() => {
     localStorage.clear();
     mobile.value = false;
+    role.value = 'admin';
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     container = document.createElement('div');
     document.body.appendChild(container);
@@ -71,23 +76,33 @@ describe('Project internal page', () => {
     vi.unstubAllGlobals();
   });
 
-  it('shows eight tabs, the activity module, the plan table and a blank members panel', async () => {
+  it('shows the admin plan and a blank review panel after members', async () => {
     const onBack = await render();
     expect(container.querySelector('header')?.textContent).toBe('项目/测试项目');
     expect(Array.from(container.querySelectorAll('nav button'), (item) => item.textContent))
-      .toEqual(['动态', '计划', '任务', '文件', '工作流', '浏览器', '知识库', '成员管理']);
+      .toEqual(['动态', '计划', '任务', '文件', '工作流', '浏览器', '知识库', '成员管理', '审核']);
     expect(tab('动态').getAttribute('aria-current')).toBe('page');
     expect(container.querySelector('[data-testid="activity-module"]')).not.toBeNull();
     await click(tab('计划'));
     expect(tab('计划').getAttribute('aria-current')).toBe('page');
     expect(container.querySelector('[data-testid="project-plan-page"]')).not.toBeNull();
-    expect(container.querySelector('table')).not.toBeNull();
+    expect(container.querySelector('[data-testid="project-plan-page"]')).not.toBeNull();
     await click(tab('成员管理'));
     expect(tab('成员管理').getAttribute('aria-current')).toBe('page');
     expect(container.querySelector('[data-testid="project-tab-content"]')?.getAttribute('data-active-tab')).toBe('members');
     expect(container.querySelector('[data-testid="project-tab-content"]')?.childElementCount).toBe(0);
+    await click(tab('审核'));
+    expect(container.querySelector('[data-testid="project-tab-content"]')?.getAttribute('data-active-tab')).toBe('review');
+    expect(container.querySelector('[data-testid="project-tab-content"]')?.childElementCount).toBe(0);
     await click(container.querySelector<HTMLButtonElement>('header button')!);
     expect(onBack).toHaveBeenCalledOnce();
+  });
+
+  it('hides plan and review from ordinary project members', async () => {
+    role.value = 'member';
+    await render();
+    expect(Array.from(container.querySelectorAll('nav button'), (item) => item.textContent)).not.toContain('计划');
+    expect(Array.from(container.querySelectorAll('nav button'), (item) => item.textContent)).not.toContain('审核');
   });
 
   it('embeds the five existing modules beneath the project navigation', async () => {

@@ -9,6 +9,7 @@ import type {
   DMConversation,
   EventPollResponse,
   KanbanTask,
+  ProjectPlanItem,
   TaskRunInfo,
   Workflow,
   WorkflowStep,
@@ -254,6 +255,43 @@ export class WorkspaceApi {
 
   async getTeam(): Promise<TeamMember[]> {
     return this.request<TeamMember[]>(`/v1/workspaces/${this.requireWorkspace()}/team`);
+  }
+
+  async listPlanItems(): Promise<ProjectPlanItem[]> {
+    const result = await this.request<{ items: ProjectPlanItem[] }>(`/v1/workspaces/${this.requireWorkspace()}/plan-items`);
+    return result.items;
+  }
+
+  async createPlanItem(input: Omit<ProjectPlanItem, 'id' | 'version' | 'tasks'>): Promise<ProjectPlanItem> {
+    return this.request<ProjectPlanItem>(`/v1/workspaces/${this.requireWorkspace()}/plan-items`, {
+      method: 'POST', body: JSON.stringify(input),
+    });
+  }
+
+  async updatePlanItem(id: string, input: Partial<Omit<ProjectPlanItem, 'id' | 'tasks'>>): Promise<ProjectPlanItem> {
+    return this.request<ProjectPlanItem>(`/v1/workspaces/${this.requireWorkspace()}/plan-items/${encodeURIComponent(id)}`, {
+      method: 'PATCH', body: JSON.stringify(input),
+    });
+  }
+
+  async deletePlanItem(id: string): Promise<void> {
+    await this.request(`/v1/workspaces/${this.requireWorkspace()}/plan-items/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  }
+
+  async dispatchPlanItem(id: string, userIds: string[], version: number): Promise<{ tasks: KanbanTask[] }> {
+    const response = await this.request<{ tasks: Record<string, unknown>[] }>(
+      `/v1/workspaces/${this.requireWorkspace()}/plan-items/${encodeURIComponent(id)}/dispatch`, {
+        method: 'POST', body: JSON.stringify({ userIds, version }),
+      },
+    );
+    return { tasks: response.tasks.map((task) => this.mapTask(task)) };
+  }
+
+  async publishPlanItem(id: string, taskIds: string[], version: number): Promise<{ tasks: KanbanTask[] }> {
+    const response = await this.request<{ tasks: Record<string, unknown>[] }>(`/v1/workspaces/${this.requireWorkspace()}/plan-items/${encodeURIComponent(id)}/publish`, {
+      method: 'POST', body: JSON.stringify({ taskIds, version }),
+    });
+    return { tasks: response.tasks.map((task) => this.mapTask(task)) };
   }
 
   async addTeamMember(email: string, role: WorkspaceRole): Promise<{ email: string; role: string }> {
@@ -1607,6 +1645,20 @@ export class WorkspaceApi {
       lastMessage: (t.last_message || null) as string | null,
       createdAt: (t.created_at || null) as string | null,
       updatedAt: (t.updated_at || null) as string | null,
+      planItemId: (t.plan_item_id || null) as string | null,
+      responsibleUserId: (t.responsible_user_id || null) as string | null,
+      sourceVersion: (t.source_version ?? null) as number | null,
+      executionStatus: (t.execution_status || null) as string | null,
+      activeRunId: (t.active_run_id || null) as string | null,
+      submittedSummary: (t.submitted_summary || null) as string | null,
+      submissionHistory: (t.submission_history || []) as KanbanTask['submissionHistory'],
+      transferUserId: (t.transfer_user_id || null) as string | null,
+      transferReason: (t.transfer_reason || null) as string | null,
+      declineReason: (t.decline_reason || null) as string | null,
+      acceptanceCriteria: (t.acceptance_criteria || null) as string | null,
+      tags: (t.tags || []) as string[],
+      startDate: (t.start_date || null) as string | null,
+      dueDate: (t.due_date || null) as string | null,
     };
   }
 
@@ -1615,6 +1667,37 @@ export class WorkspaceApi {
     const raw = await this.request<{ tasks: Record<string, unknown>[] }>(`/v1/tasks?${params}`);
     return { tasks: (raw.tasks || []).map((t) => this.mapTask(t)) };
   }
+
+  async getTask(id: string): Promise<KanbanTask> {
+    const params = new URLSearchParams({ network: this.workspaceId });
+    return this.mapTask(await this.request<Record<string, unknown>>(`/v1/tasks/${encodeURIComponent(id)}?${params}`));
+  }
+
+  private async taskAction(id: string, action: string, input: Record<string, unknown> = {}): Promise<KanbanTask> {
+    const raw = await this.request<Record<string, unknown>>(`/v1/tasks/${encodeURIComponent(id)}/${action}`, {
+      method: 'POST', body: JSON.stringify({ network: this.workspaceId, ...input }),
+    });
+    return this.mapTask(raw);
+  }
+
+  configureTask(id: string, input: { mode: 'manual' | 'agent' | 'workflow'; agent?: string; workflowId?: string; knowledgeIds?: string[]; fileIds?: string[] }): Promise<KanbanTask> {
+    return this.taskAction(id, 'configure', {
+      mode: input.mode, agent: input.agent, workflow_id: input.workflowId,
+      knowledge_ids: input.knowledgeIds, file_ids: input.fileIds,
+    });
+  }
+
+  acceptTask(id: string): Promise<KanbanTask> { return this.taskAction(id, 'accept'); }
+  declineTask(id: string, reason: string): Promise<KanbanTask> { return this.taskAction(id, 'decline', { reason }); }
+  submitTask(id: string, summary: string, fileIds: string[] = []): Promise<KanbanTask> {
+    return this.taskAction(id, 'submit', { summary, file_ids: fileIds });
+  }
+  stopMemberTask(id: string): Promise<KanbanTask> { return this.taskAction(id, 'stop'); }
+  transferTask(id: string, userId: string, reason: string, force = false): Promise<KanbanTask> {
+    return this.taskAction(id, 'transfer', { user_id: userId, reason, force });
+  }
+  acceptTaskTransfer(id: string): Promise<KanbanTask> { return this.taskAction(id, 'transfer-accept'); }
+  completeTaskStep(id: string, content: string): Promise<KanbanTask> { return this.taskAction(id, 'complete-step', { content }); }
 
   async createTask(input: {
     title: string;

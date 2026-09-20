@@ -18,6 +18,8 @@ export interface Workspace {
 export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer';
 
 export interface TeamMember {
+  id?: string;
+  userId?: string;
   email: string;
   username?: string | null;
   displayName: string | null;
@@ -472,6 +474,50 @@ export interface KanbanTask {
   lastMessage: string | null;
   createdAt: string | null;
   updatedAt: string | null;
+  /** Human ownership is separate from the agent assignee. Null on legacy tasks. */
+  planItemId?: string | null;
+  responsibleUserId?: string | null;
+  sourceVersion?: number | null;
+  executionStatus?: string | null;
+  activeRunId?: string | null;
+  submittedSummary?: string | null;
+  submissionHistory?: Array<{ summary: string; fileIds?: string[]; submittedAt?: string; submittedBy?: string }>;
+  transferUserId?: string | null;
+  transferReason?: string | null;
+  declineReason?: string | null;
+  acceptanceCriteria?: string | null;
+  tags?: string[];
+  startDate?: string | null;
+  dueDate?: string | null;
+}
+
+export interface PlanTaskSummary {
+  id: string;
+  /** Original dispatch recipient; does not change when responsibility transfers. */
+  dispatchedUserId: string | null;
+  responsibleUserId: string | null;
+  responsibleName: string | null;
+  status: TaskStatus;
+  sourceVersion: number;
+  submittedSummary: string | null;
+  declineReason?: string | null;
+  transferUserId?: string | null;
+}
+
+export interface ProjectPlanItem {
+  id: string;
+  title: string;
+  description: string;
+  status: 'todo' | 'doing' | 'paused' | 'done';
+  assignees: Array<{ id: string; name: string; kind: 'human' | 'agent'; avatarUrl?: string | null }>;
+  priority: 'urgent' | 'high' | 'medium' | 'low' | null;
+  tags: string[];
+  startDate: string | null;
+  dueDate: string | null;
+  attachments: Array<{ id: string; filename: string; contentType: string; size: number }>;
+  acceptanceCriteria: string;
+  version: number;
+  tasks: PlanTaskSummary[];
 }
 
 // ---------------------------------------------------------------------------

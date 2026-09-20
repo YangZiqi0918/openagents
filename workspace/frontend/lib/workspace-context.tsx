@@ -261,6 +261,10 @@ export function useWorkspace() {
   return ctx;
 }
 
+export function useOptionalWorkspace() {
+  return useContext(WorkspaceContext);
+}
+
 interface WorkspaceProviderProps {
   workspaceId: string;
   token: string | null;
@@ -935,6 +939,11 @@ function WorkspaceStateProvider({
 
   const stopTask = useCallback(async (id: string) => {
     const task = tasks.find((t) => t.id === id);
+    if (task?.responsibleUserId) {
+      const stopped = await workspaceApi.stopMemberTask(id);
+      setTasks((prev) => prev.map((entry) => entry.id === id ? stopped : entry));
+      return;
+    }
     // Signal the agent to abort its current run in the task thread.
     if (task?.assignee && task.channelName) {
       try {

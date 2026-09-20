@@ -16,8 +16,13 @@ import {
   Waypoints,
   BookOpen,
   Paperclip,
+  Check,
+  Send,
+  Settings2,
+  X,
 } from 'lucide-react';
 import { useWorkspace } from '@/lib/workspace-context';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { useLayout } from '@/components/layout/layout-context';
 import { DetailHeader } from '@/components/layout/app-header';
 import { FeatureTourBanner } from '@/components/tours/feature-tours';
@@ -32,9 +37,11 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import type { KanbanTask } from '@/lib/types';
-import { useFormatters, useT } from '@/lib/i18n';
-import { NewTaskDialog } from './new-task-dialog';
+import { useFormatters, useI18n, useT } from '@/lib/i18n';
+import { AttachmentPicker, NewTaskDialog } from './new-task-dialog';
 import { TaskChatPopup } from './task-chat-popup';
+import { TaskExecutionDialog, type TaskExecutionConfig } from './task-execution-dialog';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/responsive-dialog';
 
 // ── Card ──────────────────────────────────────────────────────────────────
 
@@ -46,6 +53,13 @@ function TaskCard({
   onOpenChat,
   onEdit,
   onDelete,
+  onConfigure,
+  onAccept,
+  onDecline,
+  onSubmit,
+  onAcceptTransfer,
+  onCompleteStep,
+  busy,
 }: {
   task: KanbanTask;
   onSetAssignee: (agent: string) => void;
@@ -54,15 +68,30 @@ function TaskCard({
   onOpenChat: () => void;
   onEdit: () => void;
   onDelete: () => void;
+  onConfigure: () => void;
+  onAccept: () => void;
+  onDecline: () => void;
+  onSubmit: () => void;
+  onAcceptTransfer: () => void;
+  onCompleteStep: () => void;
+  busy: boolean;
 }) {
   const t = useT();
+  const { locale } = useI18n();
+  const zh = locale === 'zh-CN';
   const { timeAgo } = useFormatters();
-  const { agents, workflows, canWrite = true } = useWorkspace();
+  const { agents, workflows, canWrite = true, me } = useWorkspace();
+  const dispatched = Boolean(task.responsibleUserId);
+  const ownTask = !dispatched || task.responsibleUserId === me?.userId;
+  const canManage = canWrite && ownTask;
+  const pendingTransfer = dispatched && task.transferUserId === me?.userId && task.responsibleUserId !== me?.userId;
   const onlineAgents = agents.filter((a) => a.status === 'online');
 
   const isBacklog = task.status === 'backlog' || task.status === 'todo';
   const isRunning = task.status === 'in_progress';
   const needsInput = task.status === 'need_input';
+  const aiNeedsInput = dispatched && task.executionStatus === 'need_input';
+  const executionRunning = dispatched && (task.executionStatus === 'running' || aiNeedsInput);
   const openable = !!task.channelName;
   const runnable = !!task.assignee || !!task.workflowId;
   const workflowName = task.workflowId
@@ -71,7 +100,7 @@ function TaskCard({
 
   return (
     <div
-      onClick={openable ? onOpenChat : isBacklog && canWrite ? onEdit : undefined}
+      onClick={openable ? onOpenChat : isBacklog && canWrite && !dispatched ? onEdit : undefined}
       title={openable ? t('tasks.openChat') : isBacklog ? t('tasks.editTaskTitle') : undefined}
       className={cn(
         'group relative rounded-lg border bg-card p-3 shadow-sm transition-colors',
@@ -79,8 +108,8 @@ function TaskCard({
         needsInput ? 'border-rose-400/70' : isRunning ? 'border-amber-400/70' : 'border-border',
       )}
     >
-      {/* Attention ring: red pulse when the agent needs input, amber while working. */}
-      {(needsInput || isRunning) && (
+      {/* Submission needs attention; on human tasks running is an ownership state, not an AI run. */}
+      {(needsInput || (isRunning && !dispatched)) && (
         <span
           className={cn(
             'pointer-events-none absolute inset-0 rounded-lg ring-2 animate-pulse',
@@ -91,7 +120,7 @@ function TaskCard({
 
       <div className="flex items-start justify-between gap-2">
         <p className="text-sm font-medium leading-snug break-words min-w-0">{task.title}</p>
-        {canWrite && <div className="flex items-center gap-1.5 shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
+        {canWrite && !dispatched && <div className="flex items-center gap-1.5 shrink-0 opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-opacity">
           {isBacklog && (
             <button
               onClick={(e) => { e.stopPropagation(); onEdit(); }}
@@ -113,13 +142,16 @@ function TaskCard({
 
       {needsInput && (
         <span className="mt-1.5 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-semibold text-rose-600 dark:text-rose-400 bg-rose-500/10">
-          {t('tasks.needsInput')}
+          {dispatched ? (zh ? '待管理员审核' : 'Awaiting review') : t('tasks.needsInput')}
         </span>
       )}
+      {aiNeedsInput && <span className="mt-1.5 ml-1 inline-flex rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">{zh ? '智能体等待输入' : 'AI needs input'}</span>}
+      {pendingTransfer && <span className="mt-1.5 inline-flex rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">{zh ? '待接收交接' : 'Transfer pending'}</span>}
+      {task.declineReason && <p className="mt-1.5 text-xs text-muted-foreground">{zh ? '拒绝原因：' : 'Declined: '}{task.declineReason}</p>}
 
       {/* Need-input question: surface the thread's last message so the human
           can often see what's being asked without opening the popup. */}
-      {needsInput && task.lastMessage && (
+      {needsInput && !dispatched && task.lastMessage && (
         <p className="mt-1.5 rounded-md bg-rose-500/5 border border-rose-400/20 px-2 py-1.5 text-[11px] text-muted-foreground leading-snug line-clamp-3 whitespace-pre-wrap">
           {task.lastMessage}
         </p>
@@ -130,6 +162,8 @@ function TaskCard({
           {task.description}
         </p>
       )}
+      {dispatched && task.acceptanceCriteria && <p className="mt-1 text-xs text-muted-foreground">{zh ? '验收标准：' : 'Acceptance: '}{task.acceptanceCriteria}</p>}
+      {dispatched && task.submittedSummary && <p className="mt-2 rounded border border-border bg-muted/40 px-2 py-1.5 text-xs whitespace-pre-wrap">{zh ? '提交结果：' : 'Submission: '}{task.submittedSummary}</p>}
 
       {/* Workflow progress: “Step 2/3 · Review” + step dots. */}
       {task.workflowId && task.run && task.run.stepCount > 0 && (isRunning || needsInput || task.run.status === 'paused') && (
@@ -165,7 +199,7 @@ function TaskCard({
       )}
 
       {/* Live activity: what the agent is doing right now (thread-list style). */}
-      {isRunning && task.lastMessage && (
+      {isRunning && !dispatched && task.lastMessage && (
         <p className="mt-1.5 text-[11px] italic text-muted-foreground/70 leading-snug line-clamp-2 whitespace-pre-wrap">
           {task.lastMessage}
         </p>
@@ -193,8 +227,21 @@ function TaskCard({
       </p>
 
       <div className="mt-1.5 flex items-center gap-2">
+        {dispatched && pendingTransfer && <button disabled={busy} type="button" onClick={(event) => { event.stopPropagation(); onAcceptTransfer(); }} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-500/10"><Check className="size-3.5" />{zh ? '接收交接' : 'Accept transfer'}</button>}
+        {dispatched && isBacklog && canManage && !task.transferUserId && !task.declineReason && <>
+          <button disabled={busy} type="button" onClick={(event) => { event.stopPropagation(); onConfigure(); }} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted"><Settings2 className="size-3.5" />{zh ? '配置' : 'Configure'}</button>
+          <button disabled={busy} type="button" onClick={(event) => { event.stopPropagation(); onAccept(); }} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-500/10"><Check className="size-3.5" />{zh ? '接收任务' : 'Accept'}</button>
+          <button disabled={busy} type="button" onClick={(event) => { event.stopPropagation(); onDecline(); }} title={zh ? '拒绝任务' : 'Decline task'} aria-label={zh ? '拒绝任务' : 'Decline task'} className="rounded p-1 text-muted-foreground hover:text-destructive"><X className="size-3.5" /></button>
+        </>}
+        {dispatched && isRunning && canManage && !task.transferUserId && <>
+          {!executionRunning && <button disabled={busy} type="button" onClick={(event) => { event.stopPropagation(); onConfigure(); }} title={zh ? '调整执行配置' : 'Configure execution'} aria-label={zh ? '调整执行配置' : 'Configure execution'} className="rounded p-1 text-muted-foreground hover:text-foreground"><Settings2 className="size-3.5" /></button>}
+          {runnable && !executionRunning && <button disabled={busy} type="button" onClick={(event) => { event.stopPropagation(); onRun(); }} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs font-medium text-emerald-700 hover:bg-emerald-500/10"><Play className="size-3.5" />{t('tasks.run')}</button>}
+          {executionRunning && <button disabled={busy} type="button" onClick={(event) => { event.stopPropagation(); onStop(); }} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs text-rose-600 hover:bg-rose-500/10"><Square className="size-3" />{t('tasks.stop')}</button>}
+          {task.run?.stepAssigneeKind === 'human' && task.executionStatus === 'need_input' && <button disabled={busy} type="button" onClick={(event) => { event.stopPropagation(); onCompleteStep(); }} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs text-amber-700 hover:bg-amber-500/10"><Check className="size-3.5" />{zh ? '完成当前步骤' : 'Complete step'}</button>}
+          <button disabled={busy} type="button" onClick={(event) => { event.stopPropagation(); onSubmit(); }} className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-xs font-medium text-foreground hover:bg-muted"><Send className="size-3.5" />{zh ? '提交审核' : 'Submit for review'}</button>
+        </>}
         {/* Run — backlog only. Needs an agent or a workflow first. */}
-        {isBacklog && canWrite && (
+        {!dispatched && isBacklog && canWrite && (
           <button
             onClick={(e) => { e.stopPropagation(); if (runnable) onRun(); }}
             disabled={!runnable}
@@ -212,7 +259,7 @@ function TaskCard({
         )}
 
         {/* Stop — while running or awaiting input. */}
-        {(isRunning || needsInput) && canWrite && (
+        {!dispatched && (isRunning || needsInput) && canWrite && (
           <button
             onClick={(e) => { e.stopPropagation(); onStop(); }}
             className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium text-rose-600 dark:text-rose-400 hover:bg-rose-500/10 transition-colors"
@@ -224,7 +271,7 @@ function TaskCard({
         )}
 
         {/* Re-run — a done task can be run again (workflow restarts at step 1). */}
-        {task.status === 'done' && runnable && canWrite && (
+        {!dispatched && task.status === 'done' && runnable && canWrite && (
           <button
             onClick={(e) => { e.stopPropagation(); onRun(); }}
             className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium text-emerald-600 dark:text-emerald-400 hover:bg-emerald-500/10 transition-colors"
@@ -243,7 +290,7 @@ function TaskCard({
             <Waypoints className="size-3.5 shrink-0" />
             <span className="truncate">{workflowName}</span>
           </span>
-        ) : isBacklog && canWrite ? (
+        ) : !dispatched && isBacklog && canWrite ? (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <button
@@ -330,12 +377,22 @@ function BoardColumn({
 // ── Board ─────────────────────────────────────────────────────────────────
 
 export function TasksView() {
-  const { tasks, refreshTasks, createTask, updateTask, runTask, stopTask, deleteTask, canWrite = true } = useWorkspace();
+  const { tasks, refreshTasks, createTask, updateTask, runTask, stopTask, deleteTask, canWrite = true, workspace } = useWorkspace();
+  const api = useWorkspaceApi();
   const t = useT();
+  const { locale } = useI18n();
+  const zh = locale === 'zh-CN';
+  const projectTaskPool = workspace?.kind === 'project';
 
   const [newTaskOpen, setNewTaskOpen] = useState(false);
   const [editTask, setEditTask] = useState<KanbanTask | null>(null);
   const [chatTask, setChatTask] = useState<KanbanTask | null>(null);
+  const [configuredTask, setConfiguredTask] = useState<KanbanTask | null>(null);
+  const [dialogAction, setDialogAction] = useState<{ task: KanbanTask; kind: 'submit' | 'decline' | 'step' } | null>(null);
+  const [actionText, setActionText] = useState('');
+  const [submittedFiles, setSubmittedFiles] = useState<string[]>([]);
+  const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState('');
 
   // The popup should reflect live poll updates (step progress, status), not
   // the snapshot captured when it was opened.
@@ -354,8 +411,47 @@ export function TasksView() {
     if (target) {
       setChatTask(target);
       setPendingTaskChannel(null);
+      return;
     }
-  }, [pendingTaskChannel, tasks, setPendingTaskChannel]);
+    if (!pendingTaskChannel.startsWith('task:')) return;
+    let cancelled = false;
+    void api.getTask(pendingTaskChannel.slice(5)).then((task) => {
+      if (!cancelled) { setChatTask(task); setPendingTaskChannel(null); }
+    }).catch(() => { if (!cancelled) { setActionError(zh ? '无法打开该任务' : 'Could not open this task'); setPendingTaskChannel(null); } });
+    return () => { cancelled = true; };
+  }, [pendingTaskChannel, tasks, setPendingTaskChannel, api, zh]);
+
+  const actOnTask = async (task: KanbanTask, action: () => Promise<unknown>) => {
+    setBusyTaskId(task.id);
+    setActionError('');
+    try {
+      await action();
+      await refreshTasks();
+      if (chatTask?.id === task.id) setChatTask(await api.getTask(task.id));
+      return true;
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : zh ? '操作失败' : 'Action failed');
+      return false;
+    } finally { setBusyTaskId(null); }
+  };
+
+  const configure = async (task: KanbanTask, config: TaskExecutionConfig) => {
+    if (await actOnTask(task, () => api.configureTask(task.id, config))) setConfiguredTask(null);
+  };
+
+  const submitAction = async () => {
+    if (!dialogAction || !actionText.trim()) return;
+    const { task, kind } = dialogAction;
+    const success = await actOnTask(task, () => kind === 'submit'
+      ? api.submitTask(task.id, actionText.trim(), submittedFiles)
+      : kind === 'decline' ? api.declineTask(task.id, actionText.trim())
+        : api.completeTaskStep(task.id, actionText.trim()));
+    if (success) { setDialogAction(null); setActionText(''); setSubmittedFiles([]); }
+  };
+
+  const openAction = (task: KanbanTask, kind: 'submit' | 'decline' | 'step') => {
+    setActionText(''); setSubmittedFiles([]); setDialogAction({ task, kind });
+  };
 
   const { backlog, inProgress, needsAttention, done } = useMemo(() => {
     const b: KanbanTask[] = [], p: KanbanTask[] = [], n: KanbanTask[] = [], d: KanbanTask[] = [];
@@ -376,11 +472,18 @@ export function TasksView() {
         key={task.id}
         task={task}
         onSetAssignee={(agent) => updateTask(task.id, { assignee: agent })}
-        onRun={() => runTask(task.id)}
-        onStop={() => stopTask(task.id)}
+        onRun={() => { if (task.responsibleUserId) void actOnTask(task, () => runTask(task.id)); else void runTask(task.id); }}
+        onStop={() => { if (task.responsibleUserId) void actOnTask(task, () => stopTask(task.id)); else void stopTask(task.id); }}
         onOpenChat={() => setChatTask(task)}
         onEdit={() => setEditTask(task)}
         onDelete={() => deleteTask(task.id)}
+        onConfigure={() => setConfiguredTask(task)}
+        onAccept={() => void actOnTask(task, () => api.acceptTask(task.id))}
+        onDecline={() => openAction(task, 'decline')}
+        onSubmit={() => openAction(task, 'submit')}
+        onAcceptTransfer={() => void actOnTask(task, () => api.acceptTaskTransfer(task.id))}
+        onCompleteStep={() => openAction(task, 'step')}
+        busy={busyTaskId === task.id}
       />
     ));
 
@@ -392,10 +495,10 @@ export function TasksView() {
           <h2 className="text-sm font-semibold">{t('views.tasks')}</h2>
         </>}
       >
-        <Button size="sm" disabled={!canWrite} onClick={() => setNewTaskOpen(true)} className="gap-1.5">
+        {!projectTaskPool && <Button size="sm" disabled={!canWrite} onClick={() => setNewTaskOpen(true)} className="gap-1.5">
           <Plus className="size-3.5" />
           {t('tasks.newTask')}
-        </Button>
+        </Button>}
         <button
           onClick={refreshTasks}
           className="p-1.5 rounded-md hover:bg-zinc-100 dark:hover:bg-zinc-800 text-muted-foreground transition-colors"
@@ -405,6 +508,7 @@ export function TasksView() {
       </DetailHeader>
 
       <FeatureTourBanner feature="tasks" />
+      {actionError && <p role="alert" className="mx-4 mt-2 rounded border border-destructive/30 px-3 py-2 text-xs text-destructive">{actionError}</p>}
 
       {/* Board — four equal columns in lifecycle order (Backlog → In Progress →
           Needs attention → Done). Stacks vertically on mobile with whole-board
@@ -415,13 +519,13 @@ export function TasksView() {
             dotClass="bg-zinc-400"
             title={t('tasks.col.backlog')}
             count={backlog.length}
-            canAdd={canWrite}
+            canAdd={canWrite && !projectTaskPool}
             onAdd={() => setNewTaskOpen(true)}
             className="sm:flex-1 sm:min-w-0"
           >
             {/* The primary add affordance: a big, unmissable button that opens
                 the full create dialog (title/description/context/run-with). */}
-            <Button
+            {!projectTaskPool && <Button
               size="lg"
               disabled={!canWrite}
               onClick={() => setNewTaskOpen(true)}
@@ -429,7 +533,8 @@ export function TasksView() {
             >
               <Plus className="size-4" />
               {t('tasks.newTask')}
-            </Button>
+            </Button>}
+            {backlog.length === 0 && projectTaskPool && <p className="px-1 py-6 text-center text-xs text-muted-foreground">{zh ? '暂无待接收任务' : 'No tasks to accept'}</p>}
             {renderCards(backlog)}
           </BoardColumn>
 
@@ -446,7 +551,7 @@ export function TasksView() {
 
           <BoardColumn
             dotClass="bg-rose-500"
-            title={t('tasks.col.need_input')}
+            title={projectTaskPool ? (zh ? '需要关注 · 待审核' : 'Attention · awaiting review') : t('tasks.col.need_input')}
             count={needsAttention.length}
             className="sm:flex-1 sm:min-w-0"
           >
@@ -483,12 +588,34 @@ export function TasksView() {
         }}
       />
 
+      {configuredTask && <TaskExecutionDialog key={configuredTask.id} task={tasks.find((task) => task.id === configuredTask.id) ?? configuredTask} busy={busyTaskId === configuredTask.id} onClose={() => setConfiguredTask(null)} onSave={(config) => configure(configuredTask, config)} />}
+
+      <Dialog open={Boolean(dialogAction)} onOpenChange={(open) => { if (!open && !busyTaskId) setDialogAction(null); }}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>{dialogAction?.kind === 'submit' ? (zh ? '提交管理员审核' : 'Submit for review') : dialogAction?.kind === 'decline' ? (zh ? '拒绝任务' : 'Decline task') : (zh ? '完成工作流步骤' : 'Complete workflow step')}</DialogTitle>
+            <DialogDescription>{dialogAction?.task.title}</DialogDescription>
+          </DialogHeader>
+          <label className="space-y-1.5 text-xs font-medium text-muted-foreground">
+            <span>{dialogAction?.kind === 'submit' ? (zh ? '结果摘要' : 'Result summary') : dialogAction?.kind === 'decline' ? (zh ? '拒绝原因' : 'Reason') : (zh ? '步骤结果' : 'Step result')}</span>
+            <textarea aria-label={dialogAction?.kind === 'submit' ? (zh ? '结果摘要' : 'Result summary') : (zh ? '说明' : 'Details')} rows={4} value={actionText} onChange={(event) => setActionText(event.target.value)} className="block w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground focus-visible:outline-2 focus-visible:outline-ring" />
+          </label>
+          {dialogAction?.kind === 'submit' && <AttachmentPicker value={submittedFiles} onChange={setSubmittedFiles} />}
+          <DialogFooter>
+            <Button variant="outline" disabled={Boolean(busyTaskId)} onClick={() => setDialogAction(null)}>{zh ? '取消' : 'Cancel'}</Button>
+            <Button disabled={Boolean(busyTaskId) || !actionText.trim()} onClick={() => void submitAction()}>{zh ? '确认' : 'Confirm'}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {liveChatTask?.channelName && (
         <TaskChatPopup
           open={!!liveChatTask}
           onOpenChange={(o) => !o && setChatTask(null)}
           sessionId={liveChatTask.channelName}
           taskTitle={liveChatTask.title}
+          submissionHistory={liveChatTask.submissionHistory}
+          submittedSummary={liveChatTask.submittedSummary}
           assignee={liveChatTask.assignee}
           subtitle={
             liveChatTask.run && liveChatTask.run.stepCount > 0 && liveChatTask.run.stepIndex >= 0

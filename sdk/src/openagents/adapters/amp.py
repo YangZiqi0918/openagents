@@ -224,16 +224,26 @@ class AmpAdapter(BaseAdapter):
 
     async def _on_control_action(self, action: Optional[str], payload: dict):
         if action == "stop":
-            await self._stop_all_processes()
+            channel = payload.get("channel") if isinstance(payload, dict) else None
+            if channel:
+                await self._stop_channel(channel)
+            else:
+                await self._stop_all_processes()
+
+    async def _stop_channel(self, channel: str):
+        proc = self._channel_processes.get(channel)
+        if proc is None:
+            return
+        self._stopping_channels.add(channel)
+        await self._stop_process(proc)
+        self._channel_processes.pop(channel, None)
+        self._channel_queues.pop(channel, None)
+        await self._send_status(channel, "Execution stopped by user")
 
     async def _stop_all_processes(self):
         """Terminate any running Amp subprocess (stop button)."""
-        for channel, proc in list(self._channel_processes.items()):
-            self._stopping_channels.add(channel)
-            await self._stop_process(proc)
-            self._channel_processes.pop(channel, None)
-            self._channel_queues.pop(channel, None)
-            await self._send_status(channel, "Execution stopped by user")
+        for channel in list(self._channel_processes):
+            await self._stop_channel(channel)
 
     async def _stop_process(self, proc: asyncio.subprocess.Process):
         """Kill a single Amp subprocess and its child process group."""

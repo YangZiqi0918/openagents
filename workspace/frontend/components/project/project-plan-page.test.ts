@@ -8,6 +8,11 @@ import { ProjectPlanPage } from './project-plan-page';
 
 const mock = vi.hoisted(() => ({
   getTeam: vi.fn(),
+  listPlanItems: vi.fn(),
+  createPlanItem: vi.fn(),
+  dispatchPlanItem: vi.fn(),
+  updatePlanItem: vi.fn(),
+  publishPlanItem: vi.fn(),
   workspaceId: 'workspace-1',
   agents: [{ agentName: 'codex', displayName: 'Codex' }],
 }));
@@ -18,7 +23,10 @@ vi.mock('@/lib/workspace-context', () => ({
     agents: mock.agents,
   }),
 }));
-vi.mock('@/lib/api', () => ({ workspaceApi: { getTeam: mock.getTeam } }));
+vi.mock('@/lib/api', () => ({ workspaceApi: {
+  getTeam: mock.getTeam, listPlanItems: mock.listPlanItems, createPlanItem: mock.createPlanItem,
+  dispatchPlanItem: mock.dispatchPlanItem, updatePlanItem: mock.updatePlanItem, publishPlanItem: mock.publishPlanItem,
+} }));
 
 const STORAGE_KEY = 'oa:projects:workspace:workspace-1:v1:plan:project-1:v1';
 let root: Root;
@@ -142,7 +150,12 @@ describe('Project plan table', () => {
   beforeEach(() => {
     localStorage.clear();
     mock.workspaceId = 'workspace-1';
-    mock.getTeam.mockReset().mockResolvedValue([{ email: 'lin@example.com', displayName: '小林' }]);
+    mock.getTeam.mockReset().mockResolvedValue([{ email: 'lin@example.com', userId: 'user-lin', displayName: '小林', role: 'member' }]);
+    mock.listPlanItems.mockReset().mockResolvedValue([]);
+    mock.createPlanItem.mockReset();
+    mock.dispatchPlanItem.mockReset().mockResolvedValue({ tasks: [] });
+    mock.updatePlanItem.mockReset();
+    mock.publishPlanItem.mockReset();
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     container = document.createElement('div');
     document.body.appendChild(container);
@@ -250,75 +263,58 @@ describe('Project plan table', () => {
     expect(saved()[0].title).toBe('新需求');
   });
 
-  it('selects multiple human and agent assignees and supports clearing them', async () => {
+  it('loads connected plans from the server without writing local data', async () => {
+    mock.listPlanItems.mockResolvedValueOnce([{ id: 'plan-1', title: '服务端计划', description: '', status: 'todo', assignees: [], priority: null, tags: [], startDate: null, dueDate: null, attachments: [], acceptanceCriteria: '', version: 1, tasks: [] }]);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify([record('old', '本地旧计划')]));
     await render(STORAGE_KEY, true);
-    await add('负责人测试');
-    await select('处理人: 负责人测试', 'human:lin@example.com');
-    expect(saved()[0].assignees).toEqual([
-      expect.objectContaining({ id: 'human:lin@example.com', name: '小林', kind: 'human' }),
-    ]);
-    await select('处理人: 负责人测试', 'agent:codex');
-    expect(saved()[0].assignees.map((item: { name: string }) => item.name)).toEqual(['小林', 'Codex']);
-    await select('处理人: 负责人测试', 'none');
-    expect(saved()[0].assignees).toEqual([]);
+    expect(container.textContent).toContain('服务端计划');
+    expect(container.textContent).not.toContain('本地旧计划');
+    expect(mock.createPlanItem).not.toHaveBeenCalled();
   });
 
-  it('retains a removed assignee on its record without offering it for new assignments', async () => {
-    const assignee = { id: 'human:old@example.com', name: '历史成员', kind: 'human' };
-    const raw = JSON.stringify([record('a', '旧记录', { assignee }), record('b', '新记录')]);
+  it('previews local records before explicitly importing them as server drafts', async () => {
+    const raw = JSON.stringify([record('old', '本地旧计划')]);
     localStorage.setItem(STORAGE_KEY, raw);
+    mock.createPlanItem.mockResolvedValue({ id: 'new', title: '本地旧计划', description: '', status: 'todo', assignees: [], priority: 'medium', tags: [], startDate: null, dueDate: null, attachments: [], acceptanceCriteria: '', version: 1, tasks: [] });
     await render(STORAGE_KEY, true);
-    expect(labelled('处理人: 旧记录').textContent).toContain('历史成员');
-    await click(labelled('处理人: 新记录'));
-    expect(document.querySelector('[data-slot="popover-content"]')?.textContent).not.toContain('历史成员');
+    await click(button('导入本地计划'));
+    expect(document.body.textContent).toContain('找到 1 条');
+    expect(mock.createPlanItem).not.toHaveBeenCalled();
+    await click(button('导入为草稿'));
+    expect(mock.createPlanItem).toHaveBeenCalledWith(expect.objectContaining({ title: '本地旧计划', assignees: [] }));
     expect(localStorage.getItem(STORAGE_KEY)).toBe(raw);
   });
 
-  it('reports member failures, preserves table editing and retries loading', async () => {
-    mock.getTeam.mockRejectedValueOnce(new Error('Offline'));
+  it('dispatches selected human owners once and shows individual server states', async () => {
+    const item = { id: 'plan-1', title: '上线', description: '部署', status: 'todo', assignees: [{ id: 'human:user-lin', name: '小林', kind: 'human' }], priority: null, tags: [], startDate: null, dueDate: null, attachments: [], acceptanceCriteria: '', version: 2, tasks: [] };
+    mock.listPlanItems.mockResolvedValueOnce([item]).mockResolvedValueOnce([{ ...item, tasks: [{ id: 'task-1', responsibleUserId: 'user-lin', responsibleName: '小林', status: 'need_input', sourceVersion: 2, submittedSummary: '已部署' }] }]);
     await render(STORAGE_KEY, true);
-    expect(container.textContent).toContain('工作区成员加载失败');
-    await add('本地编辑');
+    await click(button('派发 (1)'));
+    await click(button('确认派发'));
+    expect(mock.dispatchPlanItem).toHaveBeenCalledWith('plan-1', ['user-lin'], 2);
+    expect(container.textContent).toContain('待审核');
+    expect(container.textContent).toContain('小林');
+  });
+
+  it('does not offer dispatch again to the original recipient after a handoff', async () => {
+    mock.listPlanItems.mockResolvedValueOnce([{
+      id: 'plan-1', title: '上线', description: '', status: 'doing',
+      assignees: [{ id: 'human:user-lin', name: '小林', kind: 'human' }], priority: null,
+      tags: [], startDate: null, dueDate: null, attachments: [], acceptanceCriteria: '', version: 2,
+      tasks: [{ id: 'task-1', dispatchedUserId: 'user-lin', responsibleUserId: 'user-new',
+        responsibleName: '新负责人', status: 'in_progress', sourceVersion: 2, submittedSummary: null }],
+    }]);
+    await render(STORAGE_KEY, true);
+    expect(button('派发').disabled).toBe(true);
+    expect(mock.dispatchPlanItem).not.toHaveBeenCalled();
+  });
+
+  it('reports failed server loading with a retry', async () => {
+    mock.listPlanItems.mockRejectedValueOnce(new Error('Offline'));
+    await render(STORAGE_KEY, true);
+    expect(container.textContent).toContain('Offline');
     await click(button('重试'));
-    expect(mock.getTeam).toHaveBeenCalledTimes(2);
-    expect(container.textContent).not.toContain('工作区成员加载失败');
-    await select('处理人: 本地编辑', 'human:lin@example.com');
-    expect(saved()[0].assignees[0].name).toBe('小林');
-  });
-
-  it('shows member loading without blocking local record creation', async () => {
-    let finish!: (members: unknown[]) => void;
-    mock.getTeam.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          finish = resolve;
-        }),
-    );
-    await render(STORAGE_KEY, true);
-    expect(container.textContent).toContain('正在加载成员');
-    await add('离线准备');
-    expect(labelled<HTMLSelectElement>('处理人: 离线准备').disabled).toBe(true);
-    await act(() => finish([]));
-    expect(labelled<HTMLSelectElement>('处理人: 离线准备').disabled).toBe(false);
-  });
-
-  it('ignores member requests resolved after changing workspace', async () => {
-    let finish!: (members: unknown[]) => void;
-    mock.getTeam.mockImplementationOnce(
-      () =>
-        new Promise((resolve) => {
-          finish = resolve;
-        }),
-    );
-    await render(STORAGE_KEY, true);
-    mock.workspaceId = 'workspace-2';
-    localStorage.setItem('other', JSON.stringify([record()]));
-    await render('other', true);
-    await act(() => finish([{ email: 'stale@example.com', displayName: '过期成员' }]));
-    await click(labelled('处理人: 需求评审'));
-    const choices = document.querySelector('[data-slot="popover-content"]')!;
-    expect(choices.textContent).toContain('小林');
-    expect(choices.textContent).not.toContain('过期成员');
+    expect(mock.listPlanItems).toHaveBeenCalledTimes(2);
   });
 
   it('searches titles, assignee names and tags and handles no results', async () => {

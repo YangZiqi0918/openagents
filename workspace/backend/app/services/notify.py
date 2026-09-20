@@ -65,6 +65,7 @@ def notify(
     link_url: str | None = None,
     reason: str | None = None,
     push: bool = True,
+    recipient_user_id: str | None = None,
 ) -> NotificationRecord:
     """File an inbox notification and (unless `push=False`) send it.
 
@@ -77,6 +78,7 @@ def notify(
     """
     record = NotificationRecord(
         workspace_id=str(workspace_id),
+        recipient_user_id=recipient_user_id,
         created_by=source,
         title=title,
         message=message,
@@ -105,6 +107,7 @@ def notify(
         "channel_name": channel_name or "",
         "source": source,
         "reason": reason or _reason_for(priority),
+        "recipient_user_id": recipient_user_id,
     }
     sa_event.listen(
         db,

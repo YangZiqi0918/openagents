@@ -354,10 +354,14 @@ class KimiAdapter(LlmDirectAdapter):
         channel = payload.get("channel") if isinstance(payload, dict) else None
 
         if action == "stop":
-            if channel and channel in self._channel_processes:
-                self._stopping_channels.add(channel)
-                await self._stop_process(self._channel_processes.pop(channel))
-                await self._send_response(channel, "Execution stopped by user.")
+            if channel:
+                proc = self._channel_processes.get(channel)
+                if proc:
+                    self._stopping_channels.add(channel)
+                    await self._stop_process(proc)
+                    self._channel_processes.pop(channel, None)
+                    self._channel_queues.pop(channel, None)
+                    await self._send_response(channel, "Execution stopped by user.")
                 return
             if self._channel_processes:
                 await self._stop_all_processes("Execution stopped by user.")
@@ -393,6 +397,7 @@ class KimiAdapter(LlmDirectAdapter):
             self._stopping_channels.add(channel)
             await self._stop_process(proc)
             self._channel_processes.pop(channel, None)
+            self._channel_queues.pop(channel, None)
             try:
                 await self._send_response(channel, message)
             except Exception:

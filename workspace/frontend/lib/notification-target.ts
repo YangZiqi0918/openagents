@@ -10,3 +10,15 @@ export function invitationNotificationPath(notification: Pick<NotificationItem, 
     return null;
   }
 }
+
+/** Only route an administrator review notification to this project's own plan. */
+export function projectPlanNotificationPath(notification: Pick<NotificationItem, 'linkUrl'>, workspaceId: string): string | null {
+  if (!notification.linkUrl || !workspaceId) return null;
+  try {
+    const origin = typeof window === 'undefined' ? 'http://local-app' : window.location.origin;
+    const url = new URL(notification.linkUrl, origin);
+    if (url.origin !== origin || url.pathname !== `/projects/${encodeURIComponent(workspaceId)}`
+      || url.searchParams.get('tab') !== 'plan' || !url.searchParams.get('item')) return null;
+    return `${url.pathname}${url.search}`;
+  } catch { return null; }
+}

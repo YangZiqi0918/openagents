@@ -692,6 +692,29 @@ class TodoRecord(Base):
     )
 
 
+class PlanItem(Base):
+    """Project-level plan row; dispatched task snapshots remain independent."""
+    __tablename__ = "plan_items"
+
+    id = Column(Text, primary_key=True, default=_uuid)
+    workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    title = Column(Text, nullable=False)
+    description = Column(Text, nullable=False, default="", server_default="")
+    status = Column(Text, nullable=False, default="todo", server_default="todo")
+    assignees = Column(JSONB, nullable=False, default=list, server_default=text("'[]'"))
+    priority = Column(Text, nullable=True)
+    tags = Column(JSONB, nullable=False, default=list, server_default=text("'[]'"))
+    start_date = Column(Text, nullable=True)
+    due_date = Column(Text, nullable=True)
+    attachments = Column(JSONB, nullable=False, default=list, server_default=text("'[]'"))
+    acceptance_criteria = Column(Text, nullable=False, default="", server_default="")
+    version = Column(Integer, nullable=False, default=1, server_default="1")
+    created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
+    updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=text("NOW()"))
+
+    __table_args__ = (Index("idx_plan_items_workspace", "workspace_id"),)
+
+
 class KanbanTask(Base):
     """A Kanban board task — workspace-wide, assignable to a single agent.
 
@@ -723,12 +746,32 @@ class KanbanTask(Base):
     # Files attached to the task (list of FileRecord ids). Delivered as
     # attachments on the kickoff message so the agent can open them.
     file_ids = Column(JSONB, nullable=True)
+    # Assigned human work is distinct from legacy, agent-owned Kanban tasks.
+    plan_item_id = Column(Text, ForeignKey("plan_items.id", ondelete="SET NULL"), nullable=True)
+    responsible_user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    dispatched_user_id = Column(UUID(as_uuid=False), nullable=True)  # immutable recipient; survives handoff
+    source_version = Column(Integer, nullable=True)
+    execution_status = Column(Text, nullable=True)  # idle | running | need_input | done | paused
+    active_run_id = Column(Text, nullable=True)
+    acceptance_criteria = Column(Text, nullable=True)
+    tags = Column(JSONB, nullable=True)
+    start_date = Column(Text, nullable=True)
+    due_date = Column(Text, nullable=True)
+    submission_history = Column(JSONB, nullable=True)
+    activity_history = Column(JSONB, nullable=True)
+    submitted_summary = Column(Text, nullable=True)
+    decline_reason = Column(Text, nullable=True)
+    transfer_user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    transfer_reason = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
     updated_at = Column(DateTime(timezone=True), default=_now, onupdate=_now, server_default=text("NOW()"))
 
     __table_args__ = (
         Index("idx_kanban_workspace_status", "workspace_id", "status"),
         Index("idx_kanban_workspace_channel", "workspace_id", "channel_name"),
+        Index("idx_kanban_workspace_responsible", "workspace_id", "responsible_user_id"),
+        Index("idx_kanban_plan_item", "plan_item_id"),
+        UniqueConstraint("plan_item_id", "source_version", "dispatched_user_id", name="uq_plan_dispatch_recipient_version"),
     )
 
 
@@ -859,6 +902,7 @@ class NotificationRecord(Base):
 
     id = Column(Text, primary_key=True, default=_uuid)
     workspace_id = Column(UUID(as_uuid=False), ForeignKey("workspaces.id", ondelete="CASCADE"), nullable=False)
+    recipient_user_id = Column(UUID(as_uuid=False), ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
     created_by = Column(Text, nullable=False)              # "openagents:agent-name" or "system:routine"
     title = Column(Text, nullable=False)
     message = Column(Text, nullable=False)
@@ -875,6 +919,7 @@ class NotificationRecord(Base):
         Index("idx_notifications_workspace_status", "workspace_id", "status"),
         Index("idx_notifications_workspace_read", "workspace_id", "is_read"),
         Index("idx_notifications_created_at", "created_at"),
+        Index("idx_notifications_recipient", "recipient_user_id"),
     )
 
 

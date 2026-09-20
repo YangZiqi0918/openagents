@@ -15,10 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import { useI18n } from '@/lib/i18n';
-import { useWorkspaceApi } from '@/lib/workspace-api-context';
-import { agentLabel } from '@/lib/helpers';
 import { useWorkspace } from '@/lib/workspace-context';
-import type { TeamMember } from '@/lib/types';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -39,6 +36,7 @@ import {
   TagPicker,
 } from './plan-record-controls';
 import { PlanRecordDialog } from './plan-record-dialog';
+import { ServerPlanPage } from './server-plan-page';
 import {
   COLUMNS,
   EMPTY_MEMBERS,
@@ -58,76 +56,21 @@ interface ProjectPlanPageProps {
   projectId: string;
   storageKey?: string;
   workspaceModulesAvailable?: boolean;
+  focusItemId?: string;
 }
 
-export function ProjectPlanPage({ projectId, storageKey, workspaceModulesAvailable = true }: ProjectPlanPageProps) {
+export function ProjectPlanPage({ projectId, storageKey, workspaceModulesAvailable = true, focusItemId }: ProjectPlanPageProps) {
   if (workspaceModulesAvailable)
-    return <ConnectedPlan key={storageKey ?? projectId} projectId={projectId} storageKey={storageKey} />;
+    return <ConnectedPlan key={storageKey ?? projectId} projectId={projectId} storageKey={storageKey} focusItemId={focusItemId} />;
   const key = storageKey ?? `oa:projects:preview:plan:${projectId}:v1`;
   return <PlanTable key={key} storageKey={key} members={EMPTY_MEMBERS} />;
 }
 
-function ConnectedPlan({ projectId, storageKey }: ProjectPlanPageProps) {
-  const workspaceApi = useWorkspaceApi();
-  const { workspace, agents, me } = useWorkspace();
-  const [team, setTeam] = useState<TeamMember[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(false);
-  const [attempt, setAttempt] = useState(0);
+function ConnectedPlan({ projectId, storageKey, focusItemId }: ProjectPlanPageProps) {
+  const { workspace } = useWorkspace();
   const workspaceId = workspace?.workspaceId;
-
-  useEffect(() => {
-    let cancelled = false;
-    setTeam([]);
-    setLoading(true);
-    setError(false);
-    workspaceApi
-      .getTeam()
-      .then((next) => {
-        if (!cancelled) setTeam(next);
-      })
-      .catch(() => {
-        if (!cancelled) setError(true);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [workspaceApi, workspaceId, attempt]);
-
-  const options: Assignee[] = [
-    ...team.map(
-      (member): Assignee => ({
-        id: `human:${member.email}`,
-        name: member.username || member.displayName || member.email,
-        kind: 'human',
-        avatarUrl: member.avatarUrl,
-      }),
-    ),
-    ...agents.map(
-      (agent): Assignee => ({
-        id: `agent:${agent.agentName}`,
-        name: agentLabel(agent),
-        kind: 'agent',
-      }),
-    ),
-  ];
   const key = storageKey ?? `oa:projects:workspace:${workspaceId ?? 'local'}:plan:${projectId}:v1`;
-  return (
-    <PlanTable
-      key={key}
-      canUpload={me?.role !== 'viewer'}
-      storageKey={key}
-      members={{
-        options,
-        loading,
-        error,
-        retry: () => setAttempt((value) => value + 1),
-      }}
-    />
-  );
+  return <ServerPlanPage key={key} storageKey={key} focusItemId={focusItemId} />;
 }
 
 function EditableText({

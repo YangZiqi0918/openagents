@@ -48,7 +48,7 @@ export function PlanRecordDialog({
   members: Members;
   tagOptions: string[];
   canUpload: boolean;
-  onSave: (record: PlanRecord) => boolean;
+  onSave: (record: PlanRecord) => boolean | Promise<boolean>;
   onClose: () => void;
 }) {
   const workspaceApi = useWorkspaceApi();
@@ -151,7 +151,7 @@ export function PlanRecordDialog({
           (item, index) => attachments.findIndex((other) => other.id === item.id) === index,
         ),
       };
-      if (onSave(record)) onClose();
+      if (await onSave(record)) onClose();
       else setError(l.formSaveError);
     } finally {
       if (current()) {
@@ -228,6 +228,17 @@ export function PlanRecordDialog({
                 onChange={(event) => change({ description: event.target.value })}
                 className="min-h-32 w-full min-w-0 flex-1 resize-none rounded-sm border-0 bg-transparent text-sm leading-6 outline-none placeholder:text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring"
               />
+              <label className="space-y-1 text-xs font-medium text-muted-foreground">
+                <span>{l.acceptanceCriteria}</span>
+                <textarea
+                  aria-label={l.acceptanceCriteria}
+                  value={draft.acceptanceCriteria ?? ''}
+                  disabled={busy}
+                  onChange={(event) => change({ acceptanceCriteria: event.target.value })}
+                  rows={2}
+                  className="block w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm font-normal text-foreground focus-visible:outline-2 focus-visible:outline-ring"
+                />
+              </label>
               <div className="mt-auto flex flex-wrap items-center gap-2 pb-2">
                 <StatusPicker
                   value={draft.status}

@@ -304,8 +304,8 @@ def test_browser_viewer_does_not_receive_interactive_session_url(local_auth, cli
                        json={"agent_name": "foreign-agent"}).status_code in {401, 403}
 
 
-def test_bearer_only_task_execution_creates_channel_and_kickoff(local_auth, client, db):
-    _, owner_headers = _account(client, "alice")
+def test_bearer_only_admin_task_execution_creates_channel_and_kickoff(local_auth, client, db):
+    alice, owner_headers = _account(client, "alice")
     _, member_headers = _account(client, "bob")
     project = _project(client, owner_headers)
     bob = db.execute(select(User).where(User.username == "bob")).scalar_one()
@@ -313,11 +313,15 @@ def test_bearer_only_task_execution_creates_channel_and_kickoff(local_auth, clie
     db.add(WorkspaceMember(workspace_id=project["workspaceId"], agent_name="worker", role="master",
                            agent_type="claude", status="online"))
     db.commit()
-    created = client.post("/v1/tasks", headers=member_headers,
+    assert client.post("/v1/tasks", headers=member_headers,
+                       json={"network": project["workspaceId"], "title": "Cannot self-create"}).status_code == 403
+    created = client.post("/v1/tasks", headers=owner_headers,
                           json={"network": project["workspaceId"], "title": "Do a thing", "assignee": "worker"})
     assert created.status_code == 200, created.text
     task_id = created.json()["data"]["id"]
-    ran = client.post(f"/v1/tasks/{task_id}/assign", headers=member_headers,
+    assert client.post(f"/v1/tasks/{task_id}/assign", headers=member_headers,
+                       json={"network": project["workspaceId"]}).status_code == 403
+    ran = client.post(f"/v1/tasks/{task_id}/assign", headers=owner_headers,
                       json={"network": project["workspaceId"], "source": "human:forged"})
     assert ran.status_code == 200, ran.text
     assert ran.json()["data"]["status"] == "in_progress"
@@ -325,7 +329,7 @@ def test_bearer_only_task_execution_creates_channel_and_kickoff(local_auth, clie
     assert db.execute(select(Channel.id).where(Channel.workspace_id == project["workspaceId"], Channel.name == channel_name)).first()
     events = db.execute(select(EventRecord).where(EventRecord.network_id == project["workspaceId"],
                            EventRecord.target == f"channel/{channel_name}", EventRecord.type == "workspace.message.posted")).scalars().all()
-    assert any(e.source == f"human:{bob.email}" and "assigned this Kanban task" in (e.payload or {}).get("content", "") for e in events)
+    assert any(e.source == f"human:{alice['identity_key']}" and "assigned this Kanban task" in (e.payload or {}).get("content", "") for e in events)
 
 
 def test_human_todo_source_cannot_delete_another_members_plan(local_auth, client, db):

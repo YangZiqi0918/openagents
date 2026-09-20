@@ -12,7 +12,7 @@ import { agentLabel } from '@/lib/helpers';
 import type { NotificationItem } from '@/lib/types';
 import { useRouter } from 'next/navigation';
 import { IS_LOCAL_AUTH } from '@/lib/api-config';
-import { invitationNotificationPath } from '@/lib/notification-target';
+import { invitationNotificationPath, projectPlanNotificationPath } from '@/lib/notification-target';
 
 function PriorityDot({ priority }: { priority: NotificationItem['priority'] }) {
   return (
@@ -157,6 +157,7 @@ export function InboxView() {
     dismissNotification,
     setCurrentSessionId,
     sessions,
+    workspace,
   } = useWorkspace();
   const { setViewMode, setPendingTaskChannel } = useLayout();
 
@@ -192,6 +193,11 @@ export function InboxView() {
     const invitePath = invitationNotificationPath(notification);
     if (invitePath) {
       router.push(invitePath);
+      return;
+    }
+    const planPath = projectPlanNotificationPath(notification, workspace?.workspaceId ?? '');
+    if (planPath) {
+      router.push(planPath);
       return;
     }
     if (notification.channelName) {

@@ -366,7 +366,10 @@ def _deliver_step(db, workspace, run: WorkflowRun, step: dict, prev_output: str,
         if channel is not None:
             _ensure_member(db, channel, agent)
         if task is not None:
-            task.status = "in_progress"
+            if task.responsible_user_id:
+                task.execution_status = "running"
+            else:
+                task.status = "in_progress"
             task.assignee = agent
         db.flush()
         _emit(db, workspace, run.channel_name, body, metadata={"workflow_step": step["id"]},
@@ -378,7 +381,10 @@ def _deliver_step(db, workspace, run: WorkflowRun, step: dict, prev_output: str,
         human = assignee.get("human")
         mention = f"@{human} " if human else ""
         if task is not None:
-            task.status = "need_input"
+            if task.responsible_user_id:
+                task.execution_status = "need_input"
+            else:
+                task.status = "need_input"
         db.flush()
         _emit(db, workspace, run.channel_name, f"{mention}{body}",
               metadata={"workflow_step": step["id"], "workflow_human": True},
@@ -394,6 +400,7 @@ def _deliver_step(db, workspace, run: WorkflowRun, step: dict, prev_output: str,
             priority="high",
             channel_name=run.channel_name,
             reason=REASON_APPROVAL,
+            recipient_user_id=task.responsible_user_id if task and task.responsible_user_id else None,
         )
         db.flush()
 
@@ -403,7 +410,11 @@ def _complete(db, workspace, run: WorkflowRun) -> None:
     run.current_step = None
     task = _linked_task(db, str(workspace.id), run.channel_name)
     if task is not None:
-        task.status = "done"
+        if task.responsible_user_id:
+            task.execution_status = "done"
+            task.active_run_id = None
+        else:
+            task.status = "done"
     db.flush()
     name = (run.snapshot or {}).get("name", "")
     _emit(db, workspace, run.channel_name, f"✅ Workflow “{name}” complete.", metadata={})
@@ -418,6 +429,7 @@ def _complete(db, workspace, run: WorkflowRun) -> None:
         message=f"“{name or 'Workflow'}” finished.",
         channel_name=run.channel_name,
         reason=REASON_TASK_COMPLETED,
+        recipient_user_id=task.responsible_user_id if task and task.responsible_user_id else None,
     )
 
 
@@ -425,7 +437,10 @@ def _stall(db, workspace, run: WorkflowRun) -> None:
     run.status = "stalled"
     task = _linked_task(db, str(workspace.id), run.channel_name)
     if task is not None:
-        task.status = "need_input"
+        if task.responsible_user_id:
+            task.execution_status = "need_input"
+        else:
+            task.status = "need_input"
     notify(
         db,
         str(workspace.id),
@@ -435,6 +450,7 @@ def _stall(db, workspace, run: WorkflowRun) -> None:
         priority="high",
         channel_name=run.channel_name,
         reason=REASON_APPROVAL,
+        recipient_user_id=task.responsible_user_id if task and task.responsible_user_id else None,
     )
     db.flush()
     _emit(db, workspace, run.channel_name,
@@ -483,6 +499,21 @@ def run_advance(db, workspace_id: str, event_data: dict) -> bool:
     step = _step_by_id(run, run.current_step)
     if not step:
         return False
+    task = _linked_task(db, workspace_id, channel_name)
+    if task and task.responsible_user_id:
+        metadata = event_data.get("metadata") or {}
+        if (task.status != "in_progress" or not task.active_run_id
+                or metadata.get("task_comment")):
+            return False
+        if metadata.get("task_run_id") and metadata["task_run_id"] != task.active_run_id:
+            return False
+        if (step.get("assignee") or {}).get("kind") == "human":
+            if metadata.get("task_workflow_step_complete") is not True:
+                return False
+            from app.models import User
+            owner_email = db.execute(select(User.email).where(User.id == task.responsible_user_id)).scalar_one_or_none()
+            if not owner_email or event_data.get("source") != f"human:{owner_email}":
+                return False
 
     # Only the current step's assignee's message counts as the step output.
     source = event_data.get("source", "") or ""

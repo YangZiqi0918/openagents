@@ -1367,6 +1367,41 @@ def _handle_task_thread_progress(event: Event, channel, content: str, db, worksp
         return
 
     source = event.source or ""
+    if task.responsible_user_id:
+        # Human-owned cards reserve need_input for administrator review. Agent
+        # progress is tracked separately and cannot move the card itself.
+        if task.status != "in_progress" or not task.active_run_id or task.execution_status == "paused":
+            return
+        if (event.metadata or {}).get("task_comment"):
+            return
+        event_run_id = (event.metadata or {}).get("task_run_id")
+        if event_run_id and event_run_id != task.active_run_id:
+            return
+        if task.workflow_id:
+            return  # the workflow engine owns execution progress
+        if source.startswith("openagents:") and source[len("openagents:"):] == task.assignee:
+            new_status = _classify_task_progress(task, content, db, workspace)
+            if new_status != task.execution_status:
+                task.execution_status = new_status
+                if new_status == "done":
+                    task.active_run_id = None
+                if new_status in ("need_input", "done"):
+                    from app.services.notify import REASON_APPROVAL, REASON_TASK_COMPLETED, notify
+                    notify(
+                        db, str(workspace.id), source=source,
+                        title="Task needs your input" if new_status == "need_input" else "Agent work finished",
+                        message=f"“{task.title}” needs your reply." if new_status == "need_input" else f"“{task.title}” is ready for your review.",
+                        channel_name=task.channel_name,
+                        reason=REASON_APPROVAL if new_status == "need_input" else REASON_TASK_COMPLETED,
+                        recipient_user_id=task.responsible_user_id,
+                    )
+        elif source.startswith("human:") and task.execution_status == "need_input":
+            from app.models import User
+            owner_email = db.execute(select(User.email).where(User.id == task.responsible_user_id)).scalar_one_or_none()
+            if owner_email and source[len("human:"):].lower() == owner_email.lower():
+                task.execution_status = "running"
+        return
+
     if source.startswith("openagents:"):
         sender_name = source[len("openagents:"):]
         # Only the assigned agent's own replies drive the card.
@@ -1532,6 +1567,41 @@ async def _handle_message_posted(event: Event, ctx: PipelineContext) -> Optional
                 Channel.name == channel_name,
             )
         ).scalar_one_or_none()
+
+    if channel and channel.name.startswith(TASK_CHANNEL_PREFIX):
+        from app.models import KanbanTask, User
+        task = db.execute(select(KanbanTask).where(
+            KanbanTask.workspace_id == workspace.id,
+            KanbanTask.channel_name == channel.name,
+        )).scalar_one_or_none()
+        if task and task.responsible_user_id:
+            if event.source.startswith("openagents:") and (
+                task.status != "in_progress" or not task.active_run_id
+                or task.execution_status == "paused"
+            ):
+                event.metadata["target_agents"] = ["__no_response__"]
+                return event
+            if event.source.startswith("human:"):
+                sender_email = event.source[len("human:"):].lower()
+                sender_id = db.execute(select(User.id).where(User.email == sender_email)).scalar_one_or_none()
+                if sender_id != task.responsible_user_id:
+                    # Server-owned marker: a project member may comment on another
+                    # member's task, but cannot wake its agent or advance its run.
+                    event.metadata["task_comment"] = True
+                    from app.services.notify import notify
+                    notify(
+                        db, str(workspace.id), source=event.source,
+                        title="Task comment", message=f"New comment on “{task.title}”.",
+                        channel_name=task.channel_name, reason="chat",
+                        recipient_user_id=task.responsible_user_id,
+                    )
+                else:
+                    event.metadata.pop("task_comment", None)
+                if event.metadata.get("task_comment") or task.status != "in_progress" or not task.active_run_id:
+                    event.metadata["target_agents"] = ["__no_response__"]
+                    _upsert_human_collaborator(workspace, event.payload or {}, db, event.metadata)
+                    _join_channel_as_human(channel, event.payload or {}, db, event.metadata)
+                    return event
 
     project_human_message = (
         config.AUTH_MODE == "local_password" and workspace.kind == "project"

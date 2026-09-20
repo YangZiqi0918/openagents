@@ -11,7 +11,7 @@ a direct call so the assertion is deterministic.
 
 import pytest
 
-from app.models import DeviceToken, NotificationRecord
+from app.models import DeviceToken, NotificationRecord, User, WorkspaceMembership
 
 
 @pytest.fixture
@@ -198,6 +198,58 @@ class TestFanoutForNotification:
         _tokens, alert, _data = self._fanout(monkeypatch, snapshot)[0]
         # 237 + the ellipsis, matching `_build_alert` on the event path.
         assert len(alert.body) == 238 and alert.body.endswith("…")
+
+    def test_personal_notification_pushes_only_to_its_member(self, db, workspace, monkeypatch):
+        owner = db.query(User).filter_by(email="test@example.com").one()
+        _device(db, workspace["id"], "TOKEN-OWNER", email=owner.email)
+        _device(db, workspace["id"], "TOKEN-OTHER", email="other@example.com")
+
+        calls = self._fanout(
+            monkeypatch,
+            self._snapshot(workspace["id"], recipient_user_id=owner.id),
+        )
+
+        assert len(calls) == 1
+        assert calls[0][0] == ["TOKEN-OWNER"]
+
+
+def test_personal_notification_is_not_readable_by_another_member(
+    client, db, workspace, owner_headers, captured_push, monkeypatch,
+):
+    import app.access as access
+    from app.services.notify import notify
+
+    other = User(email="other@example.com")
+    db.add(other)
+    db.flush()
+    db.add(WorkspaceMembership(workspace_id=workspace["id"], user_id=other.id, role="member"))
+    db.commit()
+
+    original = access.verify_identity_claims
+    monkeypatch.setattr(
+        access, "verify_identity_claims",
+        lambda token: {"provider": "firebase", "email": other.email}
+        if token == "other-member-token" else original(token),
+    )
+    personal = notify(
+        db, workspace["id"], source="system:tasks", title="Your assignment",
+        message="A task was assigned to you", recipient_user_id=other.id,
+    )
+    shared = notify(db, workspace["id"], source="system:tasks", title="Shared", message="Shared")
+    db.commit()
+
+    other_headers = {"Authorization": "Bearer other-member-token"}
+    owner_list = client.get("/v1/notifications", params={"network": workspace["id"]}, headers=owner_headers)
+    other_list = client.get("/v1/notifications", params={"network": workspace["id"]}, headers=other_headers)
+    machine_list = client.get("/v1/notifications", params={"network": workspace["id"]}, headers={"X-Workspace-Token": workspace["token"]})
+
+    assert {n["id"] for n in owner_list.json()["data"]["notifications"]} == {shared.id}
+    assert {n["id"] for n in other_list.json()["data"]["notifications"]} == {shared.id, personal.id}
+    assert {n["id"] for n in machine_list.json()["data"]["notifications"]} == {shared.id}
+    assert client.get(f"/v1/notifications/{personal.id}", headers=owner_headers).status_code == 404
+    client.patch("/v1/notifications/read-all", params={"network": workspace["id"]}, headers=owner_headers)
+    db.refresh(personal)
+    assert personal.is_read is False
 
 
 class TestNotificationEndpoints:

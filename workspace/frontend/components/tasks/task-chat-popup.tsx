@@ -14,6 +14,7 @@ import { useWorkspace } from '@/lib/workspace-context';
 import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { toast } from 'sonner';
 import { AgentAvatar } from '@/components/agents/agent-avatar';
+import { useI18n } from '@/lib/i18n';
 
 interface TaskChatPopupProps {
   open: boolean;
@@ -24,6 +25,8 @@ interface TaskChatPopupProps {
   assignee: string | null;
   /** Optional status line under the title, e.g. workflow step progress. */
   subtitle?: string;
+  submittedSummary?: string | null;
+  submissionHistory?: Array<{ summary: string; submittedAt?: string; submittedBy?: string }>;
 }
 
 /**
@@ -34,7 +37,8 @@ interface TaskChatPopupProps {
  * (hard-coupled to the global `currentSessionId`), we compose the same two
  * children it uses — `ChatMessages` + `ChatInput` — against a `sessionId` prop.
  */
-export function TaskChatPopup({ open, onOpenChange, sessionId, taskTitle, assignee, subtitle }: TaskChatPopupProps) {
+export function TaskChatPopup({ open, onOpenChange, sessionId, taskTitle, assignee, subtitle, submittedSummary, submissionHistory }: TaskChatPopupProps) {
+  const { locale } = useI18n();
   const workspaceApi = useWorkspaceApi();
   const { agents, currentUser, canWrite = true } = useWorkspace();
   const { messages, forceRefresh, generation, loadOlder, hasOlder, loadingOlder, error: pollingError } = useMessagePolling({
@@ -87,6 +91,8 @@ export function TaskChatPopup({ open, onOpenChange, sessionId, taskTitle, assign
           {subtitle && (
             <p className="text-[11px] text-muted-foreground truncate">{subtitle}</p>
           )}
+          {submittedSummary && <p className="mt-2 rounded border border-border bg-muted/40 px-2 py-1.5 text-xs font-normal whitespace-pre-wrap">{submittedSummary}</p>}
+          {submissionHistory && submissionHistory.length > 1 && <details className="mt-1 text-xs font-normal text-muted-foreground"><summary className="cursor-pointer">{locale === 'zh-CN' ? '提交历史' : 'Submission history'} ({submissionHistory.length})</summary><ol className="max-h-28 overflow-auto pt-1">{submissionHistory.map((entry, index) => <li key={index} className="border-t py-1 whitespace-pre-wrap">{entry.summary}</li>)}</ol></details>}
         </DialogHeader>
 
         {/* ChatMessages' root is `flex-1 min-h-0`, so it must be a DIRECT child

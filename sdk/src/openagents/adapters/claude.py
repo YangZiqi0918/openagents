@@ -78,7 +78,8 @@ class ClaudeAdapter(BaseAdapter):
     async def _on_control_action(self, action: Optional[str], payload: dict):
         """Handle stop control action."""
         if action == "stop":
-            await self._stop_current_process()
+            channel = payload.get("channel") if isinstance(payload, dict) else None
+            await self._stop_current_process(channel)
 
     async def _stop_process(self, proc: asyncio.subprocess.Process):
         """Kill a single Claude subprocess and its children."""
@@ -135,9 +136,13 @@ class ClaudeAdapter(BaseAdapter):
             except ProcessLookupError:
                 pass
 
-    async def _stop_current_process(self):
-        """Kill all running Claude subprocesses (stop button)."""
-        procs = list(self._channel_processes.items())
+    async def _stop_current_process(self, channel: str | None = None):
+        """Stop one channel, or all channels for legacy stop requests."""
+        if channel:
+            proc = self._channel_processes.get(channel)
+            procs = [(channel, proc)] if proc is not None else []
+        else:
+            procs = list(self._channel_processes.items())
         if not procs:
             return
         logger.info(f"Stopping {len(procs)} running process(es)...")

@@ -16,10 +16,11 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, Header, Path, Query
 from pydantic import BaseModel
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.access import resolve_current_user
 from app.models import NotificationRecord, Workspace
 from app.response import ResponseCode, json_response, success_response
 from app.routers.network import _resolve_workspace, _verify_workspace_access
@@ -77,6 +78,21 @@ def _serialize_notification(n: NotificationRecord) -> dict:
         "created_at": n.created_at.isoformat() if n.created_at else None,
         "read_at": n.read_at.isoformat() if n.read_at else None,
     }
+
+
+def _visible_to(db: Session, authorization: Optional[str]):
+    """Personal notifications stay out of other members' shared inboxes."""
+    user = resolve_current_user(db, authorization) if authorization else None
+    if user is None:
+        return NotificationRecord.recipient_user_id.is_(None)
+    return or_(NotificationRecord.recipient_user_id.is_(None), NotificationRecord.recipient_user_id == user.id)
+
+
+def _can_read(notification: NotificationRecord, db: Session, authorization: Optional[str]) -> bool:
+    if notification.recipient_user_id is None:
+        return True
+    user = resolve_current_user(db, authorization) if authorization else None
+    return user is not None and str(user.id) == str(notification.recipient_user_id)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +164,7 @@ def list_notifications(
 
     query = select(NotificationRecord).where(
         NotificationRecord.workspace_id == ws_id,
+        _visible_to(db, authorization),
     )
     if status:
         query = query.where(NotificationRecord.status == status)
@@ -161,6 +178,7 @@ def list_notifications(
     unread_count = db.execute(
         select(func.count(NotificationRecord.id)).where(
             NotificationRecord.workspace_id == ws_id,
+            _visible_to(db, authorization),
             NotificationRecord.status == "active",
             NotificationRecord.is_read == False,  # noqa: E712
         )
@@ -204,6 +222,8 @@ def get_notification(
         return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
     if not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+    if not _can_read(notification, db, authorization):
+        return json_response(ResponseCode.NOT_FOUND, "Notification not found")
 
     return success_response(_serialize_notification(notification))
 
@@ -233,6 +253,8 @@ def mark_notification_read(
         return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
     if not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+    if not _can_read(notification, db, authorization):
+        return json_response(ResponseCode.NOT_FOUND, "Notification not found")
 
     notification.is_read = True
     notification.read_at = datetime.now(timezone.utc)
@@ -264,6 +286,7 @@ def mark_all_notifications_read(
         update(NotificationRecord)
         .where(
             NotificationRecord.workspace_id == str(workspace.id),
+            _visible_to(db, authorization),
             NotificationRecord.is_read == False,  # noqa: E712
             NotificationRecord.status == "active",
         )
@@ -300,6 +323,8 @@ def dismiss_notification(
         return json_response(ResponseCode.NOT_FOUND, "Workspace not found")
     if not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Invalid credentials")
+    if not _can_read(notification, db, authorization):
+        return json_response(ResponseCode.NOT_FOUND, "Notification not found")
 
     notification.status = "dismissed"
     db.commit()
