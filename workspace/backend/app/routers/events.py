@@ -283,6 +283,10 @@ def send_event(
             agent_names = payload.get("participants", []) if body.type == "network.channel.create" else [payload.get("agent_name")]
             if not isinstance(agent_names, list):
                 return json_response(ResponseCode.BAD_REQUEST, "Participants must be a list")
+            if (config.AUTH_MODE == "local_password" and workspace.kind == "project"
+                    and body.type == "network.channel.create" and payload.get("master")
+                    and payload["master"] not in agent_names):
+                return json_response(ResponseCode.BAD_REQUEST, "Channel master must be a participant")
             agent_names = [name for name in agent_names + [payload.get("master")] if name and name != "__no_response__"]
             if any(not isinstance(name, str) for name in agent_names):
                 return json_response(ResponseCode.BAD_REQUEST, "Invalid agent participant")
@@ -332,7 +336,8 @@ def send_event(
         # channel_join_forbidden). 403 distinguishes "you can't do this"
         # from generic auth failures.
         reason = exc.reason or "rejected"
-        code = ResponseCode.FORBIDDEN if "forbidden" in reason or "locked" in reason \
+        code = ResponseCode.BAD_REQUEST if reason.startswith(("project_mention_", "project_workflow_")) \
+            else ResponseCode.FORBIDDEN if "forbidden" in reason or "locked" in reason \
             else ResponseCode.UNAUTHORIZED
         return json_response(code, reason)
 

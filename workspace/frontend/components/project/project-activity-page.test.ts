@@ -420,11 +420,11 @@ describe('project activity', () => {
       { method: 'PUT', body: JSON.stringify({ following: true }) },
     );
     await click(labelled('提及项目成员'));
-    await click(textButton('Other @other'));
-    expect(container.querySelector<HTMLInputElement>('[data-testid="draft"]')?.value).toBe('@{other} ');
-    await click(container.querySelector<HTMLButtonElement>('[data-testid="send"]')!);
+    expect(mock.input?.mentionTriggerKey).toBe(1);
+    expect(mock.input?.projectMentions?.members?.map((member) => member.username)).toEqual(['other']);
+    await act(async () => mock.input?.onSend('@{other} ', [], [], { selectedAgentNames: [] }));
     expect(mock.api.sendMessage).toHaveBeenCalledWith(
-      'chat-one', '@{other} ', 'User', ['helper'], undefined, 'user',
+      'chat-one', '@{other} ', 'User', undefined, undefined, 'user',
     );
     expect(mock.api.fetchResource).toHaveBeenLastCalledWith(
       '/v1/workspaces/project-one/channels/chat-one/subscription',
@@ -432,18 +432,105 @@ describe('project activity', () => {
     );
   });
 
-  it('escapes project member names in inserted human mentions', async () => {
+  it('passes special project usernames to the unified mention picker', async () => {
     mock.localAuth = true;
     mock.workspaceId = 'project-one';
     mock.channels = [channel('chat-one', 'Shared')];
-    mock.api.getTeam.mockResolvedValueOnce([
+    mock.api.getTeam.mockResolvedValue([
       { username: 'A} B\\C', role: 'member', displayName: 'Special' },
     ]);
     await render('project-one');
     await click(labelled('提及项目成员'));
-    await click(textButton('Special @A} B\\C'));
+    expect(mock.input?.projectMentions?.members?.map((member) => member.username)).toEqual(['A} B\\C']);
+  });
+
+  it('joins a menu-selected project agent before sending to the shared channel', async () => {
+    mock.localAuth = true;
+    mock.workspaceId = 'project-one';
+    mock.channels = [channel('chat-one', 'Shared')];
+    mock.agents = [
+      { agentName: 'helper', status: 'online' } as WorkspaceAgent,
+      { agentName: 'yumi', status: 'online', builtin: true } as WorkspaceAgent,
+    ];
+    await render('project-one');
+    expect(mock.input?.agents).toEqual([]);
+    expect(mock.input?.projectMentions?.agents.map((agent) => agent.agentName)).toEqual(['helper', 'yumi']);
+    await act(async () => {
+      mock.input?.onSend('@yumi please help', ['yumi'], [], { selectedAgentNames: ['yumi'] });
+    });
+    expect(mock.api.addChannelParticipant).toHaveBeenCalledWith('chat-one', 'yumi');
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      'chat-one', '@yumi please help', 'User', ['yumi'], undefined, 'user',
+    );
+    expect(mock.api.addChannelParticipant.mock.invocationCallOrder[0])
+      .toBeLessThan(mock.api.sendMessage.mock.invocationCallOrder[0]);
+  });
+
+  it('does not send when joining fails and retries partially joined agents without losing the draft', async () => {
+    mock.localAuth = true;
+    mock.workspaceId = 'project-one';
+    mock.channels = [channel('chat-one', 'Shared')];
+    mock.agents = [
+      { agentName: 'helper', status: 'online' } as WorkspaceAgent,
+      { agentName: 'second', status: 'online' } as WorkspaceAgent,
+    ];
+    await render('project-one');
+    await fill(container.querySelector<HTMLInputElement>('[data-testid="draft"]')!, '@helper @second please help');
+    mock.api.addChannelParticipant.mockImplementationOnce(async (id, name) => {
+      mock.channels = mock.channels.map((item) => item.address === `channel/${id}`
+        ? { ...item, participants: [...item.participants, name] } : item);
+    }).mockRejectedValueOnce(new Error('Join denied'));
+    await act(async () => {
+      mock.input?.onSend('@helper @second please help', ['helper', 'second'], [], {
+        selectedAgentNames: ['helper', 'second'],
+      });
+    });
+    expect(mock.api.sendMessage).not.toHaveBeenCalled();
+    expect(container.textContent).toContain('Join denied');
     expect(container.querySelector<HTMLInputElement>('[data-testid="draft"]')?.value)
-      .toBe('@{A\\} B\\\\C} ');
+      .toBe('@helper @second please help');
+    await click(labelled('重新发送'));
+    expect(mock.api.addChannelParticipant).toHaveBeenCalledWith('chat-one', 'helper');
+    expect(mock.api.addChannelParticipant).toHaveBeenCalledWith('chat-one', 'second');
+    expect(mock.api.addChannelParticipant.mock.calls.filter(([, name]) => name === 'helper')).toHaveLength(1);
+    expect(mock.api.sendMessage).toHaveBeenCalledOnce();
+  });
+
+  it('explains an unjoined handwritten agent mention while preserving the draft', async () => {
+    mock.localAuth = true;
+    mock.workspaceId = 'project-one';
+    mock.channels = [channel('chat-one', 'Shared')];
+    mock.api.sendMessage.mockRejectedValueOnce(new Error('API 400: project_mention_agent_not_joined: helper'));
+    await render('project-one');
+    await fill(container.querySelector<HTMLInputElement>('[data-testid="draft"]')!, '@helper please help');
+    await click(container.querySelector<HTMLButtonElement>('[data-testid="send"]')!);
+    expect(container.textContent).toContain('请从 @ 菜单重新选择后发送');
+    expect(container.textContent).not.toContain('project_mention_agent_not_joined');
+    expect(container.querySelector<HTMLInputElement>('[data-testid="draft"]')?.value).toBe('@helper please help');
+  });
+
+  it('uses the current workflow step for project agent mentions', async () => {
+    mock.localAuth = true;
+    mock.workspaceId = 'project-one';
+    mock.channels = [channel('chat-one', 'Workflow chat', {
+      orchestration_mode: 'workflow', participants: ['helper', 'second'],
+    })];
+    mock.agents = [
+      { agentName: 'helper', status: 'online' } as WorkspaceAgent,
+      { agentName: 'second', status: 'online' } as WorkspaceAgent,
+    ];
+    mock.api.fetchResource.mockImplementation(async (path) => ({
+      json: async () => ({ data: path.endsWith('/subscription')
+        ? { following: false }
+        : { workflowRunning: true, activeWorkflowStepAgent: 'second' } }),
+    }));
+    await render('project-one');
+    expect(mock.api.fetchResource).toHaveBeenCalledWith(
+      '/v1/workspaces/project-one/channels/chat-one',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(mock.input?.projectMentions?.workflowRunning).toBe(true);
+    expect(mock.input?.projectMentions?.activeWorkflowStepAgent).toBe('second');
   });
 
   it('lets members configure project agents but hides writes from viewers', async () => {

@@ -538,6 +538,10 @@ function ActivityContent({
                   agents={agents.filter((agent) =>
                     selected.participants.includes(agent.agentName),
                   )}
+                  projectAgents={agents}
+                  participantNames={selected.participants}
+                  workflowMode={selected.orchestrationMode === 'workflow'}
+                  onRosterChange={activity.refresh}
                   currentUser={currentUser}
                   humanMembers={humanMembers?.filter((member) => member.username && member.username !== me?.username) || null}
                   membersError={membersError}

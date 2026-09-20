@@ -239,7 +239,8 @@ async def _handle_agent_leave(event: Event, ctx: PipelineContext) -> Optional[Ev
 
 async def _handle_agent_remove(event: Event, ctx: PipelineContext) -> Optional[Event]:
     """network.agent.remove → delete WorkspaceMember, reassign master if needed."""
-    from app.models import Channel, WorkspaceMember
+    from app.models import Channel, ChannelMember, WorkspaceMember
+    from app.config import config
 
     db = ctx.extra["db"]
     workspace = ctx.extra["workspace"]
@@ -276,7 +277,7 @@ async def _handle_agent_remove(event: Event, ctx: PipelineContext) -> Optional[E
                 WorkspaceMember.workspace_id == workspace.id,
                 WorkspaceMember.status != "removed",
             ).order_by(WorkspaceMember.joined_at.asc())
-        ).scalar_one_or_none()
+        ).scalars().first()
 
         if next_master:
             next_master.role = "master"
@@ -291,8 +292,28 @@ async def _handle_agent_remove(event: Event, ctx: PipelineContext) -> Optional[E
         )
     ).scalars().all()
 
+    project = config.AUTH_MODE == "local_password" and workspace.kind == "project"
+    if project:
+        # A removed agent must no longer poll, or be picked by the fallback
+        # router as a channel participant. Pick replacements from that channel,
+        # never from the workspace-wide agent roster.
+        memberships = db.execute(select(ChannelMember).join(
+            Channel, Channel.id == ChannelMember.channel_id,
+        ).where(Channel.workspace_id == workspace.id,
+                ChannelMember.agent_name == agent_name)).scalars().all()
+        for channel_member in memberships:
+            db.delete(channel_member)
+        db.flush()
     for ch in channels:
-        ch.master_agent = new_master_name
+        if project:
+            ch.master_agent = db.execute(select(ChannelMember.agent_name).join(
+                WorkspaceMember,
+                (WorkspaceMember.workspace_id == workspace.id)
+                & (WorkspaceMember.agent_name == ChannelMember.agent_name),
+            ).where(ChannelMember.channel_id == ch.id,
+                    WorkspaceMember.status != "removed").order_by(ChannelMember.agent_name)).scalars().first()
+        else:
+            ch.master_agent = new_master_name
     db.flush()
 
     event.metadata["removed_agent"] = agent_name
@@ -555,6 +576,14 @@ async def _handle_channel_leave(event: Event, ctx: PipelineContext) -> Optional[
         db.delete(member)
         db.flush()
 
+    from app.config import config
+    if config.AUTH_MODE == "local_password" and workspace.kind == "project" and channel.master_agent == agent_name:
+        replacement = db.execute(select(ChannelMember.agent_name).where(
+            ChannelMember.channel_id == channel.id,
+            ChannelMember.agent_name != agent_name,
+        ).order_by(ChannelMember.agent_name)).scalars().first()
+        channel.master_agent = replacement
+
     return event
 
 
@@ -567,6 +596,39 @@ def _extract_mentions(content: str, known_agents: List[str]) -> List[str]:
     # Only return mentions that match actual workspace members
     known_set = set(known_agents)
     return [m for m in raw_mentions if m in known_set]
+
+
+# Project-only human mentions are deliberately braced so a person and an agent
+# with the same name remain distinct. Keep the escaping in sync with push.py.
+_PROJECT_HUMAN_MENTION_RE = re.compile(r"@\{((?:\\[\\{}nr]|[^}\\\r\n]){1,256})\}")
+_PROJECT_NON_COLLABORATION_PREFIXES = ("task:", "workflow:", "routine:", "routines:", "dm:", "system:")
+
+
+def _is_project_collaboration_channel(name: str) -> bool:
+    return bool(name) and not name.startswith(_PROJECT_NON_COLLABORATION_PREFIXES)
+
+
+def _project_mentions(content: str, known_agents: List[str]) -> tuple[list[str], list[str]]:
+    """Return ordered agent identities and unescaped usernames in project text.
+
+    Agent identities may contain spaces, Unicode and punctuation; match the
+    actual project names longest-first rather than treating them as ASCII
+    words. Braced usernames are removed before matching agents.
+    """
+    from app.local_accounts import normalize_username
+
+    def unescape(match):
+        return {"n": "\n", "r": "\r"}.get(match.group(1), match.group(1))
+
+    humans = [normalize_username(re.sub(r"\\([\\{}nr])", unescape, match.group(1)))
+              for match in _PROJECT_HUMAN_MENTION_RE.finditer(content)]
+    agent_text = _PROJECT_HUMAN_MENTION_RE.sub(" ", content)
+    agents = []
+    if known_agents:
+        choices = "|".join(re.escape(name) for name in sorted(set(known_agents), key=len, reverse=True))
+        pattern = re.compile(rf"(?<![\w@])@({choices})(?![\w-])")
+        agents = [match.group(1) for match in pattern.finditer(agent_text)]
+    return list(dict.fromkeys(agents)), list(dict.fromkeys(humans))
 
 
 def _extract_leading_mention(content: str, known_agents: List[str]) -> Optional[str]:
@@ -1416,7 +1478,8 @@ async def _handle_message_posted(event: Event, ctx: PipelineContext) -> Optional
       - "stop" → no targeting, conversation rests until human speaks
     - Fallback (single-agent threads or router disabled): no routing needed.
     """
-    from app.models import Channel, WorkspaceMember
+    from app.models import Channel, User, WorkspaceMember, WorkspaceMembership
+    from app.config import config
 
     db = ctx.extra["db"]
     workspace = ctx.extra["workspace"]
@@ -1470,6 +1533,53 @@ async def _handle_message_posted(event: Event, ctx: PipelineContext) -> Optional
             )
         ).scalar_one_or_none()
 
+    project_human_message = (
+        config.AUTH_MODE == "local_password" and workspace.kind == "project"
+        and event.source.startswith("human:") and channel is not None
+        and _is_project_collaboration_channel(channel.name)
+        and message_type == "chat"
+    )
+    project_agent_mentions: list[str] = []
+    project_human_mentions: list[str] = []
+    if project_human_message:
+        project_agent_mentions, project_human_mentions = _project_mentions(content, known_agents)
+        if project_human_mentions:
+            from app.local_accounts import normalize_username
+            people = db.execute(select(User.username).join(
+                WorkspaceMembership, WorkspaceMembership.user_id == User.id,
+            ).where(WorkspaceMembership.workspace_id == workspace.id)).scalars().all()
+            valid_usernames = {normalize_username(name) for name in people if name}
+            if unknown := next((name for name in project_human_mentions if name not in valid_usernames), None):
+                raise EventRejected("workspace_mod", f"project_mention_member_not_found: {unknown}")
+
+        if project_agent_mentions:
+            members = {member.agent_name: member for member in all_members}
+            joined = {member.agent_name for member in (channel.participants or [])}
+            for name in project_agent_mentions:
+                member = members.get(name)
+                if member.status == "removed" or name not in joined:
+                    raise EventRejected("workspace_mod", f"project_mention_agent_not_joined: {name}")
+                if not _member_is_online(member):
+                    raise EventRejected("workspace_mod", f"project_mention_agent_offline: {name}")
+
+        if project_agent_mentions:
+            from app.models import WorkflowRun
+            running = db.execute(select(WorkflowRun).where(
+                WorkflowRun.workspace_id == workspace.id,
+                WorkflowRun.channel_name == channel.name,
+                WorkflowRun.status == "running",
+            )).scalar_one_or_none()
+            if running is not None:
+                step = next((item for item in (running.snapshot or {}).get("steps", [])
+                             if item.get("id") == running.current_step), None)
+                assignee = (step or {}).get("assignee") or {}
+                step_agent = assignee.get("agent") if assignee.get("kind") == "agent" else None
+                if any(name != step_agent for name in project_agent_mentions):
+                    raise EventRejected("workspace_mod", "project_workflow_step_agent_only")
+
+        # Generic legacy parsing does not distinguish @{username} from @agent.
+        mentions = project_agent_mentions
+
     # Auto-name channel from first human message if title is default/empty
     if event.source.startswith("human:") and channel:
         _auto_title_channel(channel, content, db)
@@ -1507,7 +1617,9 @@ async def _handle_message_posted(event: Event, ctx: PipelineContext) -> Optional
             # the *agent's* replies as step output, so an interjection can't
             # accidentally advance the run. During a human step, the human's
             # message IS the step output and the engine consumes it.
-            if step_agent and (source.startswith("system:") or source.startswith("human:")):
+            if step_agent and (source.startswith("system:") or source.startswith("human:")) and not (
+                project_human_message and project_human_mentions and not project_agent_mentions
+            ):
                 targets = [step_agent]
                 # Make sure the step's agent is a participant so it polls this channel.
                 from app.models import ChannelMember
@@ -1572,10 +1684,13 @@ async def _handle_message_posted(event: Event, ctx: PipelineContext) -> Optional
         if p.agent_name != "__no_response__"
     ]
     if len(real_participants) >= 2:
-        from app.config import config
         mode = (getattr(channel, "orchestration_mode", None) or "dynamic").lower()
 
-        if mode == "master":
+        if project_human_message and project_agent_mentions:
+            targets = [project_agent_mentions[0]]
+        elif project_human_message and project_human_mentions:
+            targets = ["__no_response__"]
+        elif mode == "master":
             # Deterministic star topology — no LLM. If the channel somehow
             # has no master, fall back to the generic mention/online logic
             # so messages aren't stranded.
@@ -1604,7 +1719,11 @@ async def _handle_message_posted(event: Event, ctx: PipelineContext) -> Optional
                 targets = _fallback_targets(event, channel, mentions, online_names)
     # ── Single-agent channel ────────────────────────────────────────
     else:
-        if explicit is not None:
+        if project_human_message and project_agent_mentions:
+            targets = [project_agent_mentions[0]]
+        elif project_human_message and project_human_mentions:
+            targets = ["__no_response__"]
+        elif explicit is not None:
             targets = explicit
         else:
             targets = _fallback_targets(event, channel, mentions, online_names)

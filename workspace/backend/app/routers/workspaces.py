@@ -45,6 +45,7 @@ from app.models import (
     WorkspaceInvite,
     WorkspaceMember,
     WorkspaceMembership,
+    WorkflowRun,
 )
 from app.access import (
     get_or_create_user_by_email,
@@ -1506,7 +1507,22 @@ def get_channel(
     if not channel:
         return json_response(ResponseCode.NOT_FOUND, "Channel not found")
 
-    return success_response(_format_channel(channel))
+    detail = _format_channel(channel)
+    if config.AUTH_MODE == "local_password" and workspace.kind == "project":
+        running = db.execute(select(WorkflowRun).where(
+            WorkflowRun.workspace_id == workspace.id,
+            WorkflowRun.channel_name == channel.name,
+            WorkflowRun.status == "running",
+        )).scalar_one_or_none()
+        step_agent = None
+        if running is not None:
+            step = next((item for item in (running.snapshot or {}).get("steps", [])
+                         if item.get("id") == running.current_step), None)
+            assignee = (step or {}).get("assignee") or {}
+            if assignee.get("kind") == "agent":
+                step_agent = assignee.get("agent")
+        detail.update({"workflowRunning": running is not None, "activeWorkflowStepAgent": step_agent})
+    return success_response(detail)
 
 
 # ---------------------------------------------------------------------------
@@ -1546,6 +1562,12 @@ def update_channel(
             WorkspaceMember.status != "removed",
         )).first() is None:
             return json_response(ResponseCode.BAD_REQUEST, "Agent does not belong to this project")
+        if config.AUTH_MODE == "local_password" and workspace.kind == "project" and body.master_agent:
+            if db.execute(select(ChannelMember.agent_name).where(
+                ChannelMember.channel_id == channel.id,
+                ChannelMember.agent_name == body.master_agent,
+            )).first() is None:
+                return json_response(ResponseCode.BAD_REQUEST, "Channel master must be a participant")
         if body.workflow_id:
             from app.models import Workflow
             if db.execute(select(Workflow.id).where(

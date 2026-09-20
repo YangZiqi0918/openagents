@@ -33,6 +33,7 @@ from app.models import (
     Workflow,
     WorkflowRun,
     Workspace,
+    WorkspaceMember,
 )
 from app.services.notify import REASON_APPROVAL, REASON_TASK_COMPLETED, notify
 from openagents.core.onm_events import Event
@@ -493,13 +494,24 @@ def run_advance(db, workspace_id: str, event_data: dict) -> bool:
         if not source.startswith("human:"):
             return False
 
-    output = (event_data.get("payload") or {}).get("content", "") or ""
-
     workspace = db.execute(
         select(Workspace).where(Workspace.id == workspace_id)
     ).scalar_one_or_none()
     if not workspace:
         return False
+
+    output = (event_data.get("payload") or {}).get("content", "") or ""
+    if kind == "human" and source.startswith("human:") and workspace.kind == "project":
+        from app.config import config
+        if config.AUTH_MODE == "local_password":
+            from app.mods.workspace_mod import _is_project_collaboration_channel, _project_mentions
+            if _is_project_collaboration_channel(channel_name):
+                known_agents = db.execute(select(WorkspaceMember.agent_name).where(
+                    WorkspaceMember.workspace_id == workspace.id,
+                )).scalars().all()
+                agent_mentions, human_mentions = _project_mentions(output, known_agents)
+                if human_mentions and not agent_mentions:
+                    return False
 
     if not _step_complete(step, output):
         return False  # still working — wait for the next message

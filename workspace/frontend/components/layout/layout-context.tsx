@@ -336,7 +336,7 @@ export function LayoutProvider({ children, onNavigate, initialView = 'threads', 
       setDraftThreadOpen,
       openNewThread,
     }}>
-      <div data-slot="layout-wrapper" className="flex grow">
+      <div data-slot="layout-wrapper" className={embedded ? 'flex h-full min-h-0 min-w-0 grow overflow-hidden' : 'flex grow'}>
         <TooltipProvider delayDuration={0}>
           {children}
         </TooltipProvider>

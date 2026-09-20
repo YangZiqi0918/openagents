@@ -10,26 +10,110 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
-import type { WorkspaceAgent, KnowledgeEntry } from '@/lib/types';
+import type { WorkspaceAgent, KnowledgeEntry, TeamMember } from '@/lib/types';
 import { AgentAvatar } from '@/components/agents/agent-avatar';
 import { agentLabel } from '@/lib/helpers';
 import { BookOpen } from 'lucide-react';
 import { toast } from 'sonner';
-import { useT } from '@/lib/i18n';
+import { useI18n } from '@/lib/i18n';
 
 // Keep in sync with the backend's MAX_FILE_SIZE (app/config.py); nginx's
 // /v1/files client_max_body_size allows extra headroom for multipart
 // overhead. Oversized files would be rejected server-side anyway, so
 // reject them here with immediate feedback instead.
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+const MENTION_CONTINUATION = new RegExp('[\\p{L}\\p{N}_-]', 'u');
 
 export interface PendingFile {
   file: File;
   preview?: string; // data URL for images
 }
 
+export interface ProjectMentionConfig {
+  agents: WorkspaceAgent[];
+  participantNames: string[];
+  members: TeamMember[] | null;
+  membersError: boolean;
+  onRetryMembers: () => void;
+  workflowRunning?: boolean;
+  activeWorkflowStepAgent?: string | null;
+}
+
+export interface SelectedMentionMetadata {
+  selectedAgentNames: string[];
+}
+
+interface SelectedAgentToken {
+  start: number;
+  end: number;
+  token: string;
+  name: string;
+}
+
+interface MentionRange {
+  start: number;
+  end: number;
+  filter: string;
+}
+
+function projectMentionRange(text: string, cursor: number, labels: string[]): MentionRange | null {
+  const before = text.slice(0, cursor);
+  const at = before.lastIndexOf('@');
+  if (at < 0 || (at > 0 && !/[\s([{]/.test(text[at - 1]))) return null;
+  const filter = before.slice(at + 1);
+  // Names may contain spaces. Keep the picker open while editing a display
+  // name, but stop at another mention or a newline.
+  if (filter.startsWith('{') || /[@\n\r]/.test(filter) || filter.length > 64) return null;
+  if (/\s/.test(filter) && labels.length > 0 &&
+      !labels.some((label) => label.toLocaleLowerCase().includes(filter.toLocaleLowerCase()))) return null;
+
+  const following = text.slice(cursor);
+  let end = cursor + (following.match(/^[^\s@\n\r]*/)?.[0].length ?? 0);
+  const remainder = text.slice(at + 1).toLocaleLowerCase();
+  for (const label of labels) {
+    if (label && remainder.startsWith(label.toLocaleLowerCase()) && at + 1 + label.length >= cursor) {
+      end = Math.max(end, at + 1 + label.length);
+    }
+  }
+  return { start: at, end, filter };
+}
+
+function updateSelectedTokens(tokens: SelectedAgentToken[], previous: string, next: string, edit?: { start: number; end: number }): SelectedAgentToken[] {
+  if (previous === next) return tokens;
+  let prefix = 0;
+  while (prefix < previous.length && prefix < next.length && previous[prefix] === next[prefix]) prefix++;
+  let suffix = 0;
+  while (suffix < previous.length - prefix && suffix < next.length - prefix &&
+         previous[previous.length - suffix - 1] === next[next.length - suffix - 1]) suffix++;
+  const knownEdit = edit && next.startsWith(previous.slice(0, edit.start)) &&
+    next.endsWith(previous.slice(edit.end)) ? edit : null;
+  const changedStart = knownEdit?.start ?? prefix;
+  const changedEnd = knownEdit?.end ?? previous.length - suffix;
+  const delta = next.length - previous.length;
+  return tokens.flatMap((token) => {
+    const shifted = changedEnd <= token.start
+      ? { ...token, start: token.start + delta, end: token.end + delta }
+      : changedStart >= token.end ? token : null;
+    return shifted && next.slice(shifted.start, shifted.end) === shifted.token ? [shifted] : [];
+  });
+}
+
+function selectedAgentNames(text: string, tokens: SelectedAgentToken[]): string[] {
+  const seen = new Set<string>();
+  return tokens.slice().sort((a, b) => a.start - b.start).flatMap((token) => {
+    if (seen.has(token.name) || text.slice(token.start, token.end) !== token.token ||
+        MENTION_CONTINUATION.test(text[token.end] ?? '')) return [];
+    seen.add(token.name);
+    return [token.name];
+  });
+}
+
+type ProjectMentionItem =
+  | { key: string; type: 'agent'; agent: WorkspaceAgent; joined: boolean }
+  | { key: string; type: 'member'; member: TeamMember & { username: string } };
+
 interface ChatInputProps {
-  onSend: (content: string, mentions: string[], files: PendingFile[]) => void;
+  onSend: (content: string, mentions: string[], files: PendingFile[], metadata?: SelectedMentionMetadata) => void;
   disabled?: boolean;
   className?: string;
   agents?: WorkspaceAgent[];
@@ -40,6 +124,10 @@ interface ChatInputProps {
   /** Auto-focus the textarea when mounted or when this key changes. */
   focusKey?: number;
   onCreateRoutine?: () => void;
+  /** Project-only candidate list; omitted for the unchanged personal/legacy picker. */
+  projectMentions?: ProjectMentionConfig;
+  /** Opens the project picker from a toolbar button, placing @ at the caret. */
+  mentionTriggerKey?: number;
 }
 
 function isImageFile(file: File): boolean {
@@ -49,8 +137,8 @@ function isImageFile(file: File): boolean {
 const FILE_ACCEPT =
   'image/*,.pdf,.txt,.md,.json,.csv,.xml,.html,.css,.js,.ts,.py,.rb,.go,.rs,.java,.c,.cpp,.h,.hpp,.sh,.yaml,.yml,.toml';
 
-export function ChatInput({ onSend, disabled, className, agents = [], knowledge = [], draft, onDraftChange, onFocusChange, focusKey, onCreateRoutine }: ChatInputProps) {
-  const t = useT();
+export function ChatInput({ onSend, disabled, className, agents = [], knowledge = [], draft, onDraftChange, onFocusChange, focusKey, onCreateRoutine, projectMentions, mentionTriggerKey }: ChatInputProps) {
+  const { t, locale } = useI18n();
   const [message, setMessage] = React.useState(draft ?? '');
   const [showMentions, setShowMentions] = React.useState(false);
   const [mentionFilter, setMentionFilter] = React.useState('');
@@ -61,6 +149,16 @@ export function ChatInput({ onSend, disabled, className, agents = [], knowledge 
   const textareaRef = React.useRef<HTMLTextAreaElement>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const dragCountRef = React.useRef(0);
+  const messageRef = React.useRef(draft ?? '');
+  const lastOwnDraftRef = React.useRef<string | null>(null);
+  const selectedTokensRef = React.useRef<SelectedAgentToken[]>([]);
+  const activeMentionRef = React.useRef<MentionRange | null>(null);
+  const composingRef = React.useRef(false);
+  const pendingEditRef = React.useRef<{ start: number; end: number } | null>(null);
+  const mentionTriggerRef = React.useRef(mentionTriggerKey);
+  const projectLabels = locale === 'zh-CN'
+    ? { agents: '智能体', members: '项目成员', joining: '加入会话后参与', loading: '正在加载项目成员', retry: '成员加载失败，重试', empty: '没有匹配的成员或智能体', workflow: '运行中的工作流只能提及当前步骤智能体' }
+    : { agents: 'Agents', members: 'Project members', joining: 'Joins the conversation', loading: 'Loading project members', retry: 'Members failed to load. Retry', empty: 'No matching agents or members', workflow: 'Only the current workflow step agent can be mentioned' };
 
   // Auto-size the textarea to its content (capped), toggling a scrollbar past
   // the cap. Centralized here so every path that changes `message` — typing,
@@ -80,7 +178,10 @@ export function ChatInput({ onSend, disabled, className, agents = [], knowledge 
   // height itself — otherwise the box collapses to one row while typing. The
   // layout effect below handles sizing off `message`.
   React.useEffect(() => {
-    setMessage(draft ?? '');
+    const next = draft ?? '';
+    if (lastOwnDraftRef.current !== next) selectedTokensRef.current = [];
+    messageRef.current = next;
+    setMessage(next);
   }, [draft]);
 
   // Keep the textarea sized to its content whenever the message changes.
@@ -131,6 +232,74 @@ export function ChatInput({ onSend, disabled, className, agents = [], knowledge 
     ...filteredKnowledge.map((entry): MentionItem => ({ type: 'knowledge', entry })),
   ];
 
+  const projectAgentNames = projectMentions?.agents.flatMap((agent) =>
+    [agent.agentName, agent.displayName || '']) ?? [];
+  const projectMemberNames = projectMentions?.members?.flatMap((member) =>
+    [member.username || '', member.displayName || '']) ?? [];
+  const projectSearch = mentionFilter.toLocaleLowerCase();
+  const joinedAgents = new Set(projectMentions?.participantNames ?? []);
+  const projectAgents = (projectMentions?.agents ?? [])
+    .filter((agent) => agent.status === 'online' &&
+      (!projectMentions?.workflowRunning || agent.agentName === projectMentions.activeWorkflowStepAgent) &&
+      (agent.agentName.toLocaleLowerCase().includes(projectSearch) ||
+       (agent.displayName || '').toLocaleLowerCase().includes(projectSearch)))
+    .sort((left, right) => Number(joinedAgents.has(right.agentName)) - Number(joinedAgents.has(left.agentName)));
+  const projectMembers = (projectMentions?.members ?? [])
+    .filter((member): member is TeamMember & { username: string } => Boolean(member.username?.trim()))
+    .filter((member) => member.username.toLocaleLowerCase().includes(projectSearch) ||
+      (member.displayName || '').toLocaleLowerCase().includes(projectSearch));
+  const projectItems: ProjectMentionItem[] = [
+    ...projectAgents.map((agent) => ({ key: `agent:${agent.agentName}`, type: 'agent' as const, agent, joined: joinedAgents.has(agent.agentName) })),
+    ...projectMembers.map((member) => ({ key: `member:${member.email}`, type: 'member' as const, member })),
+  ];
+
+  const publishMessage = (text: string, edit?: { start: number; end: number }) => {
+    selectedTokensRef.current = updateSelectedTokens(selectedTokensRef.current, messageRef.current, text, edit);
+    pendingEditRef.current = null;
+    messageRef.current = text;
+    lastOwnDraftRef.current = text;
+    setMessage(text);
+    onDraftChange?.(text);
+  };
+
+  const refreshProjectMention = (value: string, cursor: number) => {
+    const range = projectMentionRange(value, cursor, [...projectAgentNames, ...projectMemberNames]);
+    activeMentionRef.current = range;
+    setMentionFilter(range?.filter ?? '');
+    setMentionIndex(0);
+    setShowMentions(Boolean(range));
+  };
+
+  React.useEffect(() => {
+    if (!projectMentions || mentionTriggerKey == null || mentionTriggerRef.current === mentionTriggerKey || disabled) {
+      mentionTriggerRef.current = mentionTriggerKey;
+      return;
+    }
+    mentionTriggerRef.current = mentionTriggerKey;
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    const value = messageRef.current;
+    const caret = textarea.selectionStart;
+    const active = projectMentionRange(value, caret, [...projectAgentNames, ...projectMemberNames]);
+    if (active) {
+      refreshProjectMention(value, caret);
+      textarea.focus();
+      return;
+    }
+    const separator = caret > 0 && !/\s/.test(value[caret - 1]) ? ' ' : '';
+    const inserted = `${separator}@`;
+    const next = value.slice(0, caret) + inserted + value.slice(textarea.selectionEnd);
+    publishMessage(next);
+    const nextCaret = caret + inserted.length;
+    refreshProjectMention(next, nextCaret);
+    requestAnimationFrame(() => {
+      textarea.focus();
+      textarea.setSelectionRange(nextCaret, nextCaret);
+    });
+    // The trigger key, not the inline config object, determines when the toolbar opens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mentionTriggerKey]);
+
   const addFiles = React.useCallback((files: FileList | File[]) => {
     const newFiles: PendingFile[] = [];
     for (const file of Array.from(files)) {
@@ -165,7 +334,17 @@ export function ChatInput({ onSend, disabled, className, agents = [], knowledge 
     if (!trimmed && pendingFiles.length === 0) return;
     if (disabled) return;
     const mentions = extractMentions(trimmed);
-    onSend(trimmed, mentions, pendingFiles);
+    if (projectMentions) {
+      onSend(trimmed, mentions, pendingFiles, {
+        selectedAgentNames: selectedAgentNames(message, selectedTokensRef.current),
+      });
+    } else {
+      onSend(trimmed, mentions, pendingFiles);
+    }
+    selectedTokensRef.current = [];
+    activeMentionRef.current = null;
+    messageRef.current = '';
+    lastOwnDraftRef.current = '';
     setMessage('');
     onDraftChange?.('');
     setPendingFiles([]);
@@ -206,11 +385,61 @@ export function ChatInput({ onSend, disabled, className, agents = [], knowledge 
     }
   };
 
+  const insertProjectMention = (item: ProjectMentionItem) => {
+    const textarea = textareaRef.current;
+    const value = messageRef.current;
+    const range = activeMentionRef.current ?? (textarea && projectMentionRange(
+      value, textarea.selectionStart, [...projectAgentNames, ...projectMemberNames]
+    ));
+    if (!textarea || !range) return;
+    const name = item.type === 'agent' ? item.agent.agentName : item.member.username;
+    const token = item.type === 'agent' ? `@${name}` :
+      `@{${name.replaceAll('\\', '\\\\').replaceAll('}', '\\}').replaceAll('\n', '\\n').replaceAll('\r', '\\r')}}`;
+    const after = value.slice(range.end);
+    const separator = after && !/^\s/.test(after) ? ' ' : '';
+    const next = value.slice(0, range.start) + token + separator + after;
+    publishMessage(next);
+    if (item.type === 'agent') {
+      selectedTokensRef.current.push({ start: range.start, end: range.start + token.length, token, name });
+    }
+    activeMentionRef.current = null;
+    setShowMentions(false);
+    setMentionFilter('');
+    requestAnimationFrame(() => {
+      textarea.focus();
+      const position = range.start + token.length + separator.length;
+      textarea.setSelectionRange(position, position);
+    });
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Ignore Enter during IME composition (Chinese, Japanese, Korean input)
-    if (e.nativeEvent.isComposing || e.key === 'Process') return;
+    if (composingRef.current || e.nativeEvent.isComposing || e.key === 'Process') return;
 
-    if (showMentions && mentionItems.length > 0) {
+    if (projectMentions && showMentions) {
+      if (e.key === 'ArrowDown' && projectItems.length > 0) {
+        e.preventDefault();
+        setMentionIndex((previous) => (previous + 1) % projectItems.length);
+        return;
+      }
+      if (e.key === 'ArrowUp' && projectItems.length > 0) {
+        e.preventDefault();
+        setMentionIndex((previous) => (previous - 1 + projectItems.length) % projectItems.length);
+        return;
+      }
+      if ((e.key === 'Enter' || e.key === 'Tab') && projectItems.length > 0) {
+        e.preventDefault();
+        insertProjectMention(projectItems[Math.min(mentionIndex, projectItems.length - 1)]);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setShowMentions(false);
+        return;
+      }
+    }
+
+    if (!projectMentions && showMentions && mentionItems.length > 0) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
         setMentionIndex((prev) => (prev + 1) % mentionItems.length);
@@ -248,13 +477,28 @@ export function ChatInput({ onSend, disabled, className, agents = [], knowledge 
   // Auto-resize textarea + detect @mentions
   const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const value = e.target.value;
-    setMessage(value);
-    onDraftChange?.(value);
+    if (projectMentions) {
+      publishMessage(value, pendingEditRef.current ?? undefined);
+    }
+    else {
+      messageRef.current = value;
+      lastOwnDraftRef.current = value;
+      setMessage(value);
+      onDraftChange?.(value);
+    }
     const textarea = e.target;
     // Height is kept in sync by the layout effect keyed on `message`.
 
     // Detect @mention trigger
     const cursorPos = textarea.selectionStart;
+    if (projectMentions) {
+      if (composingRef.current || (e.nativeEvent as InputEvent).isComposing) {
+        setShowMentions(false);
+      } else {
+        refreshProjectMention(value, cursorPos);
+      }
+      return;
+    }
     const textBefore = value.slice(0, cursorPos);
     // [^\s@] (not \w) so typing a display name like "@小明" keeps the
     // picker open while filtering; the inserted mention is still ASCII.
@@ -356,7 +600,66 @@ export function ChatInput({ onSend, disabled, className, agents = [], knowledge 
       onDrop={handleDrop}
     >
       {/* @mention autocomplete dropdown */}
-      {showMentions && mentionItems.length > 0 && (
+      {projectMentions && showMentions && (
+        <div role="listbox" aria-label="@" className="absolute bottom-full mb-2 left-0 right-0 z-50 max-h-[280px] overflow-y-auto rounded-lg border bg-popover shadow-lg">
+          {projectMentions.workflowRunning && (
+            <div className="border-b px-3 py-2 text-xs text-muted-foreground">{projectLabels.workflow}</div>
+          )}
+          {projectAgents.length > 0 && (
+            <div className="border-b px-3 py-1.5 text-xs font-medium text-muted-foreground">{projectLabels.agents}</div>
+          )}
+          {projectItems.filter((item) => item.type === 'agent').map((item, idx) => {
+            if (item.type !== 'agent') return null;
+            return (
+              <button
+                key={item.key}
+                type="button"
+                role="option"
+                aria-selected={idx === mentionIndex}
+                className={cn('flex min-h-10 w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring', idx === mentionIndex && 'bg-accent')}
+                onMouseDown={(event) => event.preventDefault()}
+                onMouseEnter={() => setMentionIndex(idx)}
+                onClick={() => insertProjectMention(item)}
+              >
+                <AgentAvatar name={item.agent.agentName} size={24} status={item.agent.status} showStatus />
+                <span className="min-w-0 flex-1 truncate">{agentLabel(item.agent)}</span>
+                <span className="max-w-[40%] shrink-0 truncate text-xs text-muted-foreground">@{item.agent.agentName}</span>
+                {!item.joined && <span className="shrink-0 text-xs text-muted-foreground">{projectLabels.joining}</span>}
+              </button>
+            );
+          })}
+          {projectMembers.length > 0 && (
+            <div className="border-y px-3 py-1.5 text-xs font-medium text-muted-foreground">{projectLabels.members}</div>
+          )}
+          {projectItems.map((item, idx) => {
+            if (item.type !== 'member') return null;
+            return (
+              <button
+                key={item.key}
+                type="button"
+                role="option"
+                aria-selected={idx === mentionIndex}
+                className={cn('flex min-h-10 w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring', idx === mentionIndex && 'bg-accent')}
+                onMouseDown={(event) => event.preventDefault()}
+                onMouseEnter={() => setMentionIndex(idx)}
+                onClick={() => insertProjectMention(item)}
+              >
+                <span className="min-w-0 flex-1 truncate">{item.member.displayName || item.member.username}</span>
+                <span className="max-w-[50%] shrink-0 truncate text-xs text-muted-foreground">@{item.member.username}</span>
+              </button>
+            );
+          })}
+          {projectMentions.membersError ? (
+            <button type="button" className="w-full px-3 py-2 text-left text-sm text-destructive hover:bg-accent focus-visible:outline-2 focus-visible:outline-ring"
+              onMouseDown={(event) => event.preventDefault()} onClick={projectMentions.onRetryMembers}>{projectLabels.retry}</button>
+          ) : projectMentions.members === null ? (
+            <div role="status" className="px-3 py-2 text-xs text-muted-foreground">{projectLabels.loading}</div>
+          ) : projectItems.length === 0 ? (
+            <div className="px-3 py-2 text-xs text-muted-foreground">{projectLabels.empty}</div>
+          ) : null}
+        </div>
+      )}
+      {!projectMentions && showMentions && mentionItems.length > 0 && (
         <div className="absolute bottom-full mb-2 left-0 right-0 bg-popover border rounded-lg shadow-lg z-50 overflow-hidden max-h-[280px] overflow-y-auto">
           {filteredAgents.length > 0 && filteredKnowledge.length > 0 && (
             <div className="px-3 py-1.5 text-[10px] font-medium text-muted-foreground uppercase tracking-wider border-b border-border">{t('chatInput.mentionAgents')}</div>
@@ -519,11 +822,31 @@ export function ChatInput({ onSend, disabled, className, agents = [], knowledge 
             ref={textareaRef}
             value={message}
             onChange={handleInput}
+            onBeforeInput={(event) => {
+              if (projectMentions) pendingEditRef.current = {
+                start: event.currentTarget.selectionStart,
+                end: event.currentTarget.selectionEnd,
+              };
+            }}
             onKeyDown={handleKeyDown}
+            onCompositionStart={() => {
+              if (projectMentions) { composingRef.current = true; setShowMentions(false); }
+            }}
+            onCompositionEnd={(event) => {
+              if (projectMentions) {
+                composingRef.current = false;
+                refreshProjectMention(event.currentTarget.value, event.currentTarget.selectionStart);
+              }
+            }}
+            onSelect={(event) => {
+              if (projectMentions && showMentions && !composingRef.current) {
+                refreshProjectMention(event.currentTarget.value, event.currentTarget.selectionStart);
+              }
+            }}
             onPaste={handlePaste}
             onFocus={() => { setIsFocused(true); onFocusChange?.(true); }}
             onBlur={() => { setIsFocused(false); onFocusChange?.(false); }}
-            placeholder={agents.length > 1 || knowledge.length > 0 ? t('chatInput.placeholderWithMentions') : t('chatInput.placeholder')}
+            placeholder={projectMentions || agents.length > 1 || knowledge.length > 0 ? t('chatInput.placeholderWithMentions') : t('chatInput.placeholder')}
             rows={1}
             disabled={disabled}
             data-chat-input
