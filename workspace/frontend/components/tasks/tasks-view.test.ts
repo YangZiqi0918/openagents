@@ -101,6 +101,14 @@ describe('personal task pool', () => {
     expect(overview().parentElement?.className).toContain('min-h-[180px]');
   });
 
+  it('keeps the submitted result out of completed task cards', async () => {
+    mock.task = { ...mock.task, status: 'done', submittedSummary: '已完成部署验证' };
+    await render();
+    expect(overview().textContent).toContain('已完成');
+    expect(container.textContent).not.toContain('提交结果');
+    expect(container.textContent).not.toContain('已完成部署验证');
+  });
+
   it('shows scannable task metadata, two tags plus overflow, and overdue dates', async () => {
     mock.task = {
       ...mock.task,

@@ -213,7 +213,6 @@ function TaskCard({
         </p>
       )}
       {dispatched && task.acceptanceCriteria && <p className="mt-1 line-clamp-2 break-words text-xs text-muted-foreground" title={task.acceptanceCriteria}>{zh ? '验收标准：' : 'Acceptance: '}{task.acceptanceCriteria}</p>}
-      {dispatched && !needsInput && task.submittedSummary && <p className="mt-2 line-clamp-2 break-words rounded border border-border bg-muted/40 px-2 py-1.5 text-xs whitespace-pre-wrap" title={task.submittedSummary}>{zh ? '提交结果：' : 'Submission: '}{task.submittedSummary}</p>}
 
       {/* Workflow progress: “Step 2/3 · Review” + step dots. */}
       {task.workflowId && task.run && task.run.stepCount > 0 && (isRunning || needsInput || task.run.status === 'paused') && (
