@@ -67,10 +67,11 @@ export function ProjectPlanPage({ projectId, storageKey, workspaceModulesAvailab
 }
 
 function ConnectedPlan({ projectId, storageKey, focusItemId }: ProjectPlanPageProps) {
-  const { workspace } = useWorkspace();
+  const { workspace, me } = useWorkspace();
   const workspaceId = workspace?.workspaceId;
   const key = storageKey ?? `oa:projects:workspace:${workspaceId ?? 'local'}:plan:${projectId}:v1`;
-  return <ServerPlanPage key={key} storageKey={key} focusItemId={focusItemId} />;
+  const canManage = me?.role === 'owner' || me?.role === 'admin';
+  return <ServerPlanPage key={key} storageKey={key} focusItemId={focusItemId} canManage={canManage} />;
 }
 
 function EditableText({

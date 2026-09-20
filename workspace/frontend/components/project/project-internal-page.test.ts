@@ -39,8 +39,8 @@ function MockDetail({ name }: { name: string }) {
 let root: Root;
 let container: HTMLDivElement;
 
-async function render(withWorkspace = true, onBack = vi.fn()) {
-  const page = React.createElement(ProjectInternalPage, { projectId: 'project-1', projectName: '测试项目', onBack, workspaceModulesAvailable: withWorkspace });
+async function render(withWorkspace = true, onBack = vi.fn(), initialTab?: 'plan') {
+  const page = React.createElement(ProjectInternalPage, { projectId: 'project-1', projectName: '测试项目', onBack, workspaceModulesAvailable: withWorkspace, initialTab });
   await act(() => root.render(React.createElement(I18nProvider, {
     initialLocale: 'zh-CN', hasStoredLocale: true,
     children: withWorkspace ? React.createElement(LayoutProvider, { children: page }) : page,
@@ -98,11 +98,14 @@ describe('Project internal page', () => {
     expect(onBack).toHaveBeenCalledOnce();
   });
 
-  it('hides plan and review from ordinary project members', async () => {
-    role.value = 'member';
-    await render();
-    expect(Array.from(container.querySelectorAll('nav button'), (item) => item.textContent)).not.toContain('计划');
-    expect(Array.from(container.querySelectorAll('nav button'), (item) => item.textContent)).not.toContain('审核');
+  it.each(['member', 'viewer'])('keeps plan visible and review hidden for %s', async (memberRole) => {
+    role.value = memberRole;
+    await render(true, vi.fn(), 'plan');
+    const labels = Array.from(container.querySelectorAll('nav button'), (item) => item.textContent);
+    expect(labels).toContain('计划');
+    expect(labels).not.toContain('审核');
+    expect(tab('计划').getAttribute('aria-current')).toBe('page');
+    expect(container.querySelector('[data-testid="project-plan-page"]')).not.toBeNull();
   });
 
   it('embeds the five existing modules beneath the project navigation', async () => {

@@ -46,16 +46,21 @@ class PublishRequest(BaseModel):
     version: int = Field(ge=1)
 
 
-def _admin(db: Session, workspace_id: str, authorization: Optional[str]):
+def _project_access(db: Session, workspace_id: str, authorization: Optional[str], min_role: str):
     workspace = _resolve_workspace(db, workspace_id)
     if workspace is None or workspace.kind != "project" or workspace.status == "deleted":
         return None, None, json_response(ResponseCode.NOT_FOUND, "Project not found")
-    if not verify_human_project_access(db, workspace, authorization, "admin"):
-        return None, None, json_response(ResponseCode.FORBIDDEN, "Administrator access required")
+    if not verify_human_project_access(db, workspace, authorization, min_role):
+        message = "Administrator access required" if min_role == "admin" else "Project membership required"
+        return None, None, json_response(ResponseCode.FORBIDDEN, message)
     user = resolve_current_user(db, authorization)
     if user is None:
         return None, None, json_response(ResponseCode.UNAUTHORIZED, "Identity required")
     return workspace, user, None
+
+
+def _admin(db: Session, workspace_id: str, authorization: Optional[str]):
+    return _project_access(db, workspace_id, authorization, "admin")
 
 
 def _valid_date(value: Optional[str]) -> bool:
@@ -177,7 +182,7 @@ def _items_with_tasks(db: Session, workspace_id: str):
 
 @router.get("/{workspace_id}/plan-items")
 def list_plan_items(workspace_id: str, db: Session = Depends(get_db), authorization: Optional[str] = Header(None)):
-    workspace, _, error = _admin(db, workspace_id, authorization)
+    workspace, _, error = _project_access(db, workspace_id, authorization, "viewer")
     if error:
         return error
     items, by_item, users = _items_with_tasks(db, workspace.id)

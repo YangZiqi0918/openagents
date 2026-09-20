@@ -110,11 +110,13 @@ interface ChatMessagesProps {
   hasOlder?: boolean;
   /** Whether older messages are currently being loaded. */
   loadingOlder?: boolean;
+  /** Project history keeps every persisted thinking event, including text repeated in the final answer. */
+  preserveThinkingHistory?: boolean;
   /** Send a suggested prompt as the user's message (tap-to-ask chips). */
   onSuggestion?: (text: string) => void;
 }
 
-export function ChatMessages({ messages, agents, showAllSteps, className, scrollKey, loadOlder, hasOlder, loadingOlder, onSuggestion }: ChatMessagesProps) {
+export function ChatMessages({ messages, agents, showAllSteps, className, scrollKey, loadOlder, hasOlder, loadingOlder, preserveThinkingHistory = false, onSuggestion }: ChatMessagesProps) {
   const t = useT();
   const containerRef = useRef<HTMLDivElement>(null);
   const [showScrollBtn, setShowScrollBtn] = useState(false);
@@ -145,7 +147,7 @@ export function ChatMessages({ messages, agents, showAllSteps, className, scroll
     // Deduplicate: if a chat message follows thinking from the same agent
     // with matching content, hide the thinking (it was the final answer
     // streamed early as "thinking" before being posted as "chat").
-    const deduped = realMessages.filter((msg, i) => {
+    const deduped = preserveThinkingHistory ? realMessages : realMessages.filter((msg, i) => {
       if (msg.messageType !== 'thinking') return true;
       // Look ahead for a chat message from the same agent
       for (let j = i + 1; j < realMessages.length; j++) {
@@ -198,15 +200,21 @@ export function ChatMessages({ messages, agents, showAllSteps, className, scroll
       if (msg.messageType !== 'status') return true;
       return index === lastStatusIndex;
     });
-  }, [realMessages, showAllSteps]);
+  }, [realMessages, showAllSteps, preserveThinkingHistory]);
 
   // Group into chat messages and intermediate step clusters
   const groups = useMemo(() => groupMessages(filteredMessages), [filteredMessages]);
 
   const hasTerminalStatus = realMessages.some(isTerminalStatus);
+  const latestLoading = loadingMessages[loadingMessages.length - 1];
+  const isProjectPending = latestLoading?.metadata?.projectPending === true;
+  const isStaleProjectPending = isProjectPending && latestLoading.metadata.waitingPhase === 'stale';
 
   // Loading indicator counts as a virtual row when present
-  const hasLoading = loadingMessages.length > 0 && !hasTerminalStatus;
+  // Project pending is derived from the current request, so an older terminal
+  // status in the history must not suppress it. Legacy optimistic loading keeps
+  // its existing terminal-status behavior.
+  const hasLoading = !!latestLoading && (isProjectPending || !hasTerminalStatus);
   const totalCount = groups.length + (hasLoading ? 1 : 0);
 
   // ── Virtualizer ──
@@ -432,8 +440,12 @@ export function ChatMessages({ messages, agents, showAllSteps, className, scroll
                     {/* Optimistic "waiting for a reply" row, attributed to the
                         agent the placeholder was created for (see chat-view). */}
                     <WorkingBubble
-                      agentName={loadingMessages[loadingMessages.length - 1]?.senderName}
+                      agentName={latestLoading?.senderName}
                       agents={agents}
+                      stale={isStaleProjectPending}
+                      status={isStaleProjectPending && typeof latestLoading.metadata.waitingStatus === 'string'
+                        ? latestLoading.metadata.waitingStatus
+                        : undefined}
                     />
                   </div>
                 </div>

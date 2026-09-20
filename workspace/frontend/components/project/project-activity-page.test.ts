@@ -24,6 +24,7 @@ const mock = vi.hoisted(() => ({
   ] as WorkspaceAgent[],
   channels: [] as NetworkChannel[],
   messages: {} as Record<string, WorkspaceMessage[]>,
+  renderedMessages: [] as WorkspaceMessage[],
   input: null as React.ComponentProps<typeof ChatInput> | null,
   files: [] as PendingFile[],
   polling: vi.fn(),
@@ -42,6 +43,7 @@ const mock = vi.hoisted(() => ({
     removeChannelParticipant: vi.fn(),
     fetchResource: vi.fn(),
     getTeam: vi.fn(),
+    pollEvents: vi.fn(),
     getFileUrl: vi.fn(),
   },
 }));
@@ -116,8 +118,9 @@ vi.mock('@/components/chat/chat-input', () => ({
   },
 }));
 vi.mock('@/components/chat/chat-messages', () => ({
-  ChatMessages: (props: React.ComponentProps<typeof ChatMessages>) =>
-    React.createElement(
+  ChatMessages: (props: React.ComponentProps<typeof ChatMessages>) => {
+    mock.renderedMessages = props.messages;
+    return React.createElement(
       'div',
       { 'data-testid': 'messages' },
       ...props.messages.map((message) =>
@@ -128,7 +131,8 @@ vi.mock('@/components/chat/chat-messages', () => ({
         { 'data-testid': 'history', onClick: props.loadOlder },
         'History',
       ),
-    ),
+    );
+  },
 }));
 
 const channel = (id: string, title: string, extra = {}): NetworkChannel => ({
@@ -230,6 +234,7 @@ beforeEach(() => {
     { agentName: 'helper', displayName: 'Helper', status: 'online' } as WorkspaceAgent,
   ];
   mock.messages = {};
+  mock.renderedMessages = [];
   mock.files = [];
   mock.channels = [
     channel('personal', 'Personal'),
@@ -251,6 +256,7 @@ beforeEach(() => {
     { username: 'user', role: 'member', displayName: 'User' },
     { username: 'other', role: 'member', displayName: 'Other' },
   ]);
+  mock.api.pollEvents.mockResolvedValue({ events: [], has_more: false });
   mock.api.fetchResource.mockImplementation(async (_path, options) => ({
     json: async () => ({ data: { following: options?.method === 'PUT'
       ? JSON.parse(options.body).following : false } }),
@@ -568,7 +574,7 @@ describe('project activity', () => {
     expect(mock.api.sendEvent).not.toHaveBeenCalled();
     await select();
     expect(mock.polling).toHaveBeenLastCalledWith({
-      sessionId: 'project:one:a',
+      sessionId: 'project:one:a', includeThinkingHistory: true,
     });
     expect(mock.personalSelection).not.toHaveBeenCalled();
     expect(mock.personalCreate).not.toHaveBeenCalled();
@@ -694,6 +700,92 @@ describe('project activity', () => {
         localStorage.getItem(activityStorageKey('workspace', 'one', 'user'))!,
       ).readAt['project:one:a'],
     ).toBeGreaterThan(0);
+  });
+
+  it('shares the waiting row and real thinking between accounts without showing placeholder thinking', async () => {
+    mock.localAuth = true;
+    mock.workspaceId = 'project-one';
+    mock.channels = [channel('chat-one', 'Shared', { participants: ['helper'] })];
+    const timestamp = new Date(Date.now() - 10_000).toISOString();
+    mock.messages['chat-one'] = [
+      message('chat-one', 'Please help', { messageId: 'trigger', targetAgents: ['helper'], createdAt: timestamp }),
+      message('chat-one', 'thinking...', { messageId: 'placeholder', senderType: 'agent', senderName: 'helper', messageType: 'thinking' }),
+      message('chat-one', 'Checking the work', { messageId: 'thinking', senderType: 'agent', senderName: 'helper', messageType: 'thinking' }),
+    ];
+    await render('project-one');
+    expect(mock.renderedMessages.map((item) => item.messageId)).toContain('thinking');
+    expect(mock.renderedMessages.map((item) => item.messageId)).not.toContain('placeholder');
+    expect(mock.renderedMessages.filter((item) => item.metadata.projectPending)).toEqual([
+      expect.objectContaining({ senderName: 'helper', messageType: 'loading', metadata: expect.objectContaining({ waitingPhase: 'active' }) }),
+    ]);
+
+    mock.userId = 'another-member';
+    await render('project-one');
+    expect(mock.renderedMessages.filter((item) => item.metadata.projectPending)).toHaveLength(1);
+    mock.messages['chat-one'] = [...mock.messages['chat-one'], message('chat-one', 'Finished', {
+      messageId: 'reply', senderType: 'agent', senderName: 'helper', messageType: 'chat',
+    })];
+    await render('project-one');
+    expect(mock.renderedMessages.filter((item) => item.metadata.projectPending)).toHaveLength(0);
+  });
+
+  it('checks a stopped turn without showing historical status, then waits for a newer request', async () => {
+    mock.localAuth = true;
+    mock.workspaceId = 'project-one';
+    mock.channels = [channel('chat-one', 'Shared', { participants: ['helper'] })];
+    const timestamp = Date.now() - 10_000;
+    mock.messages['chat-one'] = [message('chat-one', 'Earlier request', {
+      messageId: 'old-request', targetAgents: ['helper'], createdAt: new Date(timestamp).toISOString(),
+    })];
+    mock.api.pollEvents.mockImplementation(async ({ after }: { after: string }) => ({
+      events: after === 'old-request' ? [{
+        id: 'old-stop', type: 'workspace.message.posted', source: 'openagents:helper',
+        target: 'channel/chat-one', payload: { message_type: 'status', content: 'Execution stopped by user' },
+        metadata: {}, timestamp: timestamp + 1_000, visibility: 'channel',
+      }] : [],
+      has_more: false,
+    }));
+    await render('project-one');
+    expect(mock.api.pollEvents).toHaveBeenCalledWith(expect.objectContaining({
+      channel: 'chat-one', after: 'old-request', excludeMessageTypes: ['chat', 'thinking', 'todos'],
+    }));
+    expect(mock.renderedMessages.map((item) => item.messageId)).not.toContain('old-stop');
+    expect(mock.renderedMessages.filter((item) => item.metadata.projectPending)).toHaveLength(0);
+
+    mock.messages['chat-one'] = [...mock.messages['chat-one'], message('chat-one', 'New request', {
+      messageId: 'new-request', targetAgents: ['helper'], createdAt: new Date(timestamp + 2_000).toISOString(),
+    })];
+    await render('project-one');
+    expect(mock.renderedMessages.filter((item) => item.metadata.projectPending)).toEqual([
+      expect.objectContaining({ messageId: 'project-loading-new-request' }),
+    ]);
+  });
+
+  it('finds a terminal status beyond the first status-event page', async () => {
+    mock.localAuth = true;
+    mock.workspaceId = 'project-one';
+    mock.channels = [channel('chat-one', 'Shared', { participants: ['helper'] })];
+    const timestamp = Date.now() - 10_000;
+    mock.messages['chat-one'] = [message('chat-one', 'Request', {
+      messageId: 'request', targetAgents: ['helper'], createdAt: new Date(timestamp).toISOString(),
+    })];
+    mock.api.pollEvents.mockImplementation(async ({ before }: { before?: string }) => before
+      ? { events: [{
+        id: 'stop', type: 'workspace.message.posted', source: 'openagents:helper',
+        target: 'channel/chat-one', payload: { message_type: 'status', content: 'Execution stopped' },
+        metadata: {}, timestamp: timestamp + 1_000, visibility: 'channel',
+      }], has_more: false }
+      : { events: [{
+        id: 'other-status', type: 'workspace.message.posted', source: 'openagents:another',
+        target: 'channel/chat-one', payload: { message_type: 'status', content: 'Still working' },
+        metadata: {}, timestamp: timestamp + 2_000, visibility: 'channel',
+      }], has_more: true });
+    await render('project-one');
+    expect(mock.api.pollEvents).toHaveBeenCalledTimes(2);
+    expect(mock.api.pollEvents).toHaveBeenLastCalledWith(expect.objectContaining({
+      channel: 'chat-one', after: 'request', before: 'other-status',
+    }));
+    expect(mock.renderedMessages.filter((item) => item.metadata.projectPending)).toHaveLength(0);
   });
 
   it('preserves failed text and attachments, retrying without duplicate uploads', async () => {

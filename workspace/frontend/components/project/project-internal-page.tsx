@@ -52,13 +52,13 @@ export function ProjectInternalPage({ projectId, projectName, onBack, workspaceM
   const [connecting, setConnecting] = useState(false);
   const me = useOptionalWorkspace()?.me;
   const admin = me?.role === 'owner' || me?.role === 'admin';
-  const visibleTabs = TABS.filter((tab) => (tab === 'review' || (tab === 'plan' && workspaceModulesAvailable)) ? (workspaceModulesAvailable && admin) || (tab === 'plan' && !workspaceModulesAvailable) : true);
+  const visibleTabs = TABS.filter((tab) => tab !== 'review' || (workspaceModulesAvailable && admin));
   useEffect(() => {
-    if (me && !admin && (activeTab === 'plan' || activeTab === 'review')) setActiveTab('activity');
+    if (me && !admin && activeTab === 'review') setActiveTab('activity');
   }, [me, admin, activeTab]);
   useEffect(() => {
-    if (initialTab === 'plan' && admin) setActiveTab('plan');
-  }, [initialTab, initialPlanItemId, admin]);
+    if (initialTab === 'plan') setActiveTab('plan');
+  }, [initialTab, initialPlanItemId]);
   const labels: Record<ProjectTab, string> = {
     activity: locale === 'zh-CN' ? '动态' : 'Activity',
     plan: locale === 'zh-CN' ? '计划' : 'Plan',
@@ -97,7 +97,7 @@ export function ProjectInternalPage({ projectId, projectName, onBack, workspaceM
       <div data-testid="project-tab-content" data-active-tab={activeTab} className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {connecting ? <><div className="flex h-11 shrink-0 items-center justify-end border-b px-5"><Button variant="ghost" mode="icon" size="sm" onClick={() => setConnecting(false)} title={t('common.close')} aria-label={t('common.close')}><X className="size-4" /></Button></div><div className="min-h-0 flex-1"><ConnectAgentView onConnected={() => setConnecting(false)} /></div></> : <>
         {activeTab === 'activity' && workspaceModulesAvailable && <ProjectActivityPage projectId={projectId} projectName={projectName} initialSessionId={initialSessionId} />}
-        {activeTab === 'plan' && (!workspaceModulesAvailable || admin) && <ProjectPlanPage projectId={projectId} storageKey={planStorageKey} workspaceModulesAvailable={workspaceModulesAvailable} focusItemId={initialPlanItemId} />}
+        {activeTab === 'plan' && <ProjectPlanPage projectId={projectId} storageKey={planStorageKey} workspaceModulesAvailable={workspaceModulesAvailable} focusItemId={initialPlanItemId} />}
         {activeTab !== 'activity' && activeTab !== 'plan' && activeTab !== 'members' && activeTab !== 'review' && workspaceModulesAvailable && (
           <ProjectWorkspaceContent key={activeTab} tab={activeTab} />
         )}

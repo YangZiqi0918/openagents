@@ -8,6 +8,7 @@ import { useMessagePolling } from '@/hooks/use-polling';
 import { useComposingSignal } from '@/hooks/use-composing-signal';
 import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { mergeMessages } from '@/lib/message-merge';
+import { isProjectTerminalStatus, projectWaitingState, visibleProjectMessages } from './project-waiting-state';
 import {
   eventToMessage,
   type WorkspaceAgent,
@@ -83,7 +84,7 @@ export function ProjectActivityConversation({
     hasOlder,
     loadingOlder,
     error: pollingError,
-  } = useMessagePolling({ sessionId });
+  } = useMessagePolling({ sessionId, includeThinkingHistory: true });
   const { notifyFocus, notifyBlur, notifyTyping } =
     useComposingSignal(sessionId);
   const [sending, setSending] = useState(false);
@@ -91,6 +92,10 @@ export function ProjectActivityConversation({
   const [inputVersion, setInputVersion] = useState(0);
   const [optimistic, setOptimistic] = useState<WorkspaceMessage[]>([]);
   const [scrollKey, setScrollKey] = useState(0);
+  const [waitingClock, setWaitingClock] = useState(() => Date.now());
+  const [terminalEvidence, setTerminalEvidence] = useState<{
+    workspaceId: string; sessionId: string; triggerId: string; message: WorkspaceMessage;
+  } | null>(null);
   const [mentionTriggerKey, setMentionTriggerKey] = useState(0);
   const [workflowStep, setWorkflowStep] = useState<{ loaded: boolean; running: boolean; agent: string | null }>({ loaded: false, running: false, agent: null });
   const [following, setFollowing] = useState<boolean | null>(null);
@@ -111,6 +116,11 @@ export function ProjectActivityConversation({
       controller.current?.abort();
       callbacks.current.onSending(false);
     };
+  }, []);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setWaitingClock(Date.now()), 5_000);
+    return () => window.clearInterval(interval);
   }, []);
 
   useEffect(() => {
@@ -300,10 +310,67 @@ export function ProjectActivityConversation({
     notifyTyping();
   };
 
-  const displayed = mergeMessages(
+  const confirmedMessages = mergeMessages(
     scopedMessages,
     optimistic.filter((message) => message.sessionId === sessionId),
   );
+  const visibleMessages = visibleProjectMessages(confirmedMessages);
+  const rawWaiting = projectWaitingState(confirmedMessages, projectAgents, waitingClock, participantNames);
+  const waitingMessages = terminalEvidence?.workspaceId === workspaceId &&
+    terminalEvidence.sessionId === sessionId && terminalEvidence.triggerId === rawWaiting?.triggerId
+    ? mergeMessages(confirmedMessages, [terminalEvidence.message]) : confirmedMessages;
+  const waiting = projectWaitingState(waitingMessages, projectAgents, waitingClock, participantNames);
+  const pendingTrigger = rawWaiting?.triggerId;
+  const pendingAgent = rawWaiting?.agentName;
+  useEffect(() => {
+    if (!pendingTrigger || !pendingAgent) return;
+    let current = true;
+    // History deliberately omits status rows. Check only this request's
+    // terminal status so a refresh cannot resurrect an already stopped turn.
+    const checkTerminal = async () => {
+      let before: string | undefined;
+      while (current) {
+        const result = await workspaceApi.pollEvents({
+          channel: sessionId,
+          type: 'workspace.message',
+          after: pendingTrigger,
+          before,
+          sort: 'desc',
+          limit: 500,
+          excludeMessageTypes: ['chat', 'thinking', 'todos'],
+        });
+        if (!current) return;
+        const terminal = result.events.map(eventToMessage)
+          .find((message) => isProjectTerminalStatus(message, pendingAgent));
+        if (terminal) {
+          setTerminalEvidence({ workspaceId, sessionId, triggerId: pendingTrigger, message: terminal });
+          return;
+        }
+        const oldest = result.events.at(-1)?.id;
+        if (!result.has_more || !oldest || oldest === before) return;
+        before = oldest;
+      }
+    };
+    void checkTerminal().catch(() => {
+      // Live message polling still handles stop events if this check fails.
+    });
+    return () => { current = false; };
+  }, [workspaceApi, workspaceId, sessionId, pendingTrigger, pendingAgent]);
+  const lastTimestamp = visibleMessages.at(-1)?.createdAt;
+  const pendingMessage: WorkspaceMessage | null = waiting ? {
+    messageId: `project-loading-${waiting.triggerId}`,
+    sessionId,
+    senderType: 'agent',
+    senderName: waiting.agentName,
+    content: '',
+    mentions: [],
+    targetAgents: null,
+    messageType: 'loading',
+    metadata: { projectPending: true, waitingPhase: waiting.phase, waitingStatus: l.stillWaiting },
+    createdAt: lastTimestamp && Number.isFinite(Date.parse(lastTimestamp))
+      ? new Date(Date.parse(lastTimestamp) + 1).toISOString() : new Date(waitingClock).toISOString(),
+  } : null;
+  const displayed = pendingMessage ? [...visibleMessages, pendingMessage] : visibleMessages;
   return (
     <div
       data-testid="project-activity-conversation"
@@ -324,6 +391,7 @@ export function ProjectActivityConversation({
           messages={displayed}
           agents={agents}
           showAllSteps={false}
+          preserveThinkingHistory
           scrollKey={scrollKey + generation}
           loadOlder={loadOlder}
           hasOlder={hasOlder}

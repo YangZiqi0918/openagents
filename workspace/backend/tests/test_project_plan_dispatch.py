@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy import select
 
 from app.config import config
-from app.models import Channel, EventRecord, KanbanTask, Workflow, WorkflowRun, WorkspaceMember, WorkspaceMembership
+from app.models import Channel, EventRecord, KanbanTask, Workflow, WorkflowRun, Workspace, WorkspaceMember, WorkspaceMembership
 
 
 @pytest.fixture
@@ -60,7 +60,7 @@ def _dispatch(client, project, item, admin, user_ids):
 def test_admin_dispatch_is_idempotent_and_each_member_accepts_independently(local_auth, client, db):
     project, (_, admin), (alice, alice_headers), (bob, bob_headers) = _setup(client, db)
     item = _plan(client, project, admin)
-    assert client.get(f"/v1/workspaces/{project}/plan-items", headers=alice_headers).status_code == 403
+    assert client.get(f"/v1/workspaces/{project}/plan-items", headers=alice_headers).json()["data"]["items"][0]["id"] == item["id"]
     assert _dispatch(client, project, item, alice_headers, [alice["id"]]).status_code == 403
     sent = _dispatch(client, project, item, admin, [alice["id"], bob["id"]])
     assert sent.status_code == 200, sent.text
@@ -142,6 +142,45 @@ def test_member_cannot_dispatch_and_cross_project_membership_is_not_sufficient(l
     assert client.get(f"/v1/workspaces/{project}/plan-items", headers=outsider_headers).status_code == 403
     assert client.get(f"/v1/workspaces/{other}/plan-items", headers=alice_headers).status_code == 403
     assert db.execute(select(KanbanTask).where(KanbanTask.plan_item_id == item["id"])).scalars().all() == []
+
+
+def test_plan_read_allows_project_roles_but_writes_remain_admin_only(local_auth, client, db):
+    project, (_, owner_headers), (alice, member_headers), (bob, admin_headers) = _setup(client, db)
+    viewer, viewer_headers = _account(client, "planviewer")
+    _member(db, project, viewer, "viewer")
+    membership = db.get(WorkspaceMembership, (project, bob["id"]))
+    membership.role = "admin"
+    db.commit()
+    item = _plan(client, project, owner_headers)
+    task = _dispatch(client, project, item, owner_headers, [alice["id"]]).json()["data"]["tasks"][0]
+
+    for headers in (owner_headers, admin_headers, member_headers, viewer_headers):
+        response = client.get(f"/v1/workspaces/{project}/plan-items", headers=headers)
+        assert response.status_code == 200, response.text
+        assert response.json()["data"]["items"][0]["tasks"][0]["id"] == task["id"]
+
+    body = {"title": "Should not write", "version": item["version"]}
+    for headers in (member_headers, viewer_headers):
+        assert client.post(f"/v1/workspaces/{project}/plan-items", headers=headers,
+                           json={"title": "Should not write"}).status_code == 403
+        assert client.patch(f"/v1/workspaces/{project}/plan-items/{item['id']}", headers=headers,
+                            json=body).status_code == 403
+        assert client.delete(f"/v1/workspaces/{project}/plan-items/{item['id']}", headers=headers).status_code == 403
+        assert _dispatch(client, project, item, headers, [viewer["id"]]).status_code == 403
+        assert client.post(f"/v1/workspaces/{project}/plan-items/{item['id']}/publish", headers=headers,
+                           json={"version": item["version"], "taskIds": [task["id"]]}).status_code == 403
+
+
+def test_plan_read_rejects_machine_credentials_and_unauthenticated_callers(local_auth, client, db):
+    project, (_, owner_headers), (_, _), (_, _) = _setup(client, db)
+    _plan(client, project, owner_headers)
+    machine_token = db.get(Workspace, project).password_hash
+    url = f"/v1/workspaces/{project}/plan-items"
+    assert machine_token
+    assert client.get(url).status_code == 403
+    assert client.get(url, params={"token": machine_token}).status_code == 403
+    assert client.get(url, headers={"X-Workspace-Token": machine_token}).status_code == 403
+    assert client.get(url, headers={"Authorization": f"Bearer {machine_token}"}).status_code == 403
 
 
 def test_legacy_tasks_are_only_in_administrator_queue(local_auth, client, db):

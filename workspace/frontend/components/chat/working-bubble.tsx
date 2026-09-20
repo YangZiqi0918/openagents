@@ -12,6 +12,8 @@ interface WorkingBubbleProps {
   agents?: WorkspaceAgent[];
   /** The agent's latest step ("Reading src/track.ts…", "Bash › git diff"). */
   status?: string;
+  /** Project waiting has timed out; show a static status instead of typing dots. */
+  stale?: boolean;
   className?: string;
 }
 
@@ -23,7 +25,7 @@ interface WorkingBubbleProps {
  * pure CSS (`.typing-dot`, `.working-bubble` in globals.css) and respect
  * prefers-reduced-motion.
  */
-export function WorkingBubble({ agentName, agents = [], status, className }: WorkingBubbleProps) {
+export function WorkingBubble({ agentName, agents = [], status, stale = false, className }: WorkingBubbleProps) {
   const t = useT();
   const agent = agentName ? agents.find((a) => a.agentName === agentName) : undefined;
   const label = agent ? agentLabel(agent) : agentName;
@@ -32,7 +34,9 @@ export function WorkingBubble({ agentName, agents = [], status, className }: Wor
     <div
       className={cn('working-bubble flex items-start gap-3 py-1.5', className)}
       role="status"
-      aria-label={label ? t('chat.agentWorkingNamed', { name: label }) : t('chat.agentWorking')}
+      aria-label={stale && status
+        ? (label ? `${label}: ${status}` : status)
+        : (label ? t('chat.agentWorkingNamed', { name: label }) : t('chat.agentWorking'))}
     >
       {agentName ? (
         <AgentAvatar name={agentName} size={28} className="mt-0.5" />
@@ -46,15 +50,17 @@ export function WorkingBubble({ agentName, agents = [], status, className }: Wor
           <span className="mb-1 truncate text-sm font-semibold text-foreground">{label}</span>
         )}
         <div className="inline-flex min-w-0 max-w-full items-center gap-2 rounded-xl rounded-tl-sm border border-border bg-muted/60 px-3 py-2 text-sm text-muted-foreground">
-          <span className="inline-flex shrink-0 items-center gap-1" aria-hidden>
-            {[0, 1, 2].map((i) => (
-              <span
-                key={i}
-                className="typing-dot size-1.5 rounded-full bg-current"
-                style={{ animationDelay: `${i * 0.16}s` }}
-              />
-            ))}
-          </span>
+          {!stale && (
+            <span className="inline-flex shrink-0 items-center gap-1" aria-hidden>
+              {[0, 1, 2].map((i) => (
+                <span
+                  key={i}
+                  className="typing-dot size-1.5 rounded-full bg-current"
+                  style={{ animationDelay: `${i * 0.16}s` }}
+                />
+              ))}
+            </span>
+          )}
           {status && <span className="min-w-0 truncate">{status}</span>}
         </div>
       </div>

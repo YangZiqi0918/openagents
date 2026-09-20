@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { WorkspaceApiError } from '@/lib/api';
+import type { WorkspaceApi } from '@/lib/api';
 import { IS_LOCAL_AUTH } from '@/lib/api-config';
 import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { eventToMessage } from '@/lib/types';
@@ -13,6 +14,80 @@ interface UsePollingOptions {
   enabled?: boolean;
   /** Pre-loaded messages to display immediately (avoids loading state). */
   initialMessages?: WorkspaceMessage[];
+  /** Include persisted thinking in channel history without changing personal or DM history. */
+  includeThinkingHistory?: boolean;
+}
+
+const PROJECT_HISTORY_CHAT_LIMIT = 50;
+const PROJECT_HISTORY_EVENT_LIMIT = 500;
+
+async function loadThinkingHistoryPage(
+  api: WorkspaceApi,
+  channel: string,
+  before?: string,
+  isCurrent: () => boolean = () => true,
+): Promise<{ events: ONMEvent[]; hasMore: boolean }> {
+  const events: ONMEvent[] = [];
+  let chatCount = 0;
+  let cursor = before;
+  let hasMore = false;
+
+  do {
+    const limit = Math.min(100, PROJECT_HISTORY_EVENT_LIMIT - events.length);
+    const result = await api.pollEvents({
+      channel,
+      type: 'workspace.message',
+      before: cursor,
+      sort: 'desc',
+      limit,
+      excludeMessageTypes: ['status', 'todos'],
+    });
+    if (!isCurrent()) return { events, hasMore: false };
+    if (result.events.length === 0) return { events, hasMore: false };
+
+    // The API window may straddle the 50th chat. Keep only events through
+    // that message; the rest can be fetched next time using its event cursor.
+    let end = result.events.length;
+    for (let i = 0; i < result.events.length; i++) {
+      if (!result.events[i].payload?.message_type || result.events[i].payload?.message_type === 'chat') {
+        chatCount++;
+        if (chatCount === PROJECT_HISTORY_CHAT_LIMIT) {
+          end = i + 1;
+          break;
+        }
+      }
+    }
+    const retained = result.events.slice(0, end);
+    if (retained[retained.length - 1].id === cursor) return { events, hasMore: false };
+    events.push(...retained);
+    cursor = retained[retained.length - 1].id;
+    hasMore = end < result.events.length || result.has_more;
+  } while (hasMore && chatCount < PROJECT_HISTORY_CHAT_LIMIT && events.length < PROJECT_HISTORY_EVENT_LIMIT);
+
+  return { events, hasMore };
+}
+
+async function loadHistoryPage(
+  api: WorkspaceApi,
+  sessionId: string,
+  dmPair: [string, string] | null,
+  includeThinkingHistory: boolean,
+  before?: string,
+  isCurrent?: () => boolean,
+): Promise<{ events: ONMEvent[]; hasMore: boolean }> {
+  if (includeThinkingHistory && !dmPair) {
+    return loadThinkingHistoryPage(api, sessionId, before, isCurrent);
+  }
+
+  const result = dmPair
+    ? await api.pollConversation(dmPair[0], dmPair[1], {
+        before,
+        sort: 'desc',
+        limit: before ? 30 : 50,
+        excludeMessageTypes: ['thinking', 'status', 'todos'],
+      })
+    : await api.loadMessageHistory(sessionId, { before, limit: before ? 30 : 50 });
+  return { events: result.events, hasMore: result.has_more };
 }
 
 /** Parse a DM session ID like "dm:agentA,agentB" into agent addresses. */
@@ -68,7 +143,7 @@ function eventsToScopedMessages(
   return scopeMessagesToSession(events.map(eventToMessage), sessionId, dmPair);
 }
 
-export function useMessagePolling({ sessionId, enabled = true, initialMessages }: UsePollingOptions) {
+export function useMessagePolling({ sessionId, enabled = true, initialMessages, includeThinkingHistory = false }: UsePollingOptions) {
   const workspaceApi = useWorkspaceApi();
   const currentApiRef = useRef(workspaceApi);
   currentApiRef.current = workspaceApi;
@@ -95,8 +170,10 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
   const oldestIdRef = useRef<string | null>(null);
   const lastActivityRef = useRef<number>(Date.now());
   const historyLoadedRef = useRef(false);
+  const olderRequestRef = useRef<object | null>(null);
   // Track current session to discard stale responses
   const currentSessionRef = useRef<string | null>(sessionId);
+  const scopeVersionRef = useRef(0);
   // True while the newest message is an agent step (status/thinking) — i.e. an
   // agent is mid-work. Drives fast polling in the fallback path so the final
   // answer lands quickly even when the user is idle (common while waiting).
@@ -104,8 +181,11 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
 
   // Reset when session changes
   useEffect(() => {
+    scopeVersionRef.current += 1;
     setError(null);
     setDenied(false);
+    setLoadingOlder(false);
+    olderRequestRef.current = null;
     currentSessionRef.current = sessionId;
     const nextDMPair = parseDMSession(sessionId);
     const scopedInitialMessages = sessionId && initialMessages
@@ -118,7 +198,9 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
       newestMsgRef.current = scopedInitialMessages[scopedInitialMessages.length - 1];
       newestIdRef.current = newestMsgRef.current.messageId;
       oldestIdRef.current = scopedInitialMessages[0].messageId;
-      historyLoadedRef.current = true;
+      // A project cache may contain only chat messages. Hydrate the persisted
+      // thinking history before treating the cache as a complete history page.
+      historyLoadedRef.current = !includeThinkingHistory || !!nextDMPair;
       setHasOlder(true); // assume there may be older until proven otherwise
       setLoading(false);
     } else {
@@ -130,7 +212,7 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
       setHasOlder(false);
       setLoading(false);
     }
-  }, [sessionId, workspaceApi]); // only seed when the request scope changes
+  }, [sessionId, workspaceApi, includeThinkingHistory]); // only seed when the request scope changes
 
   const handleError = useCallback((failure: unknown) => {
     if (currentApiRef.current !== workspaceApi || sessionId !== currentSessionRef.current) return;
@@ -175,26 +257,25 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
   const loadHistory = useCallback(async (): Promise<boolean> => {
     if (!sessionId) return false;
 
+    const scopeVersion = scopeVersionRef.current;
+    const isCurrent = () => scopeVersion === scopeVersionRef.current &&
+      sessionId === currentSessionRef.current && workspaceApi === currentApiRef.current;
     setLoading(true);
     try {
-      const result = dmPair
-        ? await workspaceApi.pollConversation(dmPair[0], dmPair[1], {
-            sort: 'desc',
-            limit: 50,
-            excludeMessageTypes: ['thinking', 'status', 'todos'],
-          })
-        : await workspaceApi.loadMessageHistory(sessionId, { limit: 50 });
+      const result = await loadHistoryPage(workspaceApi, sessionId, dmPair, includeThinkingHistory, undefined, isCurrent);
 
       // Discard if session changed
-      if (sessionId !== currentSessionRef.current || workspaceApi !== currentApiRef.current) return false;
+      if (!isCurrent()) return false;
       setError(null);
+
+      const rawEvents = result.events;
 
       // Events come newest-first from sort=desc, reverse for chronological display.
       // Guard on the SCOPED result, not result.events: a page can be non-empty
       // yet scope down to zero messages, in which case historicMessages[-1] /
       // [0] would be undefined and crash on .messageId.
-      const historicMessages = result.events.length > 0
-        ? eventsToScopedMessages(result.events, sessionId, dmPair).reverse()
+      const historicMessages = rawEvents.length > 0
+        ? eventsToScopedMessages(rawEvents, sessionId, dmPair).reverse()
         : [];
       if (historicMessages.length > 0) {
         // Merge rather than replace — the SSE stream opens alongside the
@@ -204,26 +285,28 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
         setMessages((prev) => mergeMessages(prev, historicMessages));
         bumpNewest(historicMessages[historicMessages.length - 1]);
         // History is the oldest data we have — SSE only delivers new events.
-        oldestIdRef.current = historicMessages[0].messageId;
-        setHasOlder(result.has_more);
+        oldestIdRef.current = rawEvents[rawEvents.length - 1].id;
+        setHasOlder(result.hasMore);
         setGeneration((g) => g + 1);
       } else {
         // No chat history — but keep whatever the SSE stream has already
         // delivered, and leave the cursor wherever bumpNewest put it.
-        oldestIdRef.current = null;
-        setHasOlder(false);
+        oldestIdRef.current = rawEvents.length > 0 ? rawEvents[rawEvents.length - 1].id : null;
+        setHasOlder(result.hasMore && oldestIdRef.current !== null);
       }
 
       historyLoadedRef.current = true;
       return true;
     } catch (failure) {
-      handleError(failure);
-      historyLoadedRef.current = true;
+      if (isCurrent()) {
+        handleError(failure);
+        historyLoadedRef.current = true;
+      }
       return false;
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
-  }, [sessionId, dmPair, bumpNewest, workspaceApi, handleError]);
+  }, [sessionId, dmPair, includeThinkingHistory, bumpNewest, workspaceApi, handleError]);
 
   // Forward poll: fetch new messages since the newest known
   const poll = useCallback(async () => {
@@ -274,40 +357,41 @@ export function useMessagePolling({ sessionId, enabled = true, initialMessages }
 
   // Load older messages (infinite scroll upward)
   const loadOlder = useCallback(async () => {
-    if (!sessionId || !hasOlder || loadingOlder) return;
+    if (!sessionId || !hasOlder || olderRequestRef.current) return;
 
+    const request = {};
+    olderRequestRef.current = request;
+    const scopeVersion = scopeVersionRef.current;
+    const isCurrent = () => scopeVersion === scopeVersionRef.current &&
+      sessionId === currentSessionRef.current && workspaceApi === currentApiRef.current;
     setLoadingOlder(true);
     try {
-      const result = dmPair
-        ? await workspaceApi.pollConversation(dmPair[0], dmPair[1], {
-            before: oldestIdRef.current ?? undefined,
-            sort: 'desc',
-            limit: 30,
-            excludeMessageTypes: ['thinking', 'status', 'todos'],
-          })
-        : await workspaceApi.loadMessageHistory(sessionId, {
-            before: oldestIdRef.current ?? undefined,
-            limit: 30,
-          });
+      const result = await loadHistoryPage(
+        workspaceApi, sessionId, dmPair, includeThinkingHistory, oldestIdRef.current ?? undefined, isCurrent,
+      );
 
-      if (sessionId !== currentSessionRef.current || workspaceApi !== currentApiRef.current) return;
+      if (!isCurrent()) return;
 
-      if (result.events.length > 0) {
-        const olderMessages = eventsToScopedMessages(result.events, sessionId, dmPair).reverse();
-        oldestIdRef.current = olderMessages.length > 0 ? olderMessages[0].messageId : oldestIdRef.current;
-        setHasOlder(olderMessages.length > 0 && result.has_more);
+      const rawEvents = result.events;
+      if (rawEvents.length > 0) {
+        const olderMessages = eventsToScopedMessages(rawEvents, sessionId, dmPair).reverse();
+        oldestIdRef.current = rawEvents[rawEvents.length - 1].id;
+        setHasOlder(result.hasMore);
 
         setMessages((prev) => mergeMessages(prev, olderMessages));
       } else {
         setHasOlder(false);
       }
     } catch (failure) {
-      handleError(failure);
+      if (isCurrent()) handleError(failure);
       // Best-effort
     } finally {
-      setLoadingOlder(false);
+      if (olderRequestRef.current === request) {
+        olderRequestRef.current = null;
+        setLoadingOlder(false);
+      }
     }
-  }, [sessionId, hasOlder, loadingOlder, dmPair, workspaceApi, handleError]);
+  }, [sessionId, hasOlder, dmPair, includeThinkingHistory, workspaceApi, handleError]);
 
   // Initial load + SSE with polling fallback
   useEffect(() => {

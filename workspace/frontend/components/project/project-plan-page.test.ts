@@ -13,6 +13,8 @@ const mock = vi.hoisted(() => ({
   dispatchPlanItem: vi.fn(),
   updatePlanItem: vi.fn(),
   publishPlanItem: vi.fn(),
+  downloadFile: vi.fn(),
+  role: 'admin',
   workspaceId: 'workspace-1',
   agents: [{ agentName: 'codex', displayName: 'Codex' }],
 }));
@@ -21,11 +23,13 @@ vi.mock('@/lib/workspace-context', () => ({
   useWorkspace: () => ({
     workspace: { workspaceId: mock.workspaceId },
     agents: mock.agents,
+    me: { role: mock.role },
   }),
 }));
 vi.mock('@/lib/api', () => ({ workspaceApi: {
   getTeam: mock.getTeam, listPlanItems: mock.listPlanItems, createPlanItem: mock.createPlanItem,
   dispatchPlanItem: mock.dispatchPlanItem, updatePlanItem: mock.updatePlanItem, publishPlanItem: mock.publishPlanItem,
+  downloadFile: mock.downloadFile,
 } }));
 
 const STORAGE_KEY = 'oa:projects:workspace:workspace-1:v1:plan:project-1:v1';
@@ -150,12 +154,14 @@ describe('Project plan table', () => {
   beforeEach(() => {
     localStorage.clear();
     mock.workspaceId = 'workspace-1';
+    mock.role = 'admin';
     mock.getTeam.mockReset().mockResolvedValue([{ email: 'lin@example.com', userId: 'user-lin', displayName: '小林', role: 'member' }]);
     mock.listPlanItems.mockReset().mockResolvedValue([]);
     mock.createPlanItem.mockReset();
     mock.dispatchPlanItem.mockReset().mockResolvedValue({ tasks: [] });
     mock.updatePlanItem.mockReset();
     mock.publishPlanItem.mockReset();
+    mock.downloadFile.mockReset().mockResolvedValue(undefined);
     vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
     container = document.createElement('div');
     document.body.appendChild(container);
@@ -307,6 +313,38 @@ describe('Project plan table', () => {
     await render(STORAGE_KEY, true);
     expect(button('派发').disabled).toBe(true);
     expect(mock.dispatchPlanItem).not.toHaveBeenCalled();
+  });
+
+  it.each(['member', 'viewer'])('shows complete read-only plan details to %s', async (memberRole) => {
+    mock.role = memberRole;
+    mock.listPlanItems.mockResolvedValueOnce([{
+      id: 'plan-1', title: '只读计划', description: '第一阶段部署\n第二阶段验收', status: 'doing',
+      assignees: [{ id: 'human:user-lin', name: '小林', kind: 'human' }], priority: 'urgent',
+      tags: ['发布'], startDate: '2026-09-20', dueDate: '2026-09-25',
+      attachments: [{ id: 'file-1', filename: '需求说明.pdf', contentType: 'application/pdf', size: 12 }],
+      acceptanceCriteria: '完成回归测试', version: 1,
+      tasks: [{ id: 'task-1', dispatchedUserId: 'user-lin', responsibleUserId: 'user-lin',
+        responsibleName: '小林', status: 'need_input', sourceVersion: 1, submittedSummary: '已提交' }],
+    }]);
+
+    await render(STORAGE_KEY, true);
+    expect(container.querySelectorAll('th')).toHaveLength(2);
+    expect(container.textContent).toContain('待审核');
+    for (const label of ['新建计划项', '导入本地计划', '派发', '发布变更', '交接']) {
+      expect(container.textContent).not.toContain(label);
+    }
+    await click(button('只读计划'));
+    const detail = document.querySelector('[role="dialog"]')!;
+    expect(detail.textContent).toContain('第一阶段部署\n第二阶段验收');
+    for (const text of ['紧急', '2026-09-20', '2026-09-25', '发布', '完成回归测试', '小林', '待审核', '需求说明.pdf']) {
+      expect(detail.textContent).toContain(text);
+    }
+    expect(detail.querySelector('input, textarea')).toBeNull();
+    await click(button('需求说明.pdf'));
+    expect(mock.downloadFile).toHaveBeenCalledWith('file-1', '需求说明.pdf');
+    expect(mock.createPlanItem).not.toHaveBeenCalled();
+    expect(mock.dispatchPlanItem).not.toHaveBeenCalled();
+    expect(mock.updatePlanItem).not.toHaveBeenCalled();
   });
 
   it('reports failed server loading with a retry', async () => {
