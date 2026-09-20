@@ -121,8 +121,9 @@ function TaskCard({
   const isBacklog = task.status === 'backlog' || task.status === 'todo';
   const isRunning = task.status === 'in_progress';
   const needsInput = task.status === 'need_input';
+  const matchedProjectCard = dispatched && (isRunning || needsInput);
   const aiNeedsInput = dispatched && task.executionStatus === 'need_input';
-  const executionRunning = dispatched && (task.executionStatus === 'running' || aiNeedsInput);
+  const executionRunning = dispatched && (task.executionStatus === 'running' || task.executionStatus === 'in_progress' || aiNeedsInput);
   const openable = !!task.channelName;
   const runnable = !!task.assignee || !!task.workflowId;
   const workflowName = task.workflowId
@@ -147,6 +148,7 @@ function TaskCard({
       title={openable ? t('tasks.openChat') : isBacklog ? t('tasks.editTaskTitle') : undefined}
       className={cn(
         'group relative rounded-lg border bg-card p-3 shadow-sm transition-colors',
+        matchedProjectCard && 'flex min-h-[180px] flex-col',
         openable || isBacklog ? 'cursor-pointer hover:border-foreground/30' : 'hover:border-foreground/20',
         needsInput ? 'border-rose-400/70' : isRunning ? 'border-amber-400/70' : 'border-border',
       )}
@@ -211,7 +213,7 @@ function TaskCard({
         </p>
       )}
       {dispatched && task.acceptanceCriteria && <p className="mt-1 line-clamp-2 break-words text-xs text-muted-foreground" title={task.acceptanceCriteria}>{zh ? '验收标准：' : 'Acceptance: '}{task.acceptanceCriteria}</p>}
-      {dispatched && task.submittedSummary && <p className="mt-2 line-clamp-2 break-words rounded border border-border bg-muted/40 px-2 py-1.5 text-xs whitespace-pre-wrap" title={task.submittedSummary}>{zh ? '提交结果：' : 'Submission: '}{task.submittedSummary}</p>}
+      {dispatched && !needsInput && task.submittedSummary && <p className="mt-2 line-clamp-2 break-words rounded border border-border bg-muted/40 px-2 py-1.5 text-xs whitespace-pre-wrap" title={task.submittedSummary}>{zh ? '提交结果：' : 'Submission: '}{task.submittedSummary}</p>}
 
       {/* Workflow progress: “Step 2/3 · Review” + step dots. */}
       {task.workflowId && task.run && task.run.stepCount > 0 && (isRunning || needsInput || task.run.status === 'paused') && (
@@ -254,7 +256,7 @@ function TaskCard({
       )}
 
       {/* Relative timestamp — added / updated / done — plus attached context. */}
-      <p className="mt-1.5 flex items-center gap-1.5 text-[10px] text-muted-foreground/60">
+      <p className={cn('flex items-center gap-1.5 text-[10px] text-muted-foreground/60', matchedProjectCard ? 'mt-auto pt-1.5' : 'mt-1.5')}>
         <span>
           {task.status === 'done'
             ? t('tasks.metaDone', { time: timeAgo(task.updatedAt || task.createdAt) })
@@ -677,9 +679,11 @@ export function TasksView() {
 
       {liveChatTask?.channelName && (
         <TaskChatPopup
+          key={`${workspace?.workspaceId}:${me?.userId}:${liveChatTask.id}`}
           open={!!liveChatTask}
           onOpenChange={(o) => !o && setChatTask(null)}
           sessionId={liveChatTask.channelName}
+          taskId={liveChatTask.id}
           taskTitle={liveChatTask.title}
           description={liveChatTask.description}
           acceptanceCriteria={liveChatTask.acceptanceCriteria}

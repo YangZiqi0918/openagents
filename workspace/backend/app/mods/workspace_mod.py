@@ -1188,6 +1188,26 @@ async def _route_with_llm(
 
 TASK_CHANNEL_PREFIX = "task:"
 
+
+def _current_task_step_agent(db, workspace, task) -> Optional[str]:
+    """Agent allowed to act in the current task run, if any."""
+    if not task.workflow_id:
+        return task.assignee
+    from app.models import WorkflowRun
+
+    run = db.execute(select(WorkflowRun).where(
+        WorkflowRun.workspace_id == workspace.id,
+        WorkflowRun.channel_name == task.channel_name,
+        WorkflowRun.status == "running",
+    )).scalar_one_or_none()
+    if run is None:
+        return None
+    step = next((item for item in (run.snapshot or {}).get("steps", [])
+                 if item.get("id") == run.current_step), None)
+    assignee = (step or {}).get("assignee") or {}
+    return assignee.get("agent") if assignee.get("kind") == "agent" else None
+
+
 _TASK_CLASSIFIER_PROMPT = """\
 You are tracking a long-running task on a Kanban board. An agent is working on \
 the task in a thread. From the task and the agent's LATEST message, decide the \
@@ -1374,6 +1394,8 @@ def _handle_task_thread_progress(event: Event, channel, content: str, db, worksp
             return
         if (event.metadata or {}).get("task_comment"):
             return
+        if (event.metadata or {}).get("status_kind") == "failed":
+            return
         event_run_id = (event.metadata or {}).get("task_run_id")
         if event_run_id and event_run_id != task.active_run_id:
             return
@@ -1381,8 +1403,9 @@ def _handle_task_thread_progress(event: Event, channel, content: str, db, worksp
             return  # the workflow engine owns execution progress
         if source.startswith("openagents:") and source[len("openagents:"):] == task.assignee:
             new_status = _classify_task_progress(task, content, db, workspace)
-            if new_status != task.execution_status:
-                task.execution_status = new_status
+            execution_status = "running" if new_status == "in_progress" else new_status
+            if execution_status != task.execution_status:
+                task.execution_status = execution_status
                 if new_status == "done":
                     task.active_run_id = None
                 if new_status in ("need_input", "done"):
@@ -1513,7 +1536,7 @@ async def _handle_message_posted(event: Event, ctx: PipelineContext) -> Optional
       - "stop" → no targeting, conversation rests until human speaks
     - Fallback (single-agent threads or router disabled): no routing needed.
     """
-    from app.models import Channel, User, WorkspaceMember, WorkspaceMembership
+    from app.models import Channel, KanbanTask, User, WorkspaceMember, WorkspaceMembership
     from app.config import config
 
     db = ctx.extra["db"]
@@ -1521,6 +1544,7 @@ async def _handle_message_posted(event: Event, ctx: PipelineContext) -> Optional
     payload = event.payload or {}
     content = payload.get("content", "")
     message_type = payload.get("message_type", "chat")
+    source = event.source or ""
 
     # Reject posts from stale agent sessions. If the sender is an agent
     # and its claimed session_id does not match the current one in
@@ -1539,6 +1563,26 @@ async def _handle_message_posted(event: Event, ctx: PipelineContext) -> Optional
             # Return the event with the error flag but no content changes;
             # the router checks session_error and returns an error response.
             return event
+
+    # Check stamped run IDs before the intermediate-output fast path, too:
+    # stale cloud thinking/status must not become visible after stop/restart.
+    project_task = None
+    if (config.AUTH_MODE == "local_password" and workspace.kind == "project"
+            and (event.target or "").startswith("channel/task:")):
+        project_task = db.execute(select(KanbanTask).where(
+            KanbanTask.workspace_id == workspace.id,
+            KanbanTask.channel_name == event.target[len("channel/"):],
+        ).with_for_update()).scalar_one_or_none()
+        if project_task and project_task.responsible_user_id and source.startswith("openagents:"):
+            run_id = (event.metadata or {}).get("task_run_id")
+            if run_id:
+                if (project_task.status != "in_progress" or not project_task.active_run_id
+                        or project_task.active_run_id != run_id
+                        or project_task.execution_status not in {"running", "in_progress", "need_input"}
+                        or project_task.transfer_user_id):
+                    raise EventRejected("workspace_mod", "project_task_run_stale")
+                if source[len("openagents:"):] != _current_task_step_agent(db, workspace, project_task):
+                    raise EventRejected("workspace_mod", "project_task_agent_stale")
 
     # "thinking", "status", and "todos" messages are intermediate agent output
     # — they should NOT trigger other agents.
@@ -1570,38 +1614,95 @@ async def _handle_message_posted(event: Event, ctx: PipelineContext) -> Optional
 
     if channel and channel.name.startswith(TASK_CHANNEL_PREFIX):
         from app.models import KanbanTask, User
-        task = db.execute(select(KanbanTask).where(
+        task = project_task if project_task is not None else db.execute(select(KanbanTask).where(
             KanbanTask.workspace_id == workspace.id,
             KanbanTask.channel_name == channel.name,
         )).scalar_one_or_none()
         if task and task.responsible_user_id:
-            if event.source.startswith("openagents:") and (
+            local_project_task = config.AUTH_MODE == "local_password" and workspace.kind == "project"
+            if source.startswith("openagents:") and (
                 task.status != "in_progress" or not task.active_run_id
                 or task.execution_status == "paused"
             ):
                 event.metadata["target_agents"] = ["__no_response__"]
                 return event
-            if event.source.startswith("human:"):
-                sender_email = event.source[len("human:"):].lower()
+            if source.startswith("human:"):
+                sender_email = source[len("human:"):].lower()
                 sender_id = db.execute(select(User.id).where(User.email == sender_email)).scalar_one_or_none()
-                if sender_id != task.responsible_user_id:
+                task_kickoff = False
+                if local_project_task:
+                    from app.access import resolve_current_user, resolve_user_role
+                    bearer = ctx.extra.get("bearer_token")
+                    authorization = f"Bearer {bearer}" if bearer else None
+                    actor = resolve_current_user(db, authorization)
+                    if actor is None or actor.email.lower() != sender_email:
+                        raise EventRejected("workspace_mod", "project_task_human_identity_required")
+                    task_kickoff = (event.metadata or {}).get("task_kickoff") is True
+                    if task_kickoff and (
+                        task.workflow_id or event.metadata.get("task_run_id") != task.active_run_id
+                        or not task.active_run_id or task.status != "in_progress"
+                        or task.execution_status not in {"running", "in_progress"}
+                        or (sender_id != task.responsible_user_id and
+                            resolve_user_role(db, workspace, authorization) not in {"admin", "owner"})
+                    ):
+                        raise EventRejected("workspace_mod", "project_task_kickoff_invalid")
+                if sender_id != task.responsible_user_id and not task_kickoff:
                     # Server-owned marker: a project member may comment on another
                     # member's task, but cannot wake its agent or advance its run.
                     event.metadata["task_comment"] = True
                     from app.services.notify import notify
                     notify(
-                        db, str(workspace.id), source=event.source,
+                        db, str(workspace.id), source=source,
                         title="Task comment", message=f"New comment on “{task.title}”.",
                         channel_name=task.channel_name, reason="chat",
                         recipient_user_id=task.responsible_user_id,
                     )
                 else:
                     event.metadata.pop("task_comment", None)
+                if local_project_task and (sender_id == task.responsible_user_id or task_kickoff):
+                    # A task is not a generic project chat: no client target,
+                    # channel master, or leftover participant can redirect it.
+                    event.metadata.pop("target_agents", None)
+                    event.metadata.pop("task_run_id", None)
+                    named_agents, _ = _project_mentions(content, known_agents)
+                    running = (
+                        task.status == "in_progress" and task.active_run_id
+                        and task.execution_status in {"running", "in_progress", "need_input"}
+                        and not task.transfer_user_id
+                    )
+                    if not running and named_agents:
+                        raise EventRejected("workspace_mod", "project_mention_task_not_running")
+                    allowed_agent = _current_task_step_agent(db, workspace, task) if running else None
+                    if any(name != allowed_agent for name in named_agents):
+                        raise EventRejected("workspace_mod", "project_mention_task_agent_only")
+                    if named_agents:
+                        member = next((m for m in all_members if m.agent_name == allowed_agent), None)
+                        joined = {p.agent_name for p in (channel.participants or [])}
+                        if not member or allowed_agent not in joined:
+                            raise EventRejected("workspace_mod", "project_mention_task_agent_not_joined")
+                        if not task_kickoff and not _member_is_online(member):
+                            raise EventRejected("workspace_mod", "project_mention_task_agent_offline")
+                    if running:
+                        event.metadata["task_run_id"] = task.active_run_id
+                    event.metadata["target_agents"] = [allowed_agent] if allowed_agent else ["__no_response__"]
+                    _upsert_human_collaborator(workspace, payload, db, event.metadata)
+                    _join_channel_as_human(channel, payload, db, event.metadata)
+                    if running:
+                        _handle_task_thread_progress(event, channel, content, db, workspace)
+                    return event
                 if event.metadata.get("task_comment") or task.status != "in_progress" or not task.active_run_id:
                     event.metadata["target_agents"] = ["__no_response__"]
                     _upsert_human_collaborator(workspace, event.payload or {}, db, event.metadata)
                     _join_channel_as_human(channel, event.payload or {}, db, event.metadata)
                     return event
+            elif local_project_task and source.startswith("openagents:") and not task.workflow_id:
+                # Only this task's assigned agent may complete it. No generic
+                # multi-agent fallback/delegation from this dedicated channel.
+                if source[len("openagents:"):] != task.assignee:
+                    raise EventRejected("workspace_mod", "project_task_agent_stale")
+                event.metadata["target_agents"] = ["__no_response__"]
+                _handle_task_thread_progress(event, channel, content, db, workspace)
+                return event
 
     project_human_message = (
         config.AUTH_MODE == "local_password" and workspace.kind == "project"

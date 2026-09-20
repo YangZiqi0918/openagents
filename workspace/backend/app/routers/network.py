@@ -143,7 +143,8 @@ def _check_lifecycle_auth(
     return None
 
 
-async def _emit_event(event: Event, workspace, db: Session, token: str = None, *, trusted_service: bool = False):
+async def _emit_event(event: Event, workspace, db: Session, token: str = None, *,
+                      trusted_service: bool = False, commit: bool = True):
     """Push an event through the mod pipeline. Returns None on rejection."""
     from app.access import request_authorization, resolve_current_user
     authorization = None if trusted_service else request_authorization.get()
@@ -165,13 +166,17 @@ async def _emit_event(event: Event, workspace, db: Session, token: str = None, *
     )
     try:
         result = await pipeline.process(event, context)
-    except EventRejected:
+    except EventRejected as exc:
+        if (event.metadata or {}).get("task_kickoff"):
+            logger.warning("Task kickoff for %s was rejected: %s", event.target, exc.reason)
         return None
-    db.commit()
+    if commit:
+        db.commit()
     return result
 
 
-def _emit_event_blocking(event: Event, workspace, db: Session, token: str = None, *, trusted_service: bool = False):
+def _emit_event_blocking(event: Event, workspace, db: Session, token: str = None, *,
+                         trusted_service: bool = False, commit: bool = True):
     """Sync variant of _emit_event for `def` (threadpool) handlers.
 
     The pipeline is async-shaped but everything inside it is synchronous
@@ -183,7 +188,9 @@ def _emit_event_blocking(event: Event, workspace, db: Session, token: str = None
     waits in a thread. Safe because no mod touches the outer loop (no
     create_task / get_running_loop / loop-bound clients).
     """
-    return asyncio.run(_emit_event(event, workspace, db, token=token, trusted_service=trusted_service))
+    return asyncio.run(_emit_event(
+        event, workspace, db, token=token, trusted_service=trusted_service, commit=commit,
+    ))
 
 
 # ---------------------------------------------------------------------------

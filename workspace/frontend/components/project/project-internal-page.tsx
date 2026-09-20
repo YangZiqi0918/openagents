@@ -7,6 +7,7 @@ import { ProjectWorkspaceContent, type ProjectWorkspaceTab } from './project-wor
 import { ProjectPlanPage } from './project-plan-page';
 import { ProjectActivityPage } from './project-activity-page';
 import { ProjectMembersPage } from './project-members-page';
+import { ProjectTaskReviewPage } from './project-task-review-page';
 import { ConnectAgentView } from '@/components/connect/connect-agent-view';
 import { useOptionalWorkspace } from '@/lib/workspace-context';
 import { Button } from '@/components/ui/button';
@@ -41,11 +42,12 @@ interface ProjectInternalPageProps {
   planStorageKey?: string;
   initialSessionId?: string;
   projectScoped?: boolean;
-  initialTab?: 'plan';
+  initialTab?: 'plan' | 'review';
   initialPlanItemId?: string;
+  initialReviewTaskId?: string;
 }
 
-export function ProjectInternalPage({ projectId, projectName, onBack, workspaceModulesAvailable = true, planStorageKey, initialSessionId, projectScoped = false, initialTab, initialPlanItemId }: ProjectInternalPageProps) {
+export function ProjectInternalPage({ projectId, projectName, onBack, workspaceModulesAvailable = true, planStorageKey, initialSessionId, projectScoped = false, initialTab, initialPlanItemId, initialReviewTaskId }: ProjectInternalPageProps) {
   const t = useT();
   const { locale } = useI18n();
   const [activeTab, setActiveTab] = useState<ProjectTab>(initialTab ?? 'activity');
@@ -58,7 +60,8 @@ export function ProjectInternalPage({ projectId, projectName, onBack, workspaceM
   }, [me, admin, activeTab]);
   useEffect(() => {
     if (initialTab === 'plan') setActiveTab('plan');
-  }, [initialTab, initialPlanItemId]);
+    if (initialTab === 'review' && admin) setActiveTab('review');
+  }, [initialTab, initialPlanItemId, initialReviewTaskId, admin]);
   const labels: Record<ProjectTab, string> = {
     activity: locale === 'zh-CN' ? '动态' : 'Activity',
     plan: locale === 'zh-CN' ? '计划' : 'Plan',
@@ -102,6 +105,7 @@ export function ProjectInternalPage({ projectId, projectName, onBack, workspaceM
           <ProjectWorkspaceContent key={activeTab} tab={activeTab} />
         )}
         {activeTab === 'members' && workspaceModulesAvailable && projectScoped && <ProjectMembersPage />}
+        {activeTab === 'review' && workspaceModulesAvailable && admin && <ProjectTaskReviewPage initialTaskId={initialReviewTaskId} />}
         </>}
       </div>
     </div>

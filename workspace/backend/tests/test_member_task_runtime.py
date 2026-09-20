@@ -52,7 +52,26 @@ def test_agent_result_updates_execution_not_review_column(db, workspace, monkeyp
     assert notices[0]["recipient_user_id"] == owner.id
 
 
-def test_other_member_comment_never_targets_the_task_agent(db, workspace):
+def test_in_progress_classification_keeps_execution_running(db, workspace, monkeypatch):
+    task, channel, project, _owner = _task(db, workspace)
+    monkeypatch.setattr(workspace_mod, "_classify_task_progress", lambda *_args: "in_progress")
+
+    workspace_mod._handle_task_thread_progress(
+        _message(channel, "openagents:agent-alpha", "Still working"),
+        channel, "Still working", db, project,
+    )
+    assert task.execution_status == "running"
+    task.execution_status = "in_progress"  # Previously persisted by the classifier.
+    workspace_mod._handle_task_thread_progress(
+        _message(channel, "openagents:agent-alpha", "Another update"),
+        channel, "Another update", db, project,
+    )
+    assert task.execution_status == "running"
+
+
+def test_other_member_comment_never_targets_the_task_agent(db, workspace, monkeypatch):
+    from app.config import config
+    monkeypatch.setattr(config, "AUTH_MODE", "firebase")
     task, channel, project, owner = _task(db, workspace)
     commenter = User(email="other@example.com")
     db.add(commenter)

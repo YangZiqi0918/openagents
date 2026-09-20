@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from app import cache
 from app.access import resolve_current_user, resolve_user_role, verify_workspace_access
 from app.database import SessionLocal, get_db
-from app.models import Channel, ChannelMember, EventRecord, FileRecord, User, Workspace, WorkspaceMember, WorkspaceMembership
+from app.models import Channel, ChannelMember, EventRecord, FileRecord, KanbanTask, User, Workspace, WorkspaceMember, WorkspaceMembership
 from app.config import config
 from app.pipeline_factory import pipeline
 from app.response import ResponseCode, json_response, success_response
@@ -248,6 +248,7 @@ def send_event(
     # caller posting a normal event directly.
     metadata.pop("task_comment", None)
     metadata.pop("task_workflow_step_complete", None)
+    metadata.pop("task_kickoff", None)
     required_role = "member"
     if body.type.startswith("network.agent.") or body.type == "network.ping":
         required_role = "admin"
@@ -256,6 +257,21 @@ def send_event(
     if not verify_workspace_access(workspace, x_workspace_token, authorization, db=db, min_role=required_role):
         code = ResponseCode.FORBIDDEN if resolve_user_role(db, workspace, authorization) is not None else ResponseCode.UNAUTHORIZED
         return json_response(code, "Project membership and sufficient role required")
+    if (
+        config.AUTH_MODE == "local_password"
+        and workspace.kind == "project"
+        and body.type == "workspace.message.posted"
+        and body.target.startswith("channel/task:")
+        and source.startswith("human:")
+        and authorization is None
+    ):
+        member_task = db.execute(select(KanbanTask.id).where(
+            KanbanTask.workspace_id == workspace.id,
+            KanbanTask.channel_name == body.target[len("channel/"):],
+            KanbanTask.responsible_user_id.isnot(None),
+        )).first()
+        if member_task is not None:
+            return json_response(ResponseCode.FORBIDDEN, "Task member messages require account identity")
     if authorization is not None:
         metadata.pop("task_run_id", None)
         actor = resolve_current_user(db, authorization)

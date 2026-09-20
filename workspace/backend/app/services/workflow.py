@@ -72,7 +72,8 @@ def _run_coro(coro_fn, *args) -> None:
     asyncio.run(coro_fn(*args))
 
 
-def _maybe_invoke_cloud_agent(db, workspace, channel_name: str, content: str, agent: str) -> None:
+def _maybe_invoke_cloud_agent(db, workspace, channel_name: str, content: str, agent: str,
+                              task_run_id: Optional[str] = None) -> None:
     """If the step's agent is a cloud agent, invoke it (detached, non-blocking)."""
     cfg = db.execute(
         select(CloudAgentConfig).where(
@@ -88,7 +89,7 @@ def _maybe_invoke_cloud_agent(db, workspace, channel_name: str, content: str, ag
         "target": f"channel/{channel_name}",
         "source": WORKFLOW_SOURCE,
         "payload": {"content": content, "message_type": "chat"},
-        "metadata": {"target_agents": [agent]},
+        "metadata": {"target_agents": [agent], **({"task_run_id": task_run_id} if task_run_id else {})},
     }
     _spawn(_run_coro, invoke_cloud_agents, str(workspace.id), snapshot)
 
@@ -372,10 +373,12 @@ def _deliver_step(db, workspace, run: WorkflowRun, step: dict, prev_output: str,
                 task.status = "in_progress"
             task.assignee = agent
         db.flush()
-        _emit(db, workspace, run.channel_name, body, metadata={"workflow_step": step["id"]},
+        task_run_id = task.active_run_id if task is not None and task.responsible_user_id else None
+        step_metadata = {"workflow_step": step["id"], **({"task_run_id": task_run_id} if task_run_id else {})}
+        _emit(db, workspace, run.channel_name, body, metadata=step_metadata,
               attachments=attachments)
         # Cloud agents (e.g. Yumi) don't poll — invoke them explicitly.
-        _maybe_invoke_cloud_agent(db, workspace, run.channel_name, body, agent)
+        _maybe_invoke_cloud_agent(db, workspace, run.channel_name, body, agent, task_run_id=task_run_id)
     else:
         # Human step — nobody is auto-targeted; notify + park on Need Input.
         human = assignee.get("human")

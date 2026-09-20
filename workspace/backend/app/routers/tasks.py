@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, Path, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, Path, Query
 from pydantic import BaseModel
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.access import resolve_current_user, resolve_user_role, verify_human_project_access
 from app.config import config
-from app.models import Channel, ChannelMember, KanbanTask, User, Workflow, Workspace, WorkspaceMember, WorkspaceMembership
+from app.models import Channel, ChannelMember, CloudAgentConfig, KanbanTask, User, Workflow, Workspace, WorkspaceMember, WorkspaceMembership
 from app.response import ResponseCode, json_response, success_response
 from app.routers.network import (
     _emit_event_blocking,
@@ -700,6 +700,7 @@ def _run_workflow_task(db, workspace, task, human_source: str, token: Optional[s
 @router.post("/tasks/{task_id}/assign")
 def assign_task(
     body: AssignTaskRequest,
+    background_tasks: BackgroundTasks,
     task_id: str = Path(...),
     db: Session = Depends(get_db),
     x_workspace_token: Optional[str] = Header(None),
@@ -736,7 +737,7 @@ def assign_task(
             return json_response(ResponseCode.FORBIDDEN, "Only the task owner or administrator may run it")
         if task.status != "in_progress" or task.transfer_user_id:
             return json_response(ResponseCode.CONFLICT, "Accept the task before running it")
-        if task.execution_status == "running":
+        if task.execution_status in {"running", "in_progress"}:
             return success_response(_serialize_task(task))
         if not task.workflow_id and (
             not task.assignee or (body.agent is not None and _bare_agent(body.agent) != task.assignee)
@@ -746,6 +747,8 @@ def assign_task(
         db, workspace, authorization, "admin"
     ):
         return json_response(ResponseCode.FORBIDDEN, "Only administrators may run unassigned project tasks")
+    if not task.responsible_user_id and task.status == "in_progress" and task.channel_name:
+        return success_response(_serialize_task(task))
 
     # ── Workflow task: start a WorkflowRun instead of a single-agent kickoff ──
     if task.workflow_id:
@@ -770,6 +773,13 @@ def assign_task(
             ResponseCode.FORBIDDEN,
             f"agent '{agent}' is not a member of this workspace",
         )
+    is_cloud_agent = (is_member.agent_type or "").startswith("cloud:")
+    if is_cloud_agent and db.execute(select(CloudAgentConfig.id).where(
+        CloudAgentConfig.workspace_id == workspace.id,
+        CloudAgentConfig.agent_name == agent,
+        CloudAgentConfig.status == "active",
+    )).first() is None:
+        return json_response(ResponseCode.CONFLICT, "Enable the project's cloud agent before running the task")
 
     human_source = f"human:{actor.email}" if task.responsible_user_id else (body.source or "human:user")
     channel_name = task.channel_name or _task_channel_name(task.id)
@@ -794,14 +804,15 @@ def assign_task(
             },
             metadata={},
         )
-        if _emit_event_blocking(create_evt, workspace, db, token=x_workspace_token) is None:
+        if _emit_event_blocking(create_evt, workspace, db, token=x_workspace_token, commit=False) is None:
+            db.rollback()
             return json_response(ResponseCode.FORBIDDEN, "Unable to create the task execution channel")
     else:
         # Reassignment — point the existing channel at the new agent.
         existing_channel.master_agent = agent
-        if task.responsible_user_id and is_member.agent_type == "cloud:openagents":
-            _add_channel_agent(db, existing_channel, agent)
-            db.flush()
+        _add_channel_agent(db, existing_channel, agent)
+        db.flush()
+        db.expire(existing_channel, ["participants"])
 
     # 2. Post the kickoff message (routes to the agent, starts the work).
     if task.responsible_user_id:
@@ -818,12 +829,12 @@ def assign_task(
             "message_type": "chat",
             **({"attachments": atts} if (atts := _task_attachments(db, str(workspace.id), task)) else {}),
         },
-        metadata={"target_agents": [agent], **({"task_run_id": task.active_run_id} if task.responsible_user_id else {})},
+        metadata={"target_agents": [agent], **({"task_run_id": task.active_run_id, "task_kickoff": True}
+                                              if task.responsible_user_id else {})},
     )
-    if _emit_event_blocking(kickoff, workspace, db, token=x_workspace_token) is None:
-        if task.responsible_user_id:
-            task.active_run_id = None
-            task.execution_status = "paused"
+    result = _emit_event_blocking(kickoff, workspace, db, token=x_workspace_token, commit=False)
+    if result is None:
+        db.rollback()
         return json_response(ResponseCode.FORBIDDEN, "Unable to start the task")
 
     # 3. Move the card to In Progress.
@@ -834,6 +845,13 @@ def assign_task(
         task.position = _next_position(db, str(workspace.id), "in_progress")
 
     db.commit()
+    if is_cloud_agent:
+        from app.services.cloud_agent import invoke_cloud_agents
+        background_tasks.add_task(invoke_cloud_agents, str(workspace.id), {
+            "id": result.id, "type": result.type, "source": result.source,
+            "target": result.target, "payload": result.payload,
+            "metadata": result.metadata, "timestamp": result.timestamp,
+        })
     return success_response(_serialize_task(task))
 
 
@@ -974,7 +992,7 @@ def configure_member_task(body: ConfigureTaskRequest, task_id: str,
         return json_response(ResponseCode.FORBIDDEN, "Only the task owner may configure execution")
     if task.transfer_user_id or task.decline_reason or task.status not in {"backlog", "in_progress"}:
         return json_response(ResponseCode.CONFLICT, "Task cannot be configured in its current state")
-    if task.execution_status == "running":
+    if task.execution_status in {"running", "in_progress"}:
         return json_response(ResponseCode.CONFLICT, "Stop execution before changing its configuration")
     if body.mode == "manual":
         task.assignee = None
@@ -1081,7 +1099,7 @@ def submit_member_task(body: SubmitTaskRequest, task_id: str,
     for user_id in _task_admins(db, workspace.id):
         notify(db, workspace.id, source=f"human:{actor.email}", title="Task awaiting review",
                message=task.title, channel_name=task.channel_name,
-               link_url=f"/projects/{workspace.id}?tab=plan&item={task.plan_item_id}",
+               link_url=f"/projects/{workspace.id}?tab=review&task={task.id}",
                recipient_user_id=user_id, reason="approval")
     db.commit()
     _signal_stop(workspace, db, task, run_id, agent)
@@ -1096,7 +1114,7 @@ def stop_member_task(body: TaskActionRequest, task_id: str,
         return error
     if not _owner(task, actor) and resolve_user_role(db, workspace, authorization) not in {"owner", "admin"}:
         return json_response(ResponseCode.FORBIDDEN, "Only the task owner or administrator may stop it")
-    if task.status != "in_progress" or task.execution_status not in {"running", "need_input"}:
+    if task.status != "in_progress" or task.execution_status not in {"running", "in_progress", "need_input"}:
         return json_response(ResponseCode.CONFLICT, "Task is not in progress")
     run_id, agent = _pause_execution(db, workspace, task)
     _log_activity(task, "execution_stopped", actor)
@@ -1194,7 +1212,7 @@ def complete_member_workflow_step(body: CompleteStepRequest, task_id: str,
         return json_response(ResponseCode.FORBIDDEN, "Only the active task owner may complete this step")
     from app.services.workflow import get_active_run, run_advance
     run = get_active_run(db, workspace.id, task.channel_name)
-    if run is None or task.execution_status not in {"running", "need_input"}:
+    if run is None or task.execution_status not in {"running", "in_progress", "need_input"}:
         return json_response(ResponseCode.CONFLICT, "No active workflow step")
     step = next((s for s in (run.snapshot or {}).get("steps", []) if s.get("id") == run.current_step), None)
     if not step or (step.get("assignee") or {}).get("kind") != "human":

@@ -505,6 +505,37 @@ export interface PlanTaskSummary {
   transferUserId?: string | null;
 }
 
+export interface TaskReviewSubmission {
+  summary: string;
+  fileIds: string[];
+  userId: string | null;
+  submittedAt: string | null;
+  reviewDecision: 'approved' | 'returned' | null;
+  reviewComment: string | null;
+  reviewedByUserId: string | null;
+  reviewerName: string | null;
+  reviewedAt: string | null;
+}
+
+export interface TaskReview {
+  taskId: string;
+  planItemId: string | null;
+  planTitle: string | null;
+  title: string;
+  description: string;
+  acceptanceCriteria: string;
+  responsibleUserId: string;
+  responsibleName: string | null;
+  status: TaskStatus;
+  reviewState: 'pending' | 'processed';
+  channelName: string | null;
+  submissionVersion: number;
+  submission: TaskReviewSubmission;
+  files: Array<{ id: string; filename: string; size: number; contentType: string }>;
+  submissionHistory: TaskReviewSubmission[];
+  activityHistory: Array<{ action: string; actor_user_id: string; at: string; reason?: string; comment?: string }>;
+}
+
 export interface ProjectPlanItem {
   id: string;
   title: string;

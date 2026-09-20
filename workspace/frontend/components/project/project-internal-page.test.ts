@@ -16,6 +16,7 @@ vi.mock('@/lib/workspace-context', () => ({
 }));
 vi.mock('@/lib/api', () => ({ workspaceApi: { getTeam: vi.fn().mockResolvedValue([]) } }));
 vi.mock('./project-activity-page', () => ({ ProjectActivityPage: () => React.createElement('div', { 'data-testid': 'activity-module' }) }));
+vi.mock('./project-task-review-page', () => ({ ProjectTaskReviewPage: () => React.createElement('div', { 'data-testid': 'review-module' }) }));
 vi.mock('@/components/tasks/tasks-view', () => ({ TasksView: () => React.createElement('div', { 'data-testid': 'tasks-module' }) }));
 vi.mock('@/components/workflows/workflows-view', () => ({ WorkflowsView: () => React.createElement('div', { 'data-testid': 'workflows-module' }) }));
 vi.mock('@/components/files/file-list', () => ({ FileList: () => React.createElement(MockList, { name: 'files' }) }));
@@ -76,7 +77,7 @@ describe('Project internal page', () => {
     vi.unstubAllGlobals();
   });
 
-  it('shows the admin plan and a blank review panel after members', async () => {
+  it('shows the admin plan and review module after members', async () => {
     const onBack = await render();
     expect(container.querySelector('header')?.textContent).toBe('项目/测试项目');
     expect(Array.from(container.querySelectorAll('nav button'), (item) => item.textContent))
@@ -93,7 +94,7 @@ describe('Project internal page', () => {
     expect(container.querySelector('[data-testid="project-tab-content"]')?.childElementCount).toBe(0);
     await click(tab('审核'));
     expect(container.querySelector('[data-testid="project-tab-content"]')?.getAttribute('data-active-tab')).toBe('review');
-    expect(container.querySelector('[data-testid="project-tab-content"]')?.childElementCount).toBe(0);
+    expect(container.querySelector('[data-testid="review-module"]')).not.toBeNull();
     await click(container.querySelector<HTMLButtonElement>('header button')!);
     expect(onBack).toHaveBeenCalledOnce();
   });

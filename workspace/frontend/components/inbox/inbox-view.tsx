@@ -12,7 +12,7 @@ import { agentLabel } from '@/lib/helpers';
 import type { NotificationItem } from '@/lib/types';
 import { useRouter } from 'next/navigation';
 import { IS_LOCAL_AUTH } from '@/lib/api-config';
-import { invitationNotificationPath, projectPlanNotificationPath } from '@/lib/notification-target';
+import { invitationNotificationPath, projectPlanNotificationPath, projectReviewNotificationPath } from '@/lib/notification-target';
 
 function PriorityDot({ priority }: { priority: NotificationItem['priority'] }) {
   return (
@@ -195,9 +195,10 @@ export function InboxView() {
       router.push(invitePath);
       return;
     }
-    const planPath = projectPlanNotificationPath(notification, workspace?.workspaceId ?? '');
-    if (planPath) {
-      router.push(planPath);
+    const projectPath = projectPlanNotificationPath(notification, workspace?.workspaceId ?? '')
+      || projectReviewNotificationPath(notification, workspace?.workspaceId ?? '');
+    if (projectPath) {
+      router.push(projectPath);
       return;
     }
     if (notification.channelName) {

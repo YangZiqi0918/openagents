@@ -262,6 +262,63 @@ export class WorkspaceApi {
     return result.items;
   }
 
+  private mapTaskReview(raw: Record<string, unknown>): import('./types').TaskReview {
+    type Submission = import('./types').TaskReviewSubmission;
+    const mapSubmission = (value: Record<string, unknown>): Submission => ({
+      summary: String(value.summary || ''),
+      fileIds: (value.file_ids || []) as string[],
+      userId: (value.user_id || null) as string | null,
+      submittedAt: (value.submitted_at || null) as string | null,
+      reviewDecision: (value.review_decision || null) as Submission['reviewDecision'],
+      reviewComment: (value.review_comment || null) as string | null,
+      reviewedByUserId: (value.reviewed_by_user_id || null) as string | null,
+      reviewerName: (value.reviewer_name || null) as string | null,
+      reviewedAt: (value.reviewed_at || null) as string | null,
+    });
+    return {
+      taskId: raw.task_id as string, planItemId: (raw.plan_item_id || null) as string | null,
+      planTitle: (raw.plan_title || null) as string | null,
+      title: raw.title as string, description: (raw.description || '') as string,
+      acceptanceCriteria: (raw.acceptance_criteria || '') as string,
+      responsibleUserId: raw.responsible_user_id as string,
+      responsibleName: (raw.responsible_name || null) as string | null,
+      status: raw.status as import('./types').TaskStatus,
+      reviewState: raw.review_state as 'pending' | 'processed',
+      channelName: (raw.channel_name || null) as string | null,
+      submissionVersion: raw.submission_version as number,
+      submission: mapSubmission(raw.submission as Record<string, unknown>),
+      files: ((raw.files || []) as Array<Record<string, unknown>>).map(file => ({
+        id: file.id as string, filename: file.filename as string,
+        size: file.size as number, contentType: file.content_type as string,
+      })),
+      submissionHistory: ((raw.submission_history || []) as Array<Record<string, unknown>>).map(mapSubmission),
+      activityHistory: (raw.activity_history || []) as import('./types').TaskReview['activityHistory'],
+    };
+  }
+
+  async listTaskReviews(state: 'pending' | 'processed'): Promise<import('./types').TaskReview[]> {
+    const raw = await this.request<{ items: Array<Record<string, unknown>> }>(
+      `/v1/workspaces/${this.requireWorkspace()}/task-reviews?state=${state}`,
+    );
+    return raw.items.map(item => this.mapTaskReview(item));
+  }
+
+  async getTaskReview(taskId: string): Promise<import('./types').TaskReview> {
+    const raw = await this.request<Record<string, unknown>>(
+      `/v1/workspaces/${this.requireWorkspace()}/task-reviews/${encodeURIComponent(taskId)}`,
+    );
+    return this.mapTaskReview(raw);
+  }
+
+  async decideTaskReview(taskId: string, submissionVersion: number, decision: 'approved' | 'returned', comment = ''): Promise<import('./types').TaskReview> {
+    const raw = await this.request<Record<string, unknown>>(
+      `/v1/workspaces/${this.requireWorkspace()}/task-reviews/${encodeURIComponent(taskId)}/decision`, {
+        method: 'POST', body: JSON.stringify({ submission_version: submissionVersion, decision, comment }),
+      },
+    );
+    return this.mapTaskReview(raw);
+  }
+
   async createPlanItem(input: Omit<ProjectPlanItem, 'id' | 'version' | 'tasks'>): Promise<ProjectPlanItem> {
     return this.request<ProjectPlanItem>(`/v1/workspaces/${this.requireWorkspace()}/plan-items`, {
       method: 'POST', body: JSON.stringify(input),

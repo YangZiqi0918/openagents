@@ -89,9 +89,16 @@ describe('personal task pool', () => {
     mock.task = { ...mock.task, status: 'need_input', assignee: 'codex', submittedSummary: '已验证' };
     await render();
     expect(container.textContent).toContain('需要关注 · 待审核');
-    expect(container.textContent).toContain('已验证');
+    expect(container.textContent).not.toContain('提交结果');
+    expect(container.textContent).not.toContain('已验证');
     expect(container.textContent).not.toContain('提交审核');
     expect(container.textContent).not.toContain('运行');
+    const reviewCard = overview().parentElement;
+    expect(reviewCard?.className).toContain('min-h-[180px]');
+
+    mock.task = { ...mock.task, status: 'in_progress' };
+    await render();
+    expect(overview().parentElement?.className).toContain('min-h-[180px]');
   });
 
   it('shows scannable task metadata, two tags plus overflow, and overdue dates', async () => {

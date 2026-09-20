@@ -18,7 +18,7 @@ from sqlalchemy import select
 
 from app.config import config
 from app.database import SessionLocal
-from app.models import CloudAgentConfig, EventRecord, FileRecord, User, Workspace
+from app.models import CloudAgentConfig, EventRecord, FileRecord, KanbanTask, User, Workspace
 from app.services.cloud_providers import (
     audio_generation,
     chat_completion,
@@ -105,6 +105,9 @@ async def invoke_cloud_agents(workspace_id: str, event_data: dict) -> None:
             if not cloud_config:
                 continue
 
+            if not _task_run_is_current(db, workspace_id, event_data):
+                continue
+
             try:
                 await _invoke_single(db, workspace_id, event_data, cloud_config, depth)
             except Exception as exc:
@@ -122,6 +125,23 @@ async def invoke_cloud_agents(workspace_id: str, event_data: dict) -> None:
                 )
     finally:
         db.close()
+
+
+def _task_run_is_current(db, workspace_id: str, event_data: dict) -> bool:
+    """A queued cloud call must not outlive the member-task run that requested it."""
+    run_id = (event_data.get("metadata") or {}).get("task_run_id")
+    if not run_id:
+        return True
+    target = event_data.get("target") or ""
+    if not target.startswith("channel/task:"):
+        return False
+    task = db.execute(select(KanbanTask).where(
+        KanbanTask.workspace_id == workspace_id,
+        KanbanTask.channel_name == target[len("channel/"):],
+    )).scalar_one_or_none()
+    return bool(task and task.active_run_id == run_id
+                and task.status == "in_progress"
+                and task.execution_status in {"running", "in_progress", "need_input"})
 
 
 async def _invoke_single(
@@ -223,10 +243,15 @@ async def _invoke_chat_agent(
         max_tokens=max_tokens,
         base_url=base_url,
     )
+    if (event_data.get("metadata") or {}).get("task_run_id") and (
+        not response_text or not response_text.strip()
+    ):
+        raise ValueError("Cloud agent returned an empty response")
 
     await _post_response(
         db, workspace_id, channel_target, agent_name,
         response_text, depth,
+        task_run_id=(event_data.get("metadata") or {}).get("task_run_id"),
     )
 
 
@@ -382,6 +407,7 @@ async def _invoke_assistant_agent(
     await _post_response(
         db, workspace_id, channel_target, agent_name, final_text, depth,
         explicit_targets=explicit_targets,
+        task_run_id=(event_data.get("metadata") or {}).get("task_run_id"),
     )
 
 
@@ -436,6 +462,7 @@ async def _invoke_image_agent(
         db, workspace_id, channel_target, agent_name,
         f"Here's the generated image for: *{instruction[:100]}*",
         depth=0,
+        task_run_id=(event_data.get("metadata") or {}).get("task_run_id"),
         attachments=[{
             "file_id": file_id,
             "filename": filename,
@@ -480,6 +507,7 @@ async def _invoke_audio_agent(
         db, workspace_id, channel_target, agent_name,
         f"Generated speech for: *{text[:100]}*",
         depth=0,
+        task_run_id=(event_data.get("metadata") or {}).get("task_run_id"),
         attachments=[{
             "file_id": file_id,
             "filename": filename,
@@ -748,6 +776,7 @@ async def _post_response(
     attachments: Optional[list] = None,
     explicit_targets: Optional[list] = None,
     status_kind: str = "completed",
+    task_run_id: Optional[str] = None,
 ) -> None:
     """Post the cloud agent's response back through the event pipeline.
 
@@ -770,6 +799,22 @@ async def _post_response(
         logger.error("cloud_agent: workspace %s not found", workspace_id)
         return
 
+    task = None
+    if task_run_id:
+        if not channel_target.startswith("channel/task:"):
+            return
+        task = db.execute(select(KanbanTask).where(
+            KanbanTask.workspace_id == workspace_id,
+            KanbanTask.channel_name == channel_target[len("channel/"):],
+        ).with_for_update()).scalar_one_or_none()
+        if not (task and task.active_run_id == task_run_id
+                and task.status == "in_progress"
+                and task.execution_status in {"running", "in_progress", "need_input"}
+                and (task.assignee == agent_name or task.workflow_id)):
+            db.rollback()
+            logger.info("cloud_agent: discarding stale task response for %s", channel_target)
+            return
+
     payload: dict = {
         "content": content,
         "message_type": "chat",
@@ -778,6 +823,8 @@ async def _post_response(
         payload["attachments"] = attachments
 
     metadata: dict = {"cloud_agent_depth": depth + 1, "status_kind": status_kind}
+    if task_run_id:
+        metadata["task_run_id"] = task_run_id
     if explicit_targets is not None:
         metadata["explicit_targets"] = list(explicit_targets)
 
@@ -802,9 +849,13 @@ async def _post_response(
     try:
         await pipeline.process(event, context)
     except EventRejected as exc:
+        db.rollback()
         logger.warning("cloud_agent: response event rejected: %s", exc.reason)
         return
 
+    if task is not None and status_kind == "failed":
+        task.execution_status = "paused"
+        task.active_run_id = None
     db.commit()
 
     # Push. Not automatic: the fan-out is scheduled by the `POST /v1/events`
@@ -890,6 +941,7 @@ async def _post_error_message(
     """
     err_db = SessionLocal()
     try:
+        task_run_id = (event_data.get("metadata") or {}).get("task_run_id")
         await _post_response(
             err_db, workspace_id,
             event_data.get("target", ""),
@@ -897,6 +949,8 @@ async def _post_error_message(
             f"[Error] {error_text}",
             depth=0,
             status_kind="failed",
+            explicit_targets=[] if task_run_id else None,
+            task_run_id=task_run_id,
         )
     except Exception:
         logger.exception("cloud_agent: failed to post error message for %s", agent_name)

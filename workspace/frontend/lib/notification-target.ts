@@ -22,3 +22,14 @@ export function projectPlanNotificationPath(notification: Pick<NotificationItem,
     return `${url.pathname}${url.search}`;
   } catch { return null; }
 }
+
+export function projectReviewNotificationPath(notification: Pick<NotificationItem, 'linkUrl'>, workspaceId: string): string | null {
+  if (!notification.linkUrl || !workspaceId) return null;
+  try {
+    const origin = typeof window === 'undefined' ? 'http://local-app' : window.location.origin;
+    const url = new URL(notification.linkUrl, origin);
+    if (url.origin !== origin || url.pathname !== `/projects/${encodeURIComponent(workspaceId)}`
+      || url.searchParams.get('tab') !== 'review' || !url.searchParams.get('task')) return null;
+    return `${url.pathname}${url.search}`;
+  } catch { return null; }
+}

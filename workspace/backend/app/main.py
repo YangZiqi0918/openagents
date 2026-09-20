@@ -18,7 +18,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.config import config
 from app.access import access_policy_for_request, request_access_policy, request_authorization
-from app.routers import account, app_version, auth, browser, campaign, pilot, cloud_agents, devices, events, feedback, fetch, files, integrations, invites, knowledge, model_access, network, nodes, notifications, onboarding, plan_items, routines, search, shares, tasks, timers, todos, workflows, workspaces
+from app.routers import account, app_version, auth, browser, campaign, pilot, cloud_agents, devices, events, feedback, fetch, files, integrations, invites, knowledge, model_access, network, nodes, notifications, onboarding, plan_items, routines, search, shares, task_reviews, tasks, timers, todos, workflows, workspaces
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -574,6 +574,7 @@ app.include_router(nodes.router)
 app.include_router(notifications.router)
 app.include_router(onboarding.router)
 app.include_router(plan_items.router)
+app.include_router(task_reviews.router)
 app.include_router(routines.router)
 app.include_router(search.router)
 app.include_router(shares.router)
