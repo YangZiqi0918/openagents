@@ -18,7 +18,7 @@ from sqlalchemy import select
 
 from app.config import config
 from app.database import SessionLocal
-from app.models import CloudAgentConfig, EventRecord, FileRecord, Workspace
+from app.models import CloudAgentConfig, EventRecord, FileRecord, User, Workspace
 from app.services.cloud_providers import (
     audio_generation,
     chat_completion,
@@ -59,6 +59,20 @@ def speaker_label(source: str, payload: Optional[dict] = None) -> str:
             name = email.split("@", 1)[0] if email else ""
     name = _re.sub(r"[\s\[\]]+", " ", name).strip()
     return name[:40] or "user"
+
+
+def _project_speaker_label(db, source: str, cache: dict[str, str]) -> str:
+    """Derive project speakers from persisted identities, never event payload labels."""
+    if not source.startswith("human:"):
+        return speaker_label(source)
+    identity = source[len("human:"):]
+    if identity not in cache:
+        user = db.execute(select(User).where(User.email == identity)).scalar_one_or_none()
+        cache[identity] = (
+            speaker_label(source, {"sender_display_name": user.username or user.display_name})
+            if user else "user"
+        )
+    return cache[identity]
 
 
 async def invoke_cloud_agents(workspace_id: str, event_data: dict) -> None:
@@ -146,11 +160,16 @@ async def _invoke_chat_agent(
     system_prompt = cloud_config.system_prompt
     max_tokens = cloud_config.max_tokens
 
+    project = db.execute(select(Workspace.kind).where(Workspace.id == workspace_id)).scalar_one_or_none() == "project"
+    project_channel = project and channel_target.startswith("channel/")
+
     # The char budget covers the whole request, not just history — system
     # prompt and the trigger message spend from it first, history gets the
     # remainder. An absurdly long trigger is truncated so the assembled
     # payload always stays within CLOUD_AGENT_MAX_CONTEXT_CHARS.
     content = event_data.get("payload", {}).get("content", "")
+    if project_channel and content:
+        content = f"[{_project_speaker_label(db, event_data.get('source') or '', {})}] {content}"
     total_budget = config.CLOUD_AGENT_MAX_CONTEXT_CHARS
     system_len = len(system_prompt or "")
     if system_len >= total_budget:
@@ -175,6 +194,7 @@ async def _invoke_chat_agent(
         exclude_event_id=event_data.get("id"),
         before_timestamp=_event_order_boundary(event_data),
         max_chars=max(0, total_budget - system_len - len(content)),
+        project_speakers=project_channel,
     )
 
     if content:
@@ -483,6 +503,7 @@ def _build_conversation_context(
     before_timestamp: Optional[int] = None,
     max_chars: Optional[int] = None,
     attribute_speakers: bool = False,
+    project_speakers: bool = False,
 ) -> list[dict]:
     """Fetch recent messages from the channel as conversation context.
 
@@ -520,6 +541,7 @@ def _build_conversation_context(
     max_scanned = batch_size * 10
 
     collected: list[dict] = []  # newest -> oldest
+    speaker_cache: dict[str, str] = {}
     used_chars = 0
     offset = 0
     drop_newest = exclude_event_id is None and before_timestamp is None
@@ -563,7 +585,9 @@ def _build_conversation_context(
                 role = "user"
             else:
                 continue
-            if attribute_speakers and role == "user":
+            if project_speakers and role == "user":
+                content = f"[{_project_speaker_label(db, source, speaker_cache)}] {content}"
+            elif attribute_speakers and role == "user":
                 content = f"[{speaker_label(source, payload)}] {content}"
 
             if used_chars + len(content) > max_chars:

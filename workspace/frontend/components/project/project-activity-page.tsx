@@ -1,10 +1,11 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Check,
   ChevronLeft,
   Copy,
+  Crown,
   Loader2,
   MessageSquare,
   MoreVertical,
@@ -16,6 +17,7 @@ import {
   Users,
 } from 'lucide-react';
 import { useWorkspace } from '@/lib/workspace-context';
+import { useWorkspaceApi } from '@/lib/workspace-api-context';
 import { useI18n } from '@/lib/i18n';
 import { useIsMobile } from '@/hooks/use-mobile';
 import { agentLabel } from '@/lib/helpers';
@@ -23,6 +25,8 @@ import { projectShareUrl } from '@/lib/project-channels';
 import { shareOrigin } from '@/lib/share-origin';
 import { IS_LOCAL_AUTH } from '@/lib/api-config';
 import { AgentAvatar } from '@/components/agents/agent-avatar';
+import { OrchestrationControl } from '@/components/chat/orchestration-control';
+import type { TeamMember } from '@/lib/types';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { useConfirm } from '@/components/ui/dialogs-provider';
@@ -87,6 +91,7 @@ function ActivityContent({
   workspaceId,
 }: ProjectActivityPageProps & { workspaceId: string }) {
   const { agents, currentUser, me } = useWorkspace();
+  const workspaceApi = useWorkspaceApi();
   const { locale } = useI18n();
   const l = activityLabels(locale);
   const isMobile = useIsMobile();
@@ -97,16 +102,29 @@ function ActivityContent({
     currentUser.id,
     initialSessionId,
   );
+  const appliedLink = useRef<string | undefined>(undefined);
   useEffect(() => {
-    if (initialSessionId && activity.sessions.some((session) => session.sessionId === initialSessionId)) {
+    if (initialSessionId && appliedLink.current !== initialSessionId &&
+      activity.sessions.some((session) => session.sessionId === initialSessionId)) {
+      appliedLink.current = initialSessionId;
       activity.select(initialSessionId);
       setPane('detail');
     }
   }, [initialSessionId, activity.sessions]); // eslint-disable-line react-hooks/exhaustive-deps
+  const [humanMembers, setHumanMembers] = useState<TeamMember[] | null>(null);
+  const [membersError, setMembersError] = useState(false);
+  const loadMembers = () => {
+    if (!IS_LOCAL_AUTH) return;
+    setMembersError(false);
+    void workspaceApi.getTeam().then(setHumanMembers).catch(() => setMembersError(true));
+  };
+  useEffect(() => {
+    loadMembers();
+  }, [workspaceApi]); // eslint-disable-line react-hooks/exhaustive-deps
   const [pane, setPane] = useState<'list' | 'detail'>(
     initialSessionId ? 'detail' : 'list',
   );
-  const [form, setForm] = useState<{ id?: string; name: string } | null>(null);
+  const [form, setForm] = useState<{ id?: string; name: string; participants: string[] } | null>(null);
   const [sending, setSending] = useState(false);
   const [failedSends, setFailedSends] = useState<
     Record<string, ActivitySend | undefined>
@@ -118,7 +136,14 @@ function ActivityContent({
     (session) => session.sessionId === activity.preferences.selectedId,
   );
   const disabled = activity.busy || sending;
-  const readOnly = IS_LOCAL_AUTH && me?.role === 'viewer';
+  const readOnly = IS_LOCAL_AUTH && !['owner', 'admin', 'member'].includes(me?.role || '');
+  const onlineAgents = agents.filter((agent) => agent.status === 'online');
+  const newConversation = () => setForm({
+    name: '',
+    participants: onlineAgents.length === 1 && !onlineAgents[0].builtin
+      ? [onlineAgents[0].agentName]
+      : [],
+  });
   const shareUrl = projectShareUrl(shareOrigin(), workspaceId, {
     projectId,
     projectName,
@@ -150,7 +175,8 @@ function ActivityContent({
     if (readOnly || !form?.name.trim() || form.name.trim().length > 60) return;
     const success = form.id
       ? await activity.rename(form.id, form.name.trim())
-      : await activity.create(form.name.trim());
+      : await activity.create(form.name.trim(), form.participants.filter((name) =>
+          onlineAgents.some((agent) => agent.agentName === name)));
     if (success) {
       setForm(null);
       setPane('detail');
@@ -229,7 +255,7 @@ function ActivityContent({
                 title={l.newConversation}
                 aria-label={l.newConversation}
                 disabled={disabled || readOnly}
-                onClick={() => setForm({ name: '' })}
+                onClick={newConversation}
                 className={iconClass}
               >
                 <Plus className="size-4" />
@@ -256,7 +282,7 @@ function ActivityContent({
                   <Button
                     variant="outline"
                     disabled={disabled || readOnly}
-                    onClick={() => setForm({ name: '' })}
+                    onClick={newConversation}
                   >
                     <Plus className="size-4" />
                     {l.newConversation}
@@ -327,6 +353,7 @@ function ActivityContent({
                               setForm({
                                 id: session.sessionId,
                                 name: session.title,
+                                participants: [],
                               })
                             }
                           >
@@ -378,6 +405,34 @@ function ActivityContent({
                   >
                     {selected.title}
                   </h2>
+                  {selected.participants.length > 0 && !readOnly && (
+                    <>
+                      <Popover>
+                        <PopoverTrigger asChild>
+                          <button type="button" title={l.leader} aria-label={l.leader} className={iconClass} disabled={disabled}>
+                            <Crown className="size-4" />
+                          </button>
+                        </PopoverTrigger>
+                        <PopoverContent align="end" className="w-64 p-2">
+                          <h3 className="px-2 pb-1 text-sm font-medium">{l.leader}</h3>
+                          {selected.participants.map((name) => (
+                            <button key={name} type="button" disabled={disabled}
+                              className="flex w-full items-center gap-2 rounded-sm px-2 py-2 text-left text-sm hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
+                              onClick={() => void activity.configure(selected.sessionId, { master: name })}>
+                              <AgentAvatar name={name} size={20} />
+                              <span className="min-w-0 flex-1 truncate">{agents.find((agent) => agent.agentName === name)?.displayName || name}</span>
+                              {selected.master === name && <Check className="size-4" />}
+                            </button>
+                          ))}
+                        </PopoverContent>
+                      </Popover>
+                      {agents.filter((agent) => selected.participants.includes(agent.agentName)).length >= 2 && (
+                        <OrchestrationControl session={selected}
+                          agents={agents.filter((agent) => selected.participants.includes(agent.agentName))}
+                          onChange={(changes) => void activity.configure(selected.sessionId, changes)} />
+                      )}
+                    </>
+                  )}
                   <Popover>
                     <PopoverTrigger asChild>
                       <button
@@ -478,11 +533,15 @@ function ActivityContent({
                 )}
                 <ProjectActivityConversation
                   key={selected.sessionId}
+                  workspaceId={workspaceId}
                   sessionId={selected.sessionId}
                   agents={agents.filter((agent) =>
                     selected.participants.includes(agent.agentName),
                   )}
                   currentUser={currentUser}
+                  humanMembers={humanMembers?.filter((member) => member.username && member.username !== me?.username) || null}
+                  membersError={membersError}
+                  onRetryMembers={loadMembers}
                   readOnly={readOnly}
                   draft={activity.preferences.drafts[selected.sessionId] || ''}
                   onDraftChange={(text) =>
@@ -554,6 +613,27 @@ function ActivityContent({
                 <p role="alert" className="mt-2 text-sm text-destructive">
                   {l.operationFailed} ({activity.operationError})
                 </p>
+              )}
+              {!form?.id && (
+                <div className="mt-4 space-y-2">
+                  <p className="text-sm font-medium">{l.chooseAgents}</p>
+                  {onlineAgents.length === 0 ? (
+                    <p className="text-sm text-muted-foreground">{l.noOnlineAgents}</p>
+                  ) : onlineAgents.map((agent) => (
+                    <label key={agent.agentName} className="flex cursor-pointer items-center gap-3 rounded-sm px-2 py-2 hover:bg-muted">
+                      <input type="checkbox" className="size-4 accent-foreground" disabled={activity.busy}
+                        checked={Boolean(form?.participants.includes(agent.agentName))}
+                        onChange={(event) => setForm((previous) => previous ? {
+                          ...previous,
+                          participants: event.target.checked
+                            ? [...previous.participants, agent.agentName]
+                            : previous.participants.filter((name) => name !== agent.agentName),
+                        } : null)} />
+                      <AgentAvatar name={agent.agentName} size={24} />
+                      <span className="min-w-0 flex-1 truncate text-sm">{agentLabel(agent)}</span>
+                    </label>
+                  ))}
+                </div>
               )}
             </DialogBody>
             <DialogFooter>

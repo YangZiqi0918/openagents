@@ -46,6 +46,8 @@ def access_policy_for_request(method: str, path: str) -> tuple[Optional[str], bo
     """
     if config.AUTH_MODE != "local_password" or method in {"GET", "HEAD", "OPTIONS"}:
         return None, False
+    if method == "PUT" and re.fullmatch(r"/v1/workspaces/[^/]+/channels/[^/]+/subscription", path):
+        return "viewer", True
     if re.fullmatch(r"/v1/workspaces/[^/]+", path):
         return ("owner", True) if method == "DELETE" else ("admin", False)
     if re.match(r"/v1/workspaces/[^/]+/(team|invites)(/|$)", path):

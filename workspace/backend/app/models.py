@@ -201,19 +201,21 @@ class ChannelMember(Base):
 
 
 class ChannelHumanMember(Base):
-    """Per-channel human participant — Slack-style thread membership.
+    """Per-channel human notification preference, independent of read access.
 
     Lives alongside `ChannelMember` (agents only) rather than mixing
     `agent_name` + `user_email` into one row, which would muddy the
     existing agent routing queries. Auto-populated by the workspace mod
     on first human post in a channel; consulted by `services/push.py` to
-    decide whose devices get a banner for non-mention chat messages.
-    Mentions still wake the mentioned human regardless of membership.
+    decide whose devices get a banner for non-mention chat messages. An
+    explicit opt-out row survives later posts. Project read access always
+    comes from WorkspaceMembership, never from this table.
     """
     __tablename__ = "channel_human_members"
 
     channel_id = Column(UUID(as_uuid=False), ForeignKey("channels.id", ondelete="CASCADE"), nullable=False)
     user_email = Column(Text, nullable=False)               # normalized lowercase
+    following = Column(Boolean, nullable=False, default=True, server_default=text("TRUE"))
     joined_at = Column(DateTime(timezone=True), default=_now, server_default=text("NOW()"))
 
     __table_args__ = (

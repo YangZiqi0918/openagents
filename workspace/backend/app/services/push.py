@@ -40,8 +40,13 @@ import re
 
 from sqlalchemy import select
 
+from app.config import config
 from app.database import SessionLocal
-from app.models import ChannelHumanMember, DeviceToken, WorkspaceCollaborator, WorkspaceMember
+from app.local_accounts import normalize_username
+from app.models import (
+    ChannelHumanMember, DeviceToken, User, Workspace, WorkspaceCollaborator,
+    WorkspaceMember, WorkspaceMembership,
+)
 from app.services.fcm_client import PushAlert, send_push
 from app.services.message_identity import human_sender_email
 
@@ -86,6 +91,7 @@ def _is_intermediate_step(content: str) -> bool:
 
 
 _MENTION_RE = re.compile(r"@([\w][\w\-_]{0,63})")
+_PROJECT_HUMAN_MENTION_RE = re.compile(r"@\{((?:\\[\\{}nr]|[^}\\\r\n]){1,256})\}")
 
 # The structured "this turn is over" marker — the real signal the comment on
 # _TERMINAL_STATUS_PATTERNS says to prefer over matching English words in
@@ -171,10 +177,20 @@ def _extract_mentions(content: str) -> set[str]:
     return {m.group(1).lower() for m in _MENTION_RE.finditer(content or "")}
 
 
+def _project_human_mentions(content: str, human_keys: dict[str, str]) -> set[str]:
+    """Resolve explicit @{username} tokens against current project members."""
+    def unescape(match):
+        return {"n": "\n", "r": "\r"}.get(match.group(1), match.group(1))
+
+    return {human_keys[name] for match in _PROJECT_HUMAN_MENTION_RE.finditer(content or "")
+            if (name := normalize_username(re.sub(r"\\([\\{}nr])", unescape, match.group(1)))) in human_keys}
+
+
 def _should_push(
     event: dict,
     workspace_agent_names: set[str],
     workspace_human_keys: dict[str, str] | None = None,
+    *, prefer_human_mentions: bool = False,
 ) -> tuple[bool, str, str | None]:
     """Decide whether `event` warrants a push.
 
@@ -206,12 +222,17 @@ def _should_push(
     # Mentions take priority — applies to both chat and status, agent or
     # human. Agent-name match → broadcast within the workspace as before.
     # Human-name match → scope to that human's device tokens.
+    if prefer_human_mentions and workspace_human_keys:
+        targeted = _project_human_mentions(content, workspace_human_keys)
+        if targeted:
+            return True, "mention", sorted(targeted)[0]
+
     mentions = _extract_mentions(content)
     if mentions:
         if mentions & {n.lower() for n in workspace_agent_names}:
             return True, "mention", None
         if workspace_human_keys:
-            for m in mentions:
+            for m in sorted(mentions):
                 if m in workspace_human_keys:
                     return True, "mention", workspace_human_keys[m]
 
@@ -248,10 +269,10 @@ def _should_push(
     return False, "", None
 
 
-def _build_alert(event: dict, reason: str) -> PushAlert:
+def _build_alert(event: dict, reason: str, sender_name_override: str | None = None) -> PushAlert:
     """Build the user-visible title + body of the notification."""
     source = str(event.get("source") or "")
-    sender_name = source.split(":", 1)[1] if ":" in source else source
+    sender_name = sender_name_override or (source.split(":", 1)[1] if ":" in source else source)
 
     if reason == "mention":
         title = f"{sender_name} mentioned you"
@@ -299,7 +320,7 @@ def _workspace_agent_names(db, workspace_id: str) -> set[str]:
     return set(rows)
 
 
-def _workspace_human_keys(db, workspace_id: str) -> dict[str, str]:
+def _workspace_human_keys(db, workspace_id: str, *, project_members: bool = False) -> dict[str, str]:
     """Build the mention-resolution table for humans in this workspace.
 
     Maps every plausible thing a person might type after `@` to that
@@ -314,6 +335,14 @@ def _workspace_human_keys(db, workspace_id: str) -> dict[str, str]:
     at an email and that's all we need to scope device tokens.
     """
     keys: dict[str, str] = {}
+    if project_members:
+        rows = db.execute(
+            select(User.username, User.email)
+            .join(WorkspaceMembership, WorkspaceMembership.user_id == User.id)
+            .where(WorkspaceMembership.workspace_id == workspace_id, User.username.is_not(None))
+        ).all()
+        return {normalize_username(username): email.strip().lower()
+                for username, email in rows if username and email}
     rows = db.execute(
         select(WorkspaceCollaborator.email, WorkspaceCollaborator.display_name)
         .where(WorkspaceCollaborator.workspace_id == workspace_id)
@@ -373,6 +402,7 @@ def _channel_human_emails(db, workspace_id: str, channel_name: str) -> set[str]:
         .where(
             Channel.workspace_id == workspace_id,
             Channel.name == channel_name,
+            ChannelHumanMember.following.is_(True),
         )
     ).scalars().all()
     return {e for e in rows if e}
@@ -390,10 +420,14 @@ def _sender_email_for(event: dict) -> str | None:
 def _fanout_impl(workspace_id: str, event: dict) -> None:
     db = SessionLocal()
     try:
+        workspace = db.get(Workspace, workspace_id)
+        if workspace is None or workspace.status == "deleted":
+            return
+        project_members = config.AUTH_MODE == "local_password" and workspace.kind == "project"
         agent_names = _workspace_agent_names(db, workspace_id)
-        human_keys = _workspace_human_keys(db, workspace_id)
+        human_keys = _workspace_human_keys(db, workspace_id, project_members=project_members)
         should, reason, mention_target_email = _should_push(
-            event, agent_names, human_keys,
+            event, agent_names, human_keys, prefer_human_mentions=project_members,
         )
         if not should:
             return
@@ -403,9 +437,14 @@ def _fanout_impl(workspace_id: str, event: dict) -> None:
 
         if mention_target_email:
             # Mention path — scope to the mentioned human, regardless of
-            # whether they're in this channel. One-off notification.
-            token_query = token_query.where(DeviceToken.user_email == mention_target_email)
-            scope_label = mention_target_email
+            # whether they're in this channel. Project messages may mention
+            # more than one human explicitly with @{username}.
+            targeted_emails = (
+                _project_human_mentions(_content_of(event), human_keys)
+                if project_members else set()
+            ) or {mention_target_email}
+            token_query = token_query.where(DeviceToken.user_email.in_(targeted_emails))
+            scope_label = ",".join(sorted(targeted_emails))
         else:
             # Chat / status path — scope to humans who have joined *this*
             # channel via implicit Slack-style membership. Skip the
@@ -430,6 +469,14 @@ def _fanout_impl(workspace_id: str, event: dict) -> None:
         if sender_email:
             token_query = token_query.where(DeviceToken.user_email != sender_email)
 
+        if project_members:
+            # Revalidate membership at send time: registrations and channel
+            # subscriptions can outlive a project membership or queued event.
+            member_emails = select(User.email).join(
+                WorkspaceMembership, WorkspaceMembership.user_id == User.id,
+            ).where(WorkspaceMembership.workspace_id == workspace_id)
+            token_query = token_query.where(DeviceToken.user_email.in_(member_emails))
+
         tokens: list[DeviceToken] = db.execute(token_query).scalars().all()
         if not tokens:
             return
@@ -446,7 +493,15 @@ def _fanout_impl(workspace_id: str, event: dict) -> None:
             )
             return
 
-        alert = _build_alert(event, reason)
+        sender_label = None
+        if project_members and str(event.get("source") or "").startswith("human:"):
+            sender_identity = event["source"][len("human:"):]
+            sender_label = db.execute(
+                select(User.username)
+                .join(WorkspaceMembership, WorkspaceMembership.user_id == User.id)
+                .where(WorkspaceMembership.workspace_id == workspace_id, User.email == sender_identity)
+            ).scalar_one_or_none() or "Member"
+        alert = _build_alert(event, reason, sender_name_override=sender_label)
         data = _build_data_payload(event, reason)
 
         # firebase-admin's messaging API is synchronous. That is fine — and
@@ -492,9 +547,16 @@ def fanout_for_notification(notification: dict) -> None:
 
     db = SessionLocal()
     try:
-        tokens: list[DeviceToken] = db.execute(
-            select(DeviceToken).where(DeviceToken.workspace_id == workspace_id)
-        ).scalars().all()
+        token_query = select(DeviceToken).where(DeviceToken.workspace_id == workspace_id)
+        workspace = db.get(Workspace, workspace_id)
+        if workspace is None or workspace.status == "deleted":
+            return
+        if config.AUTH_MODE == "local_password" and workspace.kind == "project":
+            member_emails = select(User.email).join(
+                WorkspaceMembership, WorkspaceMembership.user_id == User.id,
+            ).where(WorkspaceMembership.workspace_id == workspace_id)
+            token_query = token_query.where(DeviceToken.user_email.in_(member_emails))
+        tokens: list[DeviceToken] = db.execute(token_query).scalars().all()
         if not tokens:
             return
 

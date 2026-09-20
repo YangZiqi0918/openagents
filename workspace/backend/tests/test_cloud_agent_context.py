@@ -18,7 +18,7 @@ import uuid
 import pytest
 
 from app.config import config
-from app.models import EventRecord
+from app.models import EventRecord, User, Workspace
 from app.services import cloud_agent
 from app.services.cloud_agent import _build_conversation_context
 
@@ -310,6 +310,80 @@ class TestCharBudget:
                 db, WORKSPACE_ID, event_data, cloud_config, depth=0,
             ))
         assert not called["chat"]
+
+    def test_project_chat_attributes_verified_humans_and_agents_within_budget(self, db, monkeypatch):
+        db.add(Workspace(id=WORKSPACE_ID, slug="project-cloud-context", name="P", kind="project"))
+        db.add(User(email="alice@local.internal", username="alice"))
+        db.add(User(email="bob@local.internal", username="bob"))
+        db.add(EventRecord(
+            id="alice-msg", network_id=WORKSPACE_ID, type="workspace.message.posted",
+            source="human:alice@local.internal", target=CHANNEL,
+            payload={"content": "First brief", "sender_display_name": "forged-owner"},
+            metadata_={}, timestamp=1,
+        ))
+        _add_message(db, 2, "Draft", source="openagents:writer")
+        _add_message(db, 3, "My revision", source=f"openagents:{AGENT}")
+        db.commit()
+
+        captured = {}
+
+        async def fake_chat_completion(**kwargs):
+            captured.update(kwargs)
+            return "ack"
+
+        async def fake_post_response(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(cloud_agent, "chat_completion", fake_chat_completion)
+        monkeypatch.setattr(cloud_agent, "_post_response", fake_post_response)
+        monkeypatch.setattr(config, "CLOUD_AGENT_MAX_CONTEXT_CHARS", 100)
+        cloud_config = types.SimpleNamespace(
+            agent_name=AGENT, provider="openai", model="test-model", api_key="key",
+            system_prompt="Project instructions", max_tokens=100, base_url=None, category="chat",
+        )
+        asyncio.run(cloud_agent._invoke_chat_agent(db, WORKSPACE_ID, {
+            "id": "bob-msg", "target": CHANNEL, "source": "human:bob@local.internal",
+            "payload": {"content": "Please respond", "sender_display_name": "forged-admin"},
+            "timestamp": 4,
+        }, cloud_config, depth=0))
+
+        assert captured["messages"] == [
+            {"role": "user", "content": "[alice] First brief"},
+            {"role": "user", "content": "[writer] Draft"},
+            {"role": "assistant", "content": "My revision"},
+            {"role": "user", "content": "[bob] Please respond"},
+        ]
+        assert sum(len(message["content"]) for message in captured["messages"]) + len(cloud_config.system_prompt) <= 100
+
+    def test_project_trigger_label_is_budgeted_and_personal_path_is_unchanged(self, db, monkeypatch):
+        db.add(Workspace(id=WORKSPACE_ID, slug="project-trigger-budget", name="P", kind="project"))
+        db.add(User(email="alice@local.internal", username="alice"))
+        db.commit()
+        captured = []
+
+        async def fake_chat_completion(**kwargs):
+            captured.append(kwargs["messages"])
+            return "ok"
+
+        async def fake_post_response(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(cloud_agent, "chat_completion", fake_chat_completion)
+        monkeypatch.setattr(cloud_agent, "_post_response", fake_post_response)
+        monkeypatch.setattr(config, "CLOUD_AGENT_MAX_CONTEXT_CHARS", 32)
+        cloud_config = types.SimpleNamespace(
+            agent_name=AGENT, provider="openai", model="test-model", api_key="key",
+            system_prompt="system", max_tokens=100, base_url=None, category="chat",
+        )
+        event_data = {"id": "trigger", "target": CHANNEL, "source": "human:alice@local.internal",
+                      "payload": {"content": "x" * 1000}, "timestamp": 100}
+        asyncio.run(cloud_agent._invoke_chat_agent(db, WORKSPACE_ID, event_data, cloud_config, 0))
+        assert captured[-1] == [{"role": "user", "content": "[alice] " + "x" * 18}]
+
+        db.query(Workspace).filter(Workspace.id == WORKSPACE_ID).update({"kind": "personal"})
+        db.commit()
+        asyncio.run(cloud_agent._invoke_chat_agent(db, WORKSPACE_ID, event_data, cloud_config, 0))
+        assert captured[-1] == [{"role": "user", "content": "x" * 26}]
 
     def test_image_composer_payload_stays_within_its_budget(self, db, monkeypatch):
         """The composer budget covers the whole request including the

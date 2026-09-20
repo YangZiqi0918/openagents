@@ -25,6 +25,8 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.access import resolve_current_user, verify_workspace_access
+from app.config import config
 from app.database import get_db
 from app.models import DeviceToken, Workspace
 from app.response import ResponseCode, json_response, success_response
@@ -33,6 +35,15 @@ from app.routers.network import _verify_workspace_access, _workspace_filter
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/v1", tags=["Devices"])
+
+
+def _local_device_user(db: Session, workspace: Workspace, authorization: Optional[str]):
+    user = resolve_current_user(db, authorization)
+    if user is None or not verify_workspace_access(
+        workspace, None, authorization, db=db, min_role="viewer", human_only=True,
+    ):
+        return None
+    return user
 
 
 class RegisterDeviceRequest(BaseModel):
@@ -97,7 +108,12 @@ def register_device(
     ).scalar_one_or_none()
     if not workspace:
         return json_response(ResponseCode.NOT_FOUND, "Network not found")
-    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+    local_user = None
+    if config.AUTH_MODE == "local_password":
+        local_user = _local_device_user(db, workspace, authorization)
+        if local_user is None:
+            return json_response(ResponseCode.UNAUTHORIZED, "Human membership required")
+    elif not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Workspace access denied")
 
     existing = db.execute(
@@ -110,9 +126,11 @@ def register_device(
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc)
 
-    normalized_email = (body.user_email or "").strip().lower() or None
+    normalized_email = local_user.email.strip().lower() if local_user else (body.user_email or "").strip().lower() or None
 
     if existing:
+        if local_user and existing.user_email not in (None, normalized_email):
+            return json_response(ResponseCode.FORBIDDEN, "Device is registered to another account")
         existing.last_seen_at = now
         existing.device_type = body.device_type
         if body.bundle_id is not None:
@@ -158,12 +176,18 @@ def deregister_device(
     ).scalar_one_or_none()
     if not workspace:
         return json_response(ResponseCode.NOT_FOUND, "Network not found")
-    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+    local_user = None
+    if config.AUTH_MODE == "local_password":
+        local_user = _local_device_user(db, workspace, authorization)
+        if local_user is None:
+            return json_response(ResponseCode.UNAUTHORIZED, "Human membership required")
+    elif not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Workspace access denied")
 
     deleted = db.query(DeviceToken).filter(
         DeviceToken.workspace_id == str(workspace.id),
         DeviceToken.fcm_token == body.fcm_token,
+        *([DeviceToken.user_email == local_user.email.strip().lower()] if local_user else []),
     ).delete()
     db.commit()
     return success_response({"deleted": deleted})
@@ -206,13 +230,19 @@ def test_push(
     ).scalar_one_or_none()
     if not workspace:
         return json_response(ResponseCode.NOT_FOUND, "Network not found")
-    if not _verify_workspace_access(workspace, x_workspace_token, authorization):
+    local_user = None
+    if config.AUTH_MODE == "local_password":
+        local_user = _local_device_user(db, workspace, authorization)
+        if local_user is None:
+            return json_response(ResponseCode.UNAUTHORIZED, "Human membership required")
+    elif not _verify_workspace_access(workspace, x_workspace_token, authorization):
         return json_response(ResponseCode.UNAUTHORIZED, "Workspace access denied")
 
     device = db.execute(
         select(DeviceToken).where(
             DeviceToken.workspace_id == str(workspace.id),
             DeviceToken.fcm_token == body.fcm_token,
+            *([DeviceToken.user_email == local_user.email.strip().lower()] if local_user else []),
         )
     ).scalar_one_or_none()
     if not device:

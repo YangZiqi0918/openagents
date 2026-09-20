@@ -17,6 +17,11 @@ const mock = vi.hoisted(() => ({
   mobile: false,
   workspaceId: 'workspace',
   userId: 'user',
+  localAuth: false,
+  role: 'member',
+  agents: [
+    { agentName: 'helper', displayName: 'Helper', status: 'online' },
+  ] as WorkspaceAgent[],
   channels: [] as NetworkChannel[],
   messages: {} as Record<string, WorkspaceMessage[]>,
   input: null as React.ComponentProps<typeof ChatInput> | null,
@@ -35,22 +40,21 @@ const mock = vi.hoisted(() => ({
     sendMessage: vi.fn(),
     addChannelParticipant: vi.fn(),
     removeChannelParticipant: vi.fn(),
+    fetchResource: vi.fn(),
+    getTeam: vi.fn(),
     getFileUrl: vi.fn(),
   },
 }));
 
 vi.mock('@/hooks/use-mobile', () => ({ useIsMobile: () => mock.mobile }));
+vi.mock('@/lib/api-config', () => ({ get IS_LOCAL_AUTH() { return mock.localAuth; } }));
 vi.mock('@/lib/workspace-context', () => ({
   useWorkspace: () => ({
     workspace: { workspaceId: mock.workspaceId },
     currentUser: { id: mock.userId, name: 'User', isAuthenticated: true },
-    agents: [
-      {
-        agentName: 'helper',
-        displayName: 'Helper',
-        status: 'online',
-      } as WorkspaceAgent,
-    ],
+    agents: mock.agents,
+    workflows: [],
+    me: { role: mock.role, username: mock.userId },
     setCurrentSessionId: mock.personalSelection,
     createSession: mock.personalCreate,
   }),
@@ -220,6 +224,11 @@ beforeEach(() => {
   mock.mobile = false;
   mock.workspaceId = 'workspace';
   mock.userId = 'user';
+  mock.localAuth = false;
+  mock.role = 'member';
+  mock.agents = [
+    { agentName: 'helper', displayName: 'Helper', status: 'online' } as WorkspaceAgent,
+  ];
   mock.messages = {};
   mock.files = [];
   mock.channels = [
@@ -238,13 +247,25 @@ beforeEach(() => {
   mock.api.discover.mockImplementation(async () => ({
     channels: mock.channels,
   }));
+  mock.api.getTeam.mockResolvedValue([
+    { username: 'user', role: 'member', displayName: 'User' },
+    { username: 'other', role: 'member', displayName: 'Other' },
+  ]);
+  mock.api.fetchResource.mockImplementation(async (_path, options) => ({
+    json: async () => ({ data: { following: options?.method === 'PUT'
+      ? JSON.parse(options.body).following : false } }),
+  }));
   mock.api.sendEvent.mockImplementation(async (event) => {
     mock.channels.push(channel(event.payload.name, event.payload.title));
     return { metadata: { channel_name: event.payload.name } };
   });
   mock.api.updateChannel.mockImplementation(async (id, updates) => {
     mock.channels = mock.channels.map((item) =>
-      item.address === `channel/${id}` ? { ...item, ...updates } : item,
+      item.address === `channel/${id}` ? {
+        ...item, ...updates,
+        ...(updates.masterAgent !== undefined && { master: updates.masterAgent }),
+        ...(updates.orchestrationMode && { orchestration_mode: updates.orchestrationMode }),
+      } : item,
     );
   });
   mock.api.addChannelParticipant.mockImplementation(async (id, name) => {
@@ -291,6 +312,161 @@ afterEach(async () => {
 });
 
 describe('project activity', () => {
+  it('prefers an existing link over the latest conversation and restores each account selection', async () => {
+    mock.channels = [
+      channel('project:one:old', 'Old', { last_event_at: 10 }),
+      channel('project:one:new', 'New', { last_event_at: 30 }),
+    ];
+    await render('one', 'project:one:old');
+    expect(container.querySelector('[data-testid="project-activity-conversation"]')
+      ?.getAttribute('data-session-id')).toBe('project:one:old');
+    await select('New');
+    await act(async () => window.dispatchEvent(new Event('focus')));
+    expect(container.querySelector('[data-testid="project-activity-conversation"]')
+      ?.getAttribute('data-session-id')).toBe('project:one:new');
+    mock.userId = 'second';
+    await render('one');
+    expect(container.querySelector('[data-testid="project-activity-conversation"]')
+      ?.getAttribute('data-session-id')).toBe('project:one:new');
+    await select('Old');
+    await render('one');
+    expect(container.querySelector('[data-testid="project-activity-conversation"]')
+      ?.getAttribute('data-session-id')).toBe('project:one:old');
+  });
+
+  it('ignores a plausible local project link not returned by the scoped discovery', async () => {
+    mock.localAuth = true;
+    mock.workspaceId = 'project-one';
+    mock.channels = [channel('chat-allowed', 'Allowed')];
+    await render('project-one', 'chat-another-project');
+    expect(container.querySelector('[data-testid="project-activity-conversation"]')
+      ?.getAttribute('data-session-id')).toBe('chat-allowed');
+    expect(mock.polling).not.toHaveBeenCalledWith({ sessionId: 'chat-another-project' });
+  });
+
+  it('preselects the sole ordinary online project agent, but not Yumi', async () => {
+    await render();
+    await click(labelled('新建会话'));
+    expect(document.querySelector<HTMLInputElement>('[role="dialog"] input[type="checkbox"]')?.checked).toBe(true);
+    await fill(document.querySelector<HTMLInputElement>('#activity-conversation-name')!, 'Agent discussion');
+    await click(textButton('创建'));
+    expect(mock.api.sendEvent).toHaveBeenCalledWith(expect.objectContaining({
+      payload: expect.objectContaining({ participants: ['helper'] }),
+    }));
+
+    mock.agents = [{ agentName: 'yumi', displayName: 'Yumi', status: 'online', builtin: true } as WorkspaceAgent];
+    await render();
+    await click(labelled('新建会话'));
+    expect(document.querySelector<HTMLInputElement>('[role="dialog"] input[type="checkbox"]')?.checked).toBe(false);
+    await fill(document.querySelector<HTMLInputElement>('#activity-conversation-name')!, 'Human discussion');
+    await click(textButton('创建'));
+    expect(mock.api.sendEvent).toHaveBeenLastCalledWith(expect.objectContaining({
+      payload: expect.objectContaining({ participants: [] }),
+    }));
+  });
+
+  it('leaves multiple agents unselected and never carries another project selection across a switch', async () => {
+    mock.agents = [
+      { agentName: 'helper', displayName: 'Helper', status: 'online' } as WorkspaceAgent,
+      { agentName: 'second', displayName: 'Second', status: 'online' } as WorkspaceAgent,
+      { agentName: 'offline', displayName: 'Offline', status: 'offline' } as WorkspaceAgent,
+    ];
+    await render();
+    await click(labelled('新建会话'));
+    expect(Array.from(document.querySelectorAll<HTMLInputElement>('[role="dialog"] input[type="checkbox"]'))
+      .map((input) => input.checked)).toEqual([false, false]);
+    await click(document.querySelectorAll<HTMLInputElement>('[role="dialog"] input[type="checkbox"]')[1]);
+    mock.workspaceId = 'two';
+    mock.agents = [{ agentName: 'other-project', displayName: 'Other project', status: 'online' } as WorkspaceAgent];
+    await render('two');
+    await click(labelled('新建会话'));
+    await fill(document.querySelector<HTMLInputElement>('#activity-conversation-name')!, 'Other project chat');
+    await click(textButton('创建'));
+    expect(mock.api.sendEvent).toHaveBeenCalledOnce();
+    expect(mock.api.sendEvent).toHaveBeenCalledWith(expect.objectContaining({
+      payload: expect.objectContaining({ participants: ['other-project'] }),
+    }));
+  });
+
+  it('sends only explicitly chosen agents when multiple are online', async () => {
+    mock.agents = [
+      { agentName: 'helper', displayName: 'Helper', status: 'online' } as WorkspaceAgent,
+      { agentName: 'second', displayName: 'Second', status: 'online' } as WorkspaceAgent,
+    ];
+    await render();
+    await click(labelled('新建会话'));
+    await click(document.querySelectorAll<HTMLInputElement>('[role="dialog"] input[type="checkbox"]')[1]);
+    await fill(document.querySelector<HTMLInputElement>('#activity-conversation-name')!, 'Second agent');
+    await click(textButton('创建'));
+    expect(mock.api.sendEvent).toHaveBeenCalledWith(expect.objectContaining({
+      payload: expect.objectContaining({ participants: ['second'] }),
+    }));
+  });
+
+  it('uses project-scoped subscription and mentions only current project human members', async () => {
+    mock.localAuth = true;
+    mock.workspaceId = 'project-one';
+    mock.channels = [channel('chat-one', 'Shared')];
+    await render('project-one');
+    expect(container.querySelector('[data-testid="project-activity-conversation"]')
+      ?.getAttribute('data-session-id')).toBe('chat-one');
+    expect(mock.api.fetchResource).toHaveBeenCalledWith(
+      '/v1/workspaces/project-one/channels/chat-one/subscription',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    await click(labelled('关注会话'));
+    expect(mock.api.fetchResource).toHaveBeenLastCalledWith(
+      '/v1/workspaces/project-one/channels/chat-one/subscription',
+      { method: 'PUT', body: JSON.stringify({ following: true }) },
+    );
+    await click(labelled('提及项目成员'));
+    await click(textButton('Other @other'));
+    expect(container.querySelector<HTMLInputElement>('[data-testid="draft"]')?.value).toBe('@{other} ');
+    await click(container.querySelector<HTMLButtonElement>('[data-testid="send"]')!);
+    expect(mock.api.sendMessage).toHaveBeenCalledWith(
+      'chat-one', '@{other} ', 'User', ['helper'], undefined, 'user',
+    );
+    expect(mock.api.fetchResource).toHaveBeenLastCalledWith(
+      '/v1/workspaces/project-one/channels/chat-one/subscription',
+      expect.objectContaining({}),
+    );
+  });
+
+  it('escapes project member names in inserted human mentions', async () => {
+    mock.localAuth = true;
+    mock.workspaceId = 'project-one';
+    mock.channels = [channel('chat-one', 'Shared')];
+    mock.api.getTeam.mockResolvedValueOnce([
+      { username: 'A} B\\C', role: 'member', displayName: 'Special' },
+    ]);
+    await render('project-one');
+    await click(labelled('提及项目成员'));
+    await click(textButton('Special @A} B\\C'));
+    expect(container.querySelector<HTMLInputElement>('[data-testid="draft"]')?.value)
+      .toBe('@{A\\} B\\\\C} ');
+  });
+
+  it('lets members configure project agents but hides writes from viewers', async () => {
+    mock.channels = [channel('project:one:a', 'One', { participants: ['helper'] })];
+    await render();
+    await click(labelled('负责人'));
+    await click(textButton('Helper'));
+    expect(mock.api.updateChannel).toHaveBeenLastCalledWith('project:one:a', { masterAgent: 'helper' });
+    await click(labelled('参与 Agent'));
+    await click(document.querySelector<HTMLInputElement>('[data-slot="popover-content"] input')!);
+    expect(mock.api.updateChannel).toHaveBeenLastCalledWith('project:one:a', { masterAgent: '' });
+    expect(mock.api.removeChannelParticipant).toHaveBeenCalledWith('project:one:a', 'helper');
+    mock.role = 'viewer';
+    mock.localAuth = true;
+    mock.workspaceId = 'one';
+    mock.channels = [channel('chat-one', 'One', { participants: ['helper'] })];
+    await render();
+    expect(labelled('负责人')).toBeUndefined();
+    expect(labelled('新建会话')?.disabled).toBe(true);
+    await click(labelled('参与 Agent'));
+    expect(document.querySelector<HTMLInputElement>('[data-slot="popover-content"] input')?.disabled).toBe(true);
+  });
+
   it('renders only this project, without creating a channel or touching personal selection', async () => {
     await render();
     expect(
@@ -314,6 +490,7 @@ describe('project activity', () => {
   it('supports human-only creation and preserves a failed creation form for retry', async () => {
     await render();
     await click(labelled('新建会话'));
+    await click(document.querySelector<HTMLInputElement>('[role="dialog"] input[type="checkbox"]')!);
     await fill(
       document.querySelector<HTMLInputElement>('#activity-conversation-name')!,
       'Discussion',
@@ -571,9 +748,10 @@ describe('project activity', () => {
   it('does not restore a foreign session from a link', async () => {
     await render('one', 'project:two:a');
     expect(
-      container.querySelector('[data-testid="project-activity-conversation"]'),
-    ).toBeNull();
-    expect(mock.polling).not.toHaveBeenCalled();
+      container.querySelector('[data-testid="project-activity-conversation"]')
+        ?.getAttribute('data-session-id'),
+    ).toBe('project:one:a');
+    expect(mock.polling).not.toHaveBeenCalledWith({ sessionId: 'project:two:a' });
   });
 
   it('ignores a late send response after changing projects and preserves the original draft', async () => {
@@ -618,11 +796,11 @@ describe('project activity', () => {
     ).toBe('Pending one');
   });
 
-  it('refreshes every 15 seconds and stops refreshing when unmounted', async () => {
+  it('refreshes every 5 seconds and stops refreshing when unmounted', async () => {
     vi.useFakeTimers();
     await render();
     const calls = mock.api.discover.mock.calls.length;
-    await act(async () => vi.advanceTimersByTime(15_000));
+    await act(async () => vi.advanceTimersByTime(5_000));
     expect(mock.api.discover).toHaveBeenCalledTimes(calls + 1);
     await act(async () => root.unmount());
     const afterUnmount = mock.api.discover.mock.calls.length;

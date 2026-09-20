@@ -112,11 +112,8 @@ export function useProjectActivity(
       setSessions(next);
       setLoadError(false);
       const selectedId = preferencesRef.current.selectedId;
-      if (
-        selectedId &&
-        !next.some((session) => session.sessionId === selectedId)
-      )
-        select(null);
+      if (!selectedId || !next.some((session) => session.sessionId === selectedId))
+        if (next[0]) select(next[0].sessionId);
     } catch {
       if (alive.current && version === request.current) setLoadError(true);
     } finally {
@@ -127,7 +124,9 @@ export function useProjectActivity(
   useEffect(() => {
     alive.current = true;
     void refresh();
-    const interval = setInterval(() => void refresh(), 15_000);
+    const interval = setInterval(() => {
+      if (document.visibilityState === 'visible') void refresh();
+    }, 5_000);
     const onFocus = () => void refresh();
     window.addEventListener('focus', onFocus);
     return () => {
@@ -162,25 +161,26 @@ export function useProjectActivity(
     }
   };
 
-  const create = (title: string) =>
+  const create = (title: string, participants: string[] = []) =>
     operate(async () => {
       const name = `${IS_LOCAL_AUTH ? 'chat-' : projectChannelPrefix(projectId)}${crypto.randomUUID()}`;
       const event = await workspaceApi.sendEvent({
         type: 'network.channel.create',
         source: 'human:user',
         target: 'core',
-        payload: { name, title, participants: [] },
+        payload: { name, title, participants },
       });
       if (!alive.current) return;
-      if (event.metadata?.channel_name !== name)
+      const createdName = event.metadata?.channel_name;
+      if (typeof createdName !== 'string' || !belongs(createdName))
         throw new Error('Unexpected project channel');
       const session: WorkspaceSession = {
-        sessionId: name,
+        sessionId: createdName,
         workspaceId,
         title,
         createdBy: 'human:user',
         status: 'active',
-        participants: [],
+        participants,
         master: null,
         starred: false,
         orchestrationMode: 'dynamic',
@@ -190,7 +190,7 @@ export function useProjectActivity(
         lastEventAt: null,
       };
       setSessions((previous) => [session, ...previous]);
-      select(name);
+      select(createdName);
     });
 
   const rename = (id: string, title: string) =>
@@ -229,6 +229,16 @@ export function useProjectActivity(
     operate(async () => {
       if (!belongs(id))
         throw new Error('Invalid project channel');
+      const session = sessions.find((item) => item.sessionId === id);
+      if (!session) throw new Error('Invalid project channel');
+      const remaining = session.participants.filter((agent) => agent !== name);
+      if (!add && session.master === name) {
+        await workspaceApi.updateChannel(id, {
+          masterAgent: remaining[0] || '',
+          ...(remaining.length === 0 && session.orchestrationMode === 'master'
+            ? { orchestrationMode: 'dynamic' } : {}),
+        });
+      }
       if (add) await workspaceApi.addChannelParticipant(id, name);
       else await workspaceApi.removeChannelParticipant(id, name);
       if (alive.current)
@@ -240,11 +250,42 @@ export function useProjectActivity(
                   participants: add
                     ? Array.from(new Set([...session.participants, name]))
                     : session.participants.filter((agent) => agent !== name),
+                  master: !add && session.master === name ? remaining[0] || null : session.master,
+                  orchestrationMode: !add && session.master === name && remaining.length === 0 && session.orchestrationMode === 'master'
+                    ? 'dynamic' : session.orchestrationMode,
                 }
               : session,
           ),
         );
     });
+
+  const configure = (
+    id: string,
+    changes: { master?: string; mode?: string; workflowId?: string | null },
+  ) => operate(async () => {
+    const session = sessions.find((item) => item.sessionId === id);
+    if (!belongs(id) || !session) throw new Error('Invalid project channel');
+    if (changes.master && !session.participants.includes(changes.master))
+      throw new Error('Agent is not in this conversation');
+    const masterAgent = changes.mode === 'master' && !session.master
+      ? session.participants[0]
+      : changes.master;
+    if (changes.mode === 'master' && !masterAgent && !session.master)
+      throw new Error('Add an agent before selecting leader mode');
+    await workspaceApi.updateChannel(id, {
+      ...(masterAgent && { masterAgent }),
+      ...(changes.mode && { orchestrationMode: changes.mode }),
+      ...(changes.workflowId !== undefined && { workflowId: changes.workflowId }),
+    });
+    if (alive.current) setSessions((previous) => previous.map((item) => item.sessionId === id
+      ? {
+          ...item,
+          master: masterAgent ?? item.master,
+          orchestrationMode: changes.workflowId ? 'workflow' : changes.mode ?? item.orchestrationMode,
+          workflowId: changes.workflowId !== undefined ? changes.workflowId : item.workflowId,
+        }
+      : item));
+  });
 
   return {
     sessions,
@@ -262,5 +303,6 @@ export function useProjectActivity(
     rename,
     remove,
     participant,
+    configure,
   };
 }

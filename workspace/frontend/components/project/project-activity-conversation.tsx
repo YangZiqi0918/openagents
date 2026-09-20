@@ -1,9 +1,10 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Loader2, MessageSquare, RotateCcw, X } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { AtSign, Bell, BellOff, Loader2, MessageSquare, RotateCcw, X } from 'lucide-react';
 import { ChatInput, type PendingFile } from '@/components/chat/chat-input';
 import { ChatMessages } from '@/components/chat/chat-messages';
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { useMessagePolling } from '@/hooks/use-polling';
 import { useComposingSignal } from '@/hooks/use-composing-signal';
 import { useWorkspaceApi } from '@/lib/workspace-api-context';
@@ -13,7 +14,9 @@ import {
   type WorkspaceAgent,
   type WorkspaceIdentity,
   type WorkspaceMessage,
+  type TeamMember,
 } from '@/lib/types';
+import { IS_LOCAL_AUTH } from '@/lib/api-config';
 import type { activityLabels } from './project-activity-model';
 
 type Attachment = {
@@ -30,9 +33,13 @@ export interface ActivitySend {
 }
 
 export function ProjectActivityConversation({
+  workspaceId,
   sessionId,
   agents,
   currentUser,
+  humanMembers,
+  membersError,
+  onRetryMembers,
   draft,
   onDraftChange,
   onRead,
@@ -42,9 +49,13 @@ export function ProjectActivityConversation({
   labels: l,
   readOnly = false,
 }: {
+  workspaceId: string;
   sessionId: string;
   agents: WorkspaceAgent[];
   currentUser: WorkspaceIdentity;
+  humanMembers: TeamMember[] | null;
+  membersError: boolean;
+  onRetryMembers: () => void;
   draft: string;
   onDraftChange: (text: string) => void;
   onRead: () => void;
@@ -72,6 +83,9 @@ export function ProjectActivityConversation({
   const [inputVersion, setInputVersion] = useState(0);
   const [optimistic, setOptimistic] = useState<WorkspaceMessage[]>([]);
   const [scrollKey, setScrollKey] = useState(0);
+  const [following, setFollowing] = useState<boolean | null>(null);
+  const [subscriptionError, setSubscriptionError] = useState(false);
+  const [subscriptionBusy, setSubscriptionBusy] = useState(false);
   const alive = useRef(true);
   const busy = useRef(false);
   const controller = useRef<AbortController | null>(null);
@@ -88,6 +102,47 @@ export function ProjectActivityConversation({
       callbacks.current.onSending(false);
     };
   }, []);
+
+  const subscriptionPath = `/v1/workspaces/${encodeURIComponent(workspaceId)}/channels/${encodeURIComponent(sessionId)}/subscription`;
+  const loadSubscription = useCallback(async (signal?: AbortSignal) => {
+    if (!IS_LOCAL_AUTH) return;
+    try {
+      const response = await workspaceApi.fetchResource(subscriptionPath, { signal });
+      const json = await response.json() as { data: { following: boolean } };
+      if (!signal?.aborted && alive.current) {
+        setFollowing(json.data.following);
+        setSubscriptionError(false);
+      }
+    } catch {
+      if (!signal?.aborted && alive.current) setSubscriptionError(true);
+    }
+  }, [workspaceApi, subscriptionPath]);
+  useEffect(() => {
+    if (!IS_LOCAL_AUTH) return;
+    const abort = new AbortController();
+    void loadSubscription(abort.signal);
+    return () => abort.abort();
+  }, [loadSubscription]);
+
+  const toggleSubscription = async () => {
+    if (following === null || subscriptionBusy) return;
+    setSubscriptionBusy(true);
+    try {
+      const response = await workspaceApi.fetchResource(subscriptionPath, {
+        method: 'PUT',
+        body: JSON.stringify({ following: !following }),
+      });
+      const json = await response.json() as { data: { following: boolean } };
+      if (alive.current) {
+        setFollowing(json.data.following);
+        setSubscriptionError(false);
+      }
+    } catch {
+      if (alive.current) setSubscriptionError(true);
+    } finally {
+      if (alive.current) setSubscriptionBusy(false);
+    }
+  };
 
   const scopedMessages = useMemo(
     () => messages.filter((message) => message.sessionId === sessionId),
@@ -163,6 +218,7 @@ export function ProjectActivityConversation({
       if (draftRef.current === submission.content)
         callbacks.current.onDraftChange('');
       forceRefresh();
+      void loadSubscription();
     } catch (error) {
       if (!alive.current) return;
       setOptimistic((previous) =>
@@ -190,6 +246,11 @@ export function ProjectActivityConversation({
     scopedMessages,
     optimistic.filter((message) => message.sessionId === sessionId),
   );
+  const mentionHuman = (username: string) => {
+    const escaped = username.replaceAll('\\', '\\\\').replaceAll('}', '\\}')
+      .replaceAll('\n', '\\n').replaceAll('\r', '\\r');
+    callbacks.current.onDraftChange(`${draftRef.current}${draftRef.current && !/\s$/.test(draftRef.current) ? ' ' : ''}@{${escaped}} `);
+  };
   return (
     <div
       data-testid="project-activity-conversation"
@@ -254,6 +315,46 @@ export function ProjectActivityConversation({
         </div>
       )}
       <div className="mx-auto w-full max-w-4xl shrink-0 px-3 pb-3 pt-1 lg:px-5">
+        {IS_LOCAL_AUTH && (
+          <div className="mb-1 flex min-h-8 items-center gap-1">
+            {!readOnly && (
+              <Popover>
+                <PopoverTrigger asChild>
+                  <button type="button" title={l.mentionMember} aria-label={l.mentionMember}
+                    className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring">
+                    <AtSign className="size-4" />
+                  </button>
+                </PopoverTrigger>
+                <PopoverContent align="start" className="max-h-72 w-56 overflow-y-auto p-2">
+                  <p className="px-2 pb-1 text-sm font-medium">{l.mentionMember}</p>
+                  {membersError ? (
+                    <button type="button" onClick={onRetryMembers} className="w-full px-2 py-2 text-left text-sm text-destructive">{l.membersFailed} · {l.retry}</button>
+                  ) : humanMembers === null ? (
+                    <p className="px-2 py-2 text-sm text-muted-foreground">{l.loading}</p>
+                  ) : humanMembers.length === 0 ? (
+                    <p className="px-2 py-2 text-sm text-muted-foreground">{l.noHumanMembers}</p>
+                  ) : humanMembers.map((member) => (
+                    <button key={member.username} type="button" onClick={() => mentionHuman(member.username!)}
+                      className="w-full truncate rounded-sm px-2 py-2 text-left text-sm hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring">
+                      {member.displayName || member.username} <span className="text-muted-foreground">@{member.username}</span>
+                    </button>
+                  ))}
+                </PopoverContent>
+              </Popover>
+            )}
+            <button type="button" onClick={() => void toggleSubscription()}
+              title={following ? l.unfollow : l.follow} aria-label={following ? l.unfollow : l.follow}
+              disabled={following === null || subscriptionBusy}
+              className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring disabled:opacity-40">
+              {following ? <Bell className="size-4" /> : <BellOff className="size-4" />}
+            </button>
+            {subscriptionError && (
+              <button type="button" onClick={() => void loadSubscription()} className="text-xs text-destructive hover:underline">
+                {l.subscriptionFailed} · {l.retry}
+              </button>
+            )}
+          </div>
+        )}
         <ChatInput
           key={inputVersion}
           agents={agents}

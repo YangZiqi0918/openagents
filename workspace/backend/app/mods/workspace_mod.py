@@ -1370,7 +1370,11 @@ def _join_channel_as_human(channel, payload: dict, db, metadata: dict | None = N
     email = human_sender_email(payload, metadata)
     if not email or channel is None:
         return
-    from app.models import ChannelHumanMember
+    from app.models import Channel, ChannelHumanMember
+    from app.config import config
+    if config.AUTH_MODE == "local_password" and channel.workspace.kind == "project":
+        # Serialize with the explicit toggle before checking for an absent row.
+        db.execute(select(Channel.id).where(Channel.id == channel.id).with_for_update()).first()
     existing = db.execute(
         select(ChannelHumanMember).where(
             ChannelHumanMember.channel_id == channel.id,

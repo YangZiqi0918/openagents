@@ -36,7 +36,9 @@ from app.config import config
 from app.database import get_db
 from app.models import (
     Channel,
+    ChannelHumanMember,
     ChannelMember,
+    DeviceToken,
     User,
     Workspace,
     WorkspaceCollaborator,
@@ -105,6 +107,10 @@ class ChannelUpdateRequest(BaseModel):
     orchestration_instruction: Optional[str] = None  # legacy free-text plan
     workflow_id: Optional[str] = None  # structured workflow to drive this thread ("" clears)
     auto_title: bool = False  # When True, title update is from auto-titling (don't mark as manually set)
+
+
+class ChannelSubscriptionRequest(BaseModel):
+    following: bool
 
 class WorkspaceUpdateRequest(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=120)
@@ -1421,6 +1427,59 @@ async def register_custom_skill(
 # GET /v1/workspaces/{workspace_id}/channels/{channel_name}
 # ---------------------------------------------------------------------------
 
+def _human_channel_subscription(db: Session, workspace_id: str, channel_name: str,
+                                authorization: Optional[str], *, lock: bool = False):
+    workspace = db.execute(select(Workspace).where(_workspace_filter(workspace_id))).scalar_one_or_none()
+    if workspace is None or workspace.status == "deleted":
+        return None, None, None, json_response(ResponseCode.NOT_FOUND, "Project not found")
+    if not verify_human_project_access(db, workspace, authorization, "viewer"):
+        return None, None, None, json_response(ResponseCode.UNAUTHORIZED, "Project membership required")
+    user = resolve_current_user(db, authorization)
+    if user is None:
+        return None, None, None, json_response(ResponseCode.UNAUTHORIZED, "Human identity required")
+    channel_query = select(Channel).where(
+        Channel.workspace_id == workspace.id, Channel.name == channel_name,
+        Channel.status != "deleted",
+    )
+    # Serialize the first follow toggle with implicit follow on first post.
+    if lock:
+        channel_query = channel_query.with_for_update()
+    channel = db.execute(channel_query).scalar_one_or_none()
+    if channel is None:
+        return None, None, None, json_response(ResponseCode.NOT_FOUND, "Channel not found")
+    row = db.execute(select(ChannelHumanMember).where(
+        ChannelHumanMember.channel_id == channel.id,
+        ChannelHumanMember.user_email == user.email.strip().lower(),
+    )).scalar_one_or_none()
+    return user, channel, row, None
+
+
+@router.get("/{workspace_id}/channels/{channel_name}/subscription")
+def get_channel_subscription(
+    workspace_id: str, channel_name: str, db: Session = Depends(get_db),
+    authorization: Optional[str] = Header(None),
+):
+    user, channel, row, error = _human_channel_subscription(db, workspace_id, channel_name, authorization)
+    if error is not None:
+        return error
+    return success_response({"following": bool(row and row.following)})
+
+
+@router.put("/{workspace_id}/channels/{channel_name}/subscription")
+def put_channel_subscription(
+    workspace_id: str, channel_name: str, body: ChannelSubscriptionRequest,
+    db: Session = Depends(get_db), authorization: Optional[str] = Header(None),
+):
+    user, channel, row, error = _human_channel_subscription(db, workspace_id, channel_name, authorization, lock=True)
+    if error is not None:
+        return error
+    if row is None:
+        row = ChannelHumanMember(channel_id=channel.id, user_email=user.email.strip().lower())
+        db.add(row)
+    row.following = body.following
+    db.commit()
+    return success_response({"following": row.following})
+
 @router.get("/{workspace_id}/channels/{channel_name}")
 def get_channel(
     workspace_id: str,
@@ -2018,6 +2077,17 @@ def remove_team_member(
     if membership.role == "owner" and _owner_count(db, workspace.id) <= 1:
         return json_response(ResponseCode.BAD_REQUEST, "Cannot remove the last owner")
 
+    if workspace.kind == "project":
+        email_lower = user.email.strip().lower()
+        channel_ids = select(Channel.id).where(Channel.workspace_id == workspace.id)
+        db.query(ChannelHumanMember).filter(
+            ChannelHumanMember.channel_id.in_(channel_ids),
+            ChannelHumanMember.user_email == email_lower,
+        ).delete(synchronize_session=False)
+        db.query(DeviceToken).filter(
+            DeviceToken.workspace_id == workspace.id,
+            DeviceToken.user_email == email_lower,
+        ).delete(synchronize_session=False)
     db.delete(membership)
     db.commit()
     return success_response({"id": str(user.id), "userId": str(user.id), "username": user.username,

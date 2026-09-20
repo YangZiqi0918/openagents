@@ -117,6 +117,27 @@ class TestShouldPushStatus:
 
 
 class TestShouldPushMention:
+    def test_explicit_project_human_mention_precedes_bare_agent_mention(self):
+        ev = _make_event(content="@agent-alpha please ask @{Bób Team} for review")
+        ok, reason, target = _should_push(
+            ev, {"agent-alpha"}, {"bób team": "bob@local.invalid"},
+            prefer_human_mentions=True,
+        )
+        assert (ok, reason, target) == (True, "mention", "bob@local.invalid")
+
+    def test_project_username_special_characters_are_escaped(self):
+        ev = _make_event(content=r"@{R\}D\\% Team} please review")
+        ok, reason, target = _should_push(
+            ev, set(), {"r}d\\% team": "user@local.invalid"},
+            prefer_human_mentions=True,
+        )
+        assert (ok, reason, target) == (True, "mention", "user@local.invalid")
+
+    def test_braced_mentions_not_resolved_in_legacy_workspace(self):
+        ev = _make_event(content="@{Bob Team}")
+        ok, reason, target = _should_push(ev, set(), {"bob team": "bob@example.com"})
+        assert (ok, reason, target) == (True, "chat", None)
+
     def test_mention_of_known_agent_in_chat_pushes(self):
         ev = _make_event(
             source="openagents:another-agent",
