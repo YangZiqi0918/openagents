@@ -1,0 +1,16 @@
+ M packages/launcher/package-lock.json
+?? build-mac.command
+?? docs/build-macos-local.md
+?? docs/deploy-edge-arm64.md
+?? docs/desktop-platform-deployment.md
+?? docs/desktop-release-standard-workflow.md
+?? packages/launcher/scripts/mac-local-builder.cjs
+?? scripts/build-edge-arm64.sh
+?? scripts/build-linux-arm64-desktop.sh
+?? scripts/build-mac.sh
+?? scripts/deploy-edge-arm64.sh
+?? scripts/desktop-release-workflow.sh
+?? scripts/edge-desktop-deb.sh
+?? scripts/edge-ubuntu-arm64.sh
+?? scripts/install-edge-arm64.sh
+?? scripts/install-linux-arm64-deb.sh
